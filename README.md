@@ -1,11 +1,27 @@
-# music-organiser
+# music-organiser / 4chanRemix
 
 Browser-based organiser for FLAC music collections.  
 Imports from Nicotine+ (Soulseek), fetches metadata from Discogs / MusicBrainz / Deezer, and organises files into a clean folder layout.
 
+---
+
+## Screenshots
+
+**Pipeline** — Import, fetch tags, organise in one click
+
 ![Pipeline](docs/screenshot-pipeline.png)
 
+**Session** — Review the current batch before committing
+
 ![Session](docs/screenshot-session.png)
+
+**Library** — Browse and search the full permanent library
+
+![Library](docs/screenshot-library.png)
+
+**Tools** — Rebuild index, SQL query, audit checks
+
+![Tools](docs/screenshot-tools.png)
 
 ---
 
@@ -149,3 +165,18 @@ Removes the service and control script. Your music files and databases are untou
       01 - Track.flac
       cover.jpg
 ```
+
+---
+
+## Credits
+
+This project grew out of years of collective effort by an underground music community.  
+Enormous credit goes to:
+
+**FriendshipisMagic** — the original author and architect of the entire pipeline, tagging engine, detection logic, and folder classification system. The core of this tool is their work.
+
+**The 4chan /mu/ lossless threads** — years of accumulated knowledge, testing, edge cases, and feedback from anons who actually use this stuff day to day. The genre logic, provider order, and general philosophy of the project came from those threads.
+
+**The Nicotine+ community** — for building and maintaining the Soulseek client that makes sharing lossless music between collectors possible in the first place.
+
+The web UI, installer, and packaging in this release were built on top of their foundation.
