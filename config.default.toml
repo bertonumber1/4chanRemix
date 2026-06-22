@@ -1,0 +1,158 @@
+[paths]
+sources = [
+    "/mnt/usb-a/drive/downloads",
+    "/mnt/usb-a/drive/downloads/nicotine-downloads",
+]
+
+destination_root = "/mnt/usb-a/drive/Music"
+
+database = "~/.local/share/music-organiser/library.db"
+
+broken_folder = "Broken"
+high_quality_folder = "High Quality"
+low_quality_folder = "Shit Quality"
+orphan_folder = "orphaned bonus files"
+
+out_of_library_dest = "/mnt/usb-a/drive/OrganiserStuff"
+
+[import]
+mode = "copy"
+
+audio_extensions = [
+    ".flac",
+    ".mp3",
+    ".m4a",
+    ".ogg",
+    ".opus",
+    ".wav",
+    ".aiff",
+    ".aif",
+    ".ape",
+    ".wv",
+    ".alac",
+    ".dsf",
+    ".dff",
+]
+
+extras_extensions = [
+    ".jpg",
+    ".jpeg",
+    ".png",
+    ".webp",
+    ".gif",
+    ".bmp",
+    ".tiff",
+    ".svg",
+    ".log",
+    ".cue",
+    ".nfo",
+    ".md5",
+    ".sfv",
+    ".txt",
+    ".md",
+    ".pdf",
+    ".rtf",
+    ".m3u",
+    ".m3u8",
+    ".pls",
+    ".mp4",
+    ".mkv",
+    ".webm",
+    ".avi",
+    ".mov",
+    ".m4v",
+    ".wmv",
+    ".flv",
+    ".sig",
+    ".asc",
+    ".sha256",
+    ".sha1",
+    ".zip",
+    ".rar",
+    ".7z",
+    ".lrc",
+    ".srt",
+    ".vtt",
+]
+
+take_all_non_audio = true
+
+junk_filenames = [
+    ".ds_store",
+    "thumbs.db",
+    "desktop.ini",
+    "icon\r",
+    ".directory",
+    ".localized",
+]
+
+skip_hidden = true
+follow_symlinks = false
+min_size_bytes = 4096
+
+triage_non_music = false
+random_crap_min_files = 3
+orphan_bonus_max_audio = 2
+
+[organise]
+mix_artist_diversity_threshold = 0.5
+
+delete_orphaned_extras = true
+
+various_artists_tags = [
+    "various artists",
+    "various",
+    "va",
+    "v.a.",
+    "verschiedene",
+    "compilation",
+]
+
+mix_keywords = [
+    "mix",
+    "compilation",
+    "presents",
+    "selected by",
+    " dj ",
+    "mixed by",
+    "essential mix",
+    "podcast",
+]
+
+unknown_label = "Unknown Label"
+unknown_artist = "Unknown Artist"
+unknown_album = "Unknown Album"
+
+illegal_path_chars = "<>:\"/\\|?*"
+max_component_length = 200
+
+[database]
+journal_mode = "WAL"
+synchronous = "NORMAL"
+cache_size_kb = 65536
+temp_store = "MEMORY"
+auto_analyse = true
+
+[deps]
+install_mode = "prompt"
+
+[performance]
+speed_level = "ludicrous"
+
+[ui]
+use_rich = true
+logo_font = "graffiti"
+logo_text = "music-organiser"
+logo_footer = "https://boards.4chan.org/mu/"
+animate_menu = true
+animate_menu_duration = 1.2
+animate_while_input = true
+fullwidth_background = true
+theme = "rainbowdash"
+refresh_per_second = 20
+force_terminal = false
+color_system = "auto"
+progress_update_interval = 5
+nerd_font = "auto"
+
+[providers]

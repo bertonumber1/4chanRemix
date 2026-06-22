@@ -1,0 +1,25 @@
+# music-organiser — Python dependencies
+# Install: pip install -r requirements.txt
+
+# Web server
+fastapi>=0.110.0
+uvicorn[standard]>=0.27.0
+
+# Audio tag reading/writing
+mutagen>=1.47.0
+
+# Metadata providers
+requests>=2.28.0
+requests-ratelimiter>=0.4.0
+discogs-client>=2.3.0
+musicbrainzngs>=0.7.1
+pyacoustid>=1.3.0
+
+# Image processing (cover art)
+Pillow>=9.0.0
+
+# Config (Python 3.10 has no built-in tomllib)
+tomli>=2.0.0
+
+# Data validation (FastAPI dep, pin for compat)
+pydantic>=2.0.0

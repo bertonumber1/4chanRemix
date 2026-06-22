@@ -1,0 +1,36 @@
+# databases — personal data, never commit
+*.db
+*.db-shm
+*.db-wal
+
+# logs
+*.log
+
+# release artifacts
+*.tar.gz
+*.zip
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# backups / pre-edit snapshots
+*.pre-*
+*.bak
+*.bak-*
+
+# config with API keys (lives in ~/.config/, not here, but just in case)
+config.toml
+
+# editor / OS
+.DS_Store
+.vscode/
+*.swp
+*.swo
+*.kate-swp
+
+# Claude Code internals
+.claude/
