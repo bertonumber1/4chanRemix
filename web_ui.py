@@ -34,7 +34,7 @@ _SESSION_DB = Path("~/.local/share/music-organiser/web_session.db").expanduser()
 _LIBRARY_DB = Path("~/.local/share/music-organiser/library.db").expanduser()
 _CFG_PATH   = Path("~/.config/music-organiser/config.toml").expanduser()
 _LOG_FILE   = Path("~/.local/share/music-organiser/web_ui.log").expanduser()
-_VERSION    = "1.4.1"
+_VERSION    = "1.4.2"
 
 # ─── logging ──────────────────────────────────────────────────────────────────
 def _setup_logging(verbose: bool = False) -> None:
