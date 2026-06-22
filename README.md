@@ -3,6 +3,10 @@
 Browser-based organiser for FLAC music collections.  
 Imports from Nicotine+ (Soulseek), fetches metadata from Discogs / MusicBrainz / Deezer, and organises files into a clean folder layout.
 
+![Pipeline](docs/screenshot-pipeline.png)
+
+![Session](docs/screenshot-session.png)
+
 ---
 
 ## Install (one command)
