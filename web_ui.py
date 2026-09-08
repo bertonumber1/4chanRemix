@@ -34,7 +34,7 @@ _SESSION_DB = Path("~/.local/share/music-organiser/web_session.db").expanduser()
 _LIBRARY_DB = Path("~/.local/share/music-organiser/library.db").expanduser()
 _CFG_PATH   = Path("~/.config/music-organiser/config.toml").expanduser()
 _LOG_FILE   = Path("~/.local/share/music-organiser/web_ui.log").expanduser()
-_VERSION    = "1.5.0"
+_VERSION    = "1.5.1"
 
 # ─── logging ──────────────────────────────────────────────────────────────────
 def _setup_logging(verbose: bool = False) -> None:
@@ -521,12 +521,94 @@ def _windows_has_desktop() -> bool:
         return True
 
 
-def _pick_windows(start_dir: Path | None) -> tuple[bool, str]:
-    """WinForms FolderBrowserDialog via PowerShell (Windows).
+# The Vista-era IFileOpenDialog with FOS_PICKFOLDER is the dialog Explorer
+# itself uses: address bar, sidebar, search, network locations, the lot.
+# FolderBrowserDialog (the .NET default) is the ancient tree-only popup with
+# none of that, so we declare the COM interfaces by hand and fall back to
+# FolderBrowserDialog only if that fails.
+_WIN_PICKER_PS = r"""
+$ErrorActionPreference = 'Stop'
+$initial = @'
+__INITIAL__
+'@
+$initial = $initial.Trim()
 
-    powershell.exe needs -STA for WinForms; pwsh (7+) dropped that switch and
-    is already STA, hence the two spellings. The chosen path goes to stdout on
-    its own — anything PowerShell writes as a warning stays on stderr.
+function Use-ModernPicker($start) {
+  Add-Type -Namespace MO -Name Dlg -MemberDefinition @"
+[ComImport, Guid("42f85136-db7e-439c-85f1-e4075d135fc8"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+private interface IFileOpenDialog {
+  [PreserveSig] int Show(IntPtr parent);
+  void SetFileTypes(uint c, IntPtr f); void SetFileTypeIndex(uint i); void GetFileTypeIndex(out uint i);
+  void Advise(IntPtr p, out uint c); void Unadvise(uint c);
+  void SetOptions(uint opts); void GetOptions(out uint opts);
+  void SetDefaultFolder(IShellItem si); void SetFolder(IShellItem si);
+  void GetFolder(out IShellItem si); void GetCurrentSelection(out IShellItem si);
+  void SetFileName(string n); void GetFileName([MarshalAs(UnmanagedType.LPWStr)] out string n);
+  void SetTitle(string t); void SetOkButtonLabel(string t); void SetFileNameLabel(string t);
+  void GetResult(out IShellItem si);
+}
+[ComImport, Guid("43826d1e-e718-42ee-bc55-a1e261c37bfe"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+private interface IShellItem {
+  void BindToHandler(IntPtr bc, ref Guid bhid, ref Guid riid, out IntPtr ppv);
+  void GetParent(out IShellItem p);
+  void GetDisplayName(uint sigdn, [MarshalAs(UnmanagedType.LPWStr)] out string name);
+  void GetAttributes(uint mask, out uint attrs);
+  void Compare(IShellItem psi, uint hint, out int order);
+}
+[ComImport, Guid("dc1c5a9c-e88a-4dde-a5a1-60f82a20aef7")] private class FileOpenDialogRCW { }
+[DllImport("shell32.dll", CharSet=CharSet.Unicode, PreserveSig=false)]
+private static extern void SHCreateItemFromParsingName(string path, IntPtr bc,
+  [MarshalAs(UnmanagedType.LPStruct)] Guid riid, [MarshalAs(UnmanagedType.Interface)] out object item);
+
+public static string Pick(string start) {
+  var dlg = (IFileOpenDialog)(new FileOpenDialogRCW());
+  uint opts; dlg.GetOptions(out opts);
+  // FOS_PICKFOLDERS | FOS_FORCEFILESYSTEM | FOS_PATHMUSTEXIST
+  dlg.SetOptions(opts | 0x20 | 0x40 | 0x800);
+  dlg.SetTitle("music-organiser - choose a folder");
+  if (!string.IsNullOrEmpty(start)) {
+    try {
+      object si;
+      SHCreateItemFromParsingName(start, IntPtr.Zero,
+        new Guid("43826d1e-e718-42ee-bc55-a1e261c37bfe"), out si);
+      dlg.SetFolder((IShellItem)si);
+    } catch { }
+  }
+  if (dlg.Show(IntPtr.Zero) != 0) return "";   // cancelled
+  IShellItem res; dlg.GetResult(out res);
+  string path; res.GetDisplayName(0x80058000, out path);   // SIGDN_FILESYSPATH
+  return path;
+}
+"@ -ErrorAction Stop | Out-Null
+  return [MO.Dlg]::Pick($start)
+}
+
+function Use-LegacyPicker($start) {
+  Add-Type -AssemblyName System.Windows.Forms | Out-Null
+  $d = New-Object System.Windows.Forms.FolderBrowserDialog
+  $d.Description = 'music-organiser - choose a folder'
+  $d.ShowNewFolderButton = $true
+  if ($start) { $d.SelectedPath = $start }
+  if ($d.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) { return $d.SelectedPath }
+  return ""
+}
+
+try   { $out = Use-ModernPicker $initial }
+catch { $out = Use-LegacyPicker $initial }
+[Console]::Out.Write($out)
+"""
+
+
+def _pick_windows(start_dir: Path | None) -> tuple[bool, str]:
+    """Explorer's own folder chooser via PowerShell (Windows).
+
+    Uses IFileOpenDialog + FOS_PICKFOLDERS — the same dialog Explorer draws,
+    with the address bar, Quick-access sidebar and search. Falls back to the
+    old FolderBrowserDialog only if declaring the COM interfaces fails.
+
+    powershell.exe needs -STA for the shell dialog; pwsh (7+) dropped that
+    switch and is already STA, hence the two spellings. The chosen path goes
+    to stdout on its own — PowerShell warnings stay on stderr.
     """
     if not _windows_has_desktop():
         return False, "no interactive desktop (running as a service)"
@@ -538,15 +620,9 @@ def _pick_windows(start_dir: Path | None) -> tuple[bool, str]:
     if not exe:
         return False, "powershell not found"
     initial = str(start_dir) if start_dir is not None else ""
-    script = (
-        "Add-Type -AssemblyName System.Windows.Forms | Out-Null\n"
-        "$d = New-Object System.Windows.Forms.FolderBrowserDialog\n"
-        "$d.Description = 'music-organiser - choose a folder'\n"
-        "$d.ShowNewFolderButton = $true\n"
-        f"$d.SelectedPath = '{initial.replace(chr(39), chr(39) * 2)}'\n"
-        "if ($d.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) "
-        "{ [Console]::Out.Write($d.SelectedPath) }\n"
-    )
+    # Fed through a single-quoted here-string, so the only thing that can end
+    # it early is a line that is exactly "'@" — a path can never be that.
+    script = _WIN_PICKER_PS.replace("__INITIAL__", initial)
     proc = subprocess.run([exe] + args, input=script,
                           capture_output=True, text=True, timeout=300)
     chosen = (proc.stdout or "").strip()
@@ -602,6 +678,41 @@ def pick_folder(start: str = ""):
         return JSONResponse({"ok": False, "reason": str(exc)})
     finally:
         _PICKER_LOCK.release()
+
+
+@app.get("/api/open-folder")
+def open_folder(path: str = ""):
+    """Show a folder in the desktop's own file manager.
+
+    Explorer on Windows (Win11 reuses/adds a tab rather than a new window),
+    Finder on macOS, and whatever handles directories on Linux. Same desktop
+    caveat as the picker: this draws on the machine the SERVER runs on, so a
+    browser on another box gets ok=False and the UI just doesn't offer it.
+    """
+    p = Path(path) if path else None
+    if p is None or not p.exists():
+        return JSONResponse({"ok": False, "reason": "no such folder"})
+    if not p.is_dir():
+        p = p.parent
+    try:
+        if os.name == "nt":
+            if not _windows_has_desktop():
+                return JSONResponse({"ok": False, "reason": "no interactive desktop"})
+            # os.startfile is the one that reuses an existing Explorer tab;
+            # explorer.exe always returns 1, so its exit code means nothing.
+            os.startfile(str(p))          # type: ignore[attr-defined]
+        elif sys.platform == "darwin":
+            subprocess.Popen(["open", str(p)])
+        else:
+            opener = shutil.which("xdg-open") or shutil.which("nemo") \
+                     or shutil.which("nautilus") or shutil.which("thunar")
+            if not opener:
+                return JSONResponse({"ok": False, "reason": "no file manager found"})
+            subprocess.Popen([opener, str(p)],
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return JSONResponse({"ok": True, "path": str(p)})
+    except Exception as exc:
+        return JSONResponse({"ok": False, "reason": str(exc)})
 
 
 @app.get("/api/scan")
@@ -1199,11 +1310,13 @@ textarea.sql-input:focus{outline:none;border-color:var(--acc)}
       <span class="path-label src">Source</span>
       <input class="path-input" id="src-in" placeholder="folder to read from" oninput="setActiveTarget('src')">
       <button class="btn-xs" onclick="nativePick('src',this)">📁 Browse</button>
+      <button class="btn-xs ghost" onclick="openInFileManager('src-in',this)" title="Show this folder in the file manager">↗ Open</button>
     </div>
     <div class="path-row">
       <span class="path-label out">Output</span>
       <input class="path-input" id="dest-in" placeholder="folder to organise into" oninput="setActiveTarget('dest')">
       <button class="btn-xs" onclick="nativePick('dest',this)">📁 Browse</button>
+      <button class="btn-xs ghost" onclick="openInFileManager('dest-in',this)" title="Show this folder in the file manager">↗ Open</button>
     </div>
     <div style="display:flex;gap:5px;margin-top:4px">
       <button class="btn-xs" style="flex:1" onclick="scanSource()">Scan source</button>
@@ -1263,11 +1376,13 @@ textarea.sql-input:focus{outline:none;border-color:var(--acc)}
       <span class="path-label src">Source</span>
       <input class="path-input" id="direct-src-in" placeholder="folder to read from" oninput="setActiveTargetDirect('src')">
       <button class="btn-xs" onclick="nativePickDirect('src',this)">📁 Browse</button>
+      <button class="btn-xs ghost" onclick="openInFileManager('direct-src-in',this)" title="Show this folder in the file manager">↗ Open</button>
     </div>
     <div class="path-row">
       <span class="path-label out">Output</span>
       <input class="path-input" id="direct-dest-in" placeholder="folder to organise into" oninput="setActiveTargetDirect('dest')">
       <button class="btn-xs" onclick="nativePickDirect('dest',this)">📁 Browse</button>
+      <button class="btn-xs ghost" onclick="openInFileManager('direct-dest-in',this)" title="Show this folder in the file manager">↗ Open</button>
     </div>
     <div style="display:flex;gap:5px;margin-top:4px">
       <button class="btn-xs" style="flex:1" onclick="scanSourceDirect()">Scan source</button>
@@ -1652,6 +1767,23 @@ function pickFolder(path,target){
   document.getElementById(target==='src'?'src-in':'dest-in').value=path;
   activateBrowser(target);
   if(target==='src') scanSource();
+}
+// ── show a folder in the desktop file manager ────────────────────────────────
+// Explorer on Windows, Finder on macOS, xdg-open on Linux. Same desktop caveat
+// as the picker: it draws on the SERVER's desktop, so from another machine the
+// button just reports that and does nothing.
+async function openInFileManager(inputId,btn){
+  const inp=document.getElementById(inputId);
+  const path=(inp&&inp.value||'').trim();
+  if(!path){ alert('Pick a folder first'); return; }
+  const label=btn?btn.textContent:'';
+  if(btn){ btn.disabled=true; btn.textContent='…'; }
+  try{
+    const r=await fetch('/api/open-folder?path='+encodeURIComponent(path));
+    const d=await r.json();
+    if(!d.ok) alert('Cannot open folder: '+(d.reason||'failed'));
+  }catch(e){ alert('Cannot open folder'); }
+  finally{ if(btn){ btn.disabled=false; btn.textContent=label; } }
 }
 // ── native folder picker ──────────────────────────────────────────────────────
 // Opens a real GTK folder chooser on this machine's own desktop. If there's no
