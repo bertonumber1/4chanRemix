@@ -28,6 +28,7 @@ in, paths out. That makes it cheap to unit-test and easy to reason about.
 from __future__ import annotations
 
 import re
+import unicodedata
 from collections import Counter
 from pathlib import Path
 from typing import Any
@@ -117,6 +118,59 @@ def sanitise_path_part(
     return s or fallback
 
 
+# Words a release name may carry that the track title won't:
+# "Paper Dreams EP", "Paper Dreams - Single", "Bombas (Maxi Single)".
+_RELEASE_TYPE_WORDS = (
+    r"single|singles|ep|lp|album|maxi|maxi single|remix|remixes|"
+    r"the single|the album|original|original mix|12|7|12 inch|7 inch|"
+    r"vinyl|digital|edition|version"
+)
+
+
+def _compare_key(value: str | None) -> str:
+    """
+    Loose key for comparing two names: case-, accent- and punctuation-blind.
+
+    "Sensación" and "Sensacion" must compare equal, as must
+    "Paper Dreams" and "paper-dreams".
+    """
+    s = unicodedata.normalize("NFKD", str(value or ""))
+    s = "".join(c for c in s if not unicodedata.combining(c))
+    s = re.sub(r"[^\w\s]", " ", s, flags=re.UNICODE)
+    return re.sub(r"\s+", " ", s).strip().lower()
+
+
+def release_repeats_track(release: str | None, track_title: str | None) -> bool:
+    """
+    True when the release name says nothing the track title doesn't already.
+
+    Singles are routinely named after their A-side, which would otherwise
+    produce "Bjorn Akesson - Paper Dreams - Paper Dreams - Original Mix - 2015".
+    Matches an exact repeat, or a repeat plus a release-type word
+    ("Paper Dreams EP", "Paper Dreams - Single").
+
+    Only the RELEASE slot is dropped on a match — the track title is the
+    more specific field and always survives.
+    """
+    t = _compare_key(track_title)
+    if not t or not (release or "").strip():
+        return False
+
+    # Compare against the release BOTH as-is and with a trailing rendition
+    # parenthetical stripped, so a release literally titled
+    # "U & I (Extended Mix)" is recognised as repeating the track "U & I"
+    # whose mix slot already reads "Extended Mix".
+    rel_clean, _ = extract_freeform_middle(release)
+    for candidate in {_compare_key(release), _compare_key(rel_clean)}:
+        if not candidate:
+            continue
+        if candidate == t:
+            return True
+        if re.fullmatch(rf"{re.escape(t)}\s+(?:{_RELEASE_TYPE_WORDS})", candidate):
+            return True
+    return False
+
+
 # =============================================================================
 # YEAR / TRACK NORMALISATION
 # =============================================================================
@@ -198,7 +252,15 @@ def decide_album_type(
     }
     for album in album_values:
         for kw in mix_keywords:
-            if kw in album:
+            kw = kw.strip()
+            if not kw:
+                continue
+            # Word-boundary match, not plain substring — "mix" must not match
+            # inside "remix"/"megamix", which would misclassify any ordinary
+            # single-artist "(Radio Mix)"/"(Club Mix)"-titled track as a
+            # various-artists compilation (extremely common in dance/makina
+            # track titles, so a substring match here was a real, frequent bug).
+            if re.search(r"\b" + re.escape(kw) + r"\b", album):
                 return "mix"
 
     # --- check 3: track-artist diversity ---------------------------------
@@ -648,6 +710,55 @@ def decide_album_label(
 # PATH BUILDING
 # =============================================================================
 
+# Local Bit Music catalogue (Discogs label 10663, catno/title/artist/year) — used to
+# stamp the correct catalogue number when the live provider lookup misses or is wrong.
+_BM_CATALOG_PATH = "/home/media/BitMusicHunter/discogs_bitmusic_catalog.json"
+_BM_CATALOG = None
+
+
+def _bm_norm(value: str | None) -> str:
+    import re
+    return re.sub(r"[^a-z0-9]+", " ", (value or "").lower()).strip()
+
+
+def _load_bm_catalog():
+    global _BM_CATALOG
+    if _BM_CATALOG is None:
+        import json
+        try:
+            data = json.load(open(_BM_CATALOG_PATH, encoding="utf-8"))
+        except Exception:
+            data = []
+        _BM_CATALOG = [
+            (_bm_norm(c.get("title")), _bm_norm(c.get("artist")),
+             str(c.get("year") or ""), (c.get("catno") or "").strip())
+            for c in data if c.get("catno")
+        ]
+    return _BM_CATALOG
+
+
+def bitmusic_catno_lookup(album, artist, year):
+    """Best-match catalogue number from the local Bit Music catalogue, or None.
+    Strict: title similarity >= 0.90 plus year (+/-1), artist, or a near-exact title."""
+    from difflib import SequenceMatcher
+    ta = _bm_norm(album)
+    if len(ta) < 4:
+        return None
+    aa = _bm_norm(artist)
+    ay = "".join(ch for ch in str(year or "") if ch.isdigit())[:4]
+    best, best_score = None, 0.0
+    for nt, na, cy, catno in _load_bm_catalog():
+        sim = SequenceMatcher(None, ta, nt).ratio()
+        if sim < 0.90 or sim <= best_score:
+            continue
+        yr_ok = ay.isdigit() and cy.isdigit() and abs(int(ay) - int(cy)) <= 1
+        ar_ok = (SequenceMatcher(None, aa, na).ratio() >= 0.6) if (aa and na) else False
+        if not (yr_ok or ar_ok or sim >= 0.96):
+            continue
+        best, best_score = catno, sim
+    return best
+
+
 def build_destination_path(
     record: dict[str, Any],
     album_type: str,
@@ -674,14 +785,20 @@ def build_destination_path(
     Returns a Path. Does NOT touch the filesystem.
 
     Layout (when not broken):
+      Default (organise.folder_scheme = "artist_release_track_mix_year"),
+      one folder per track:
+        <artist> - <release> - <track> - <mix> - <year>/NN - <artist> - <title>.<ext>
+        Empty slots are dropped. Set folder_scheme to anything else
+        (e.g. "release") to fall back to the legacy layouts below.
+
       Standard labeled album:
-        <catno> - <year> - <artist>/album/NN - <title>.<ext>
+        <catno> - <artist> - <year>/album/NN - <title>.<ext>
       Single / EP:
-        <catno> - <year> - <artist>/single/NN - <title>.<ext>
+        <catno> - <artist> - <year>/single/NN - <title>.<ext>
       VA / mix compilation:
-        <catno> - <year> - <mix_name>/mix/NN - <artist> - <title>.<ext>
+        <catno> - <mix_name> - <year>/mix/NN - <artist> - <title>.<ext>
       Self-released:
-        Self-Released/<catno> - <year> - <artist>/album|single/NN - <title>.<ext>
+        Self-Released/<catno> - <artist> - <year>/album|single/NN - <title>.<ext>
       Broken:
         Broken/<original-basename>  (dumped flat)
 
@@ -729,70 +846,136 @@ def build_destination_path(
                                     max_length=max_len, fallback="Unknown Title"),
     )
 
-    # Catalogue number — prefer catalog_number, fall back to discogs_release_id.
+    # Catalogue number — prefer our authoritative local Bit Music catalogue when it
+    # confidently matches (fixes missing/wrong catnos from hit-or-miss live lookups),
+    # then the provider's catalog_number, then the discogs release id.
     catno_raw = (record.get("catalog_number") or "").strip()
-    if not catno_raw:
+    bm = bitmusic_catno_lookup(
+        record.get("album"),
+        record.get("primary_artist") or record.get("albumartist") or record.get("artist"),
+        record.get("year") or record.get("date"),
+    )
+    if bm:
+        catno_raw = bm
+    elif not catno_raw:
         catno_raw = str(record.get("discogs_release_id") or "").strip()
     catno = s(catno_raw, "")
 
-    # Release type subfolder: album / mix / single
+    # --- "(catno) Title (Year)" release folder (Bit-Music-archive style):
+    #     one folder per release, no album/mix/single subfolder,
+    #     filenames "NN - Artist - Title.ext" (artist always shown). ----------
     if album_type == "mix":
-        type_folder = "mix"
-    elif (is_single or
-          (record.get("release_type") or "").lower() in ("single", "ep")):
-        type_folder = "single"
+        file_artist = s(record.get("artist"), unknown_artist)
     else:
-        type_folder = "album"
-
-    if album_type == "mix":
-        # Mix layout: catno - year - mix_name / mix / NN - Artist - Title.ext
-        track_artist = s(record.get("artist"), unknown_artist)
-
-        owner_parts = [p for p in [catno, year, album] if p]
-        owner_folder = s(
-            " - ".join(owner_parts) if owner_parts else album,
-            unknown_album,
-        )
-
-        if track:
-            filename = f"{track} - {track_artist} - {title}{ext}"
-        else:
-            filename = f"{track_artist} - {title}{ext}"
-
-    else:
-        # Solo layout: catno - year - artist / album|single / NN - Title.ext
-        primary = record.get("primary_artist") or record.get("albumartist") or record.get("artist")
-        artist_folder = s(primary, unknown_artist)
-
-        owner_parts = [p for p in [catno, year, artist_folder] if p]
-        owner_folder = s(
-            " - ".join(owner_parts) if owner_parts else artist_folder,
+        file_artist = s(
+            record.get("primary_artist") or record.get("albumartist") or record.get("artist"),
             unknown_artist,
         )
 
-        if track:
-            filename = f"{track} - {title}{ext}"
-        else:
-            filename = f"{title}{ext}"
+    # release title: the album/comp name (mix comps use the compilation name)
+    rel_title = album  # already sanitised above from record['album']
 
-    # Also sanitise the filename as a path component (extension preserved).
+    # ------------------------------------------------------------------
+    # "Artist - Release - Track - Mix - Year"  —  ONE FOLDER PER TRACK.
+    #
+    # Owner's scheme (2026-09-08): the five fields in that fixed order,
+    # joined with " - ", with the audio file inside. Track and mix are
+    # per-track values, which is why this is a folder per track and not
+    # per release.
+    #
+    # Empty slots are DROPPED, never padded — the rest of this function
+    # already omits catno/year when absent, and a missing mix must not
+    # leave "Artist - Release - Track -  - 2001" behind. Artist is the
+    # one exception: it keeps its "Unknown Artist" fallback so a folder
+    # never begins with a bare separator.
+    # ------------------------------------------------------------------
+    scheme = str(cfg.get("folder_scheme") or "artist_release_track_mix_year")
+    if scheme.strip().lower() == "artist_release_track_mix_year":
+        def slot(value: str | None) -> str:
+            """Sanitise one folder slot. Empty result means 'omit this slot'."""
+            return sanitise_path_part(
+                value, illegal_chars=illegal, max_length=max_len, fallback="",
+            )
+
+        # "Sensacion (Original Mix)" -> track "Sensacion", mix "Original Mix".
+        # A title carrying no rendition parenthetical falls back to the
+        # remixer tag, which metadata.py already reads (remixer / TPE4).
+        track_title, mix_raw = extract_freeform_middle(record.get("title") or "")
+        if not mix_raw:
+            mix_raw = (record.get("remixer") or "").strip()
+
+        track_slot = slot(track_title) or title
+
+        # A single named after its own A-side would otherwise repeat itself:
+        # "Bjorn Akesson - Paper Dreams - Paper Dreams - Original Mix - 2015".
+        # Drop the release when it adds nothing over the track title.
+        release_raw = record.get("album")
+        release_slot = "" if release_repeats_track(release_raw, track_slot) \
+            else slot(release_raw)
+
+        parts = [
+            file_artist,                      # keeps its unknown-artist fallback
+            release_slot,                     # raw, so a missing release drops out
+            track_slot,
+            slot(mix_raw),
+            year,
+        ]
+        folder_name = s(" - ".join(part for part in parts if part), unknown_album)
+
+        if track:
+            filename = f"{track} - {file_artist} - {title}{ext}"
+        else:
+            filename = f"{file_artist} - {title}{ext}"
+        name_stem, _, name_ext = filename.rpartition(".")
+        if name_stem:
+            name_stem = s(name_stem, "Unknown Track")
+            filename = f"{name_stem}.{name_ext}" if name_ext else name_stem
+
+        base = dest_root / "Self-Released" if is_self_release else dest_root
+        return base / folder_name / filename
+
+    # Direct mode ("organise.artist_led_folder" in cfg) wants a two-level
+    # nest: outer folder is the catalog/artist container, inner folder is
+    # the specific release. Only applies to solo releases — a mix/VA comp
+    # has no single meaningful folder-level artist, so it keeps the plain
+    # single-level layout.
+    artist_led = bool(cfg.get("artist_led_folder", False)) and album_type != "mix" \
+        and file_artist and file_artist != unknown_artist
+
+    if artist_led:
+        outer_name = s(
+            (f"({catno}) " if catno else "") + file_artist + (f" ({year})" if year else ""),
+            unknown_artist,
+        )
+        inner_name = s(
+            f"{file_artist} - {rel_title}" + (f" ({year})" if year else ""),
+            unknown_album,
+        )
+        filename = f"{track} - {title}{ext}" if track else f"{title}{ext}"
+        name_stem, _, name_ext = filename.rpartition(".")
+        if name_stem:
+            name_stem = s(name_stem, "Unknown Track")
+            filename = f"{name_stem}.{name_ext}" if name_ext else name_stem
+        # --- routing:  (catno) Artist (Year) / Artist - Album (Year) / NN - Title.ext
+        base = dest_root / "Self-Released" if is_self_release else dest_root
+        return base / outer_name / inner_name / filename
+
+    folder_name = s(
+        (f"({catno}) " if catno else "") + rel_title + (f" ({year})" if year else ""),
+        unknown_album,
+    )
+    if track:
+        filename = f"{track} - {file_artist} - {title}{ext}"
+    else:
+        filename = f"{file_artist} - {title}{ext}"
+
+    # sanitise the filename as a path component (extension preserved)
     name_stem, _, name_ext = filename.rpartition(".")
     if name_stem:
         name_stem = s(name_stem, "Unknown Track")
         filename = f"{name_stem}.{name_ext}" if name_ext else name_stem
 
-    # --- routing ---------------------------------------------------------
-    # Standard:  <quality>/<catno - year - artist>/<type>/<filename>
-    # Self-rel:  <quality>/Self-Released/<catno - year - artist>/<type>/<filename>
+    # --- routing:  (catno) Title (Year) / NN - Artist - Title.ext ---------
     if is_self_release:
-        sr_root = dest_root / "Self-Released"
-        primary = record.get("primary_artist") or record.get("albumartist") or record.get("artist")
-        artist_folder = s(primary, unknown_artist)
-        owner_parts = [p for p in [catno, year, artist_folder] if p]
-        sr_owner = s(
-            " - ".join(owner_parts) if owner_parts else artist_folder,
-            unknown_artist,
-        )
-        return sr_root / sr_owner / type_folder / filename
-
-    return dest_root / owner_folder / type_folder / filename
+        return dest_root / "Self-Released" / folder_name / filename
+    return dest_root / folder_name / filename

@@ -55,9 +55,11 @@ The service runs in the background and auto-starts whenever you log in.
 
 ## Requirements
 
-- **Linux** with systemd (Ubuntu 20.04+, Debian 11+, etc.)
 - **Python 3.10+** — check with `python3 --version`
+- **Linux with systemd** for the one-command install (Ubuntu 20.04+, Debian 11+, etc.).
+  The app itself also runs on **Windows** and **macOS** — see [Running on Windows](#running-on-windows).
 - **fpcalc** — for AcoustID fingerprinting: `sudo apt install libchromaprint-tools`
+  (Windows: drop `fpcalc.exe` from the Chromaprint release on your `PATH`)
 - Internet access for metadata lookups (Discogs, MusicBrainz, etc.)
 
 All Python packages are installed automatically when you run `bash install.sh --deps`.
@@ -108,7 +110,7 @@ make status
 |---|---|
 | **Import** | Scans source folder, moves FLACs into output, detects duplicates |
 | **Fetch Tags** | Looks up metadata from Discogs, MusicBrainz, Deezer, Bandcamp, AcoustID |
-| **Organise** | Renames and moves files into `<year> - <artist>/album\|single\|mix/` layout |
+| **Organise** | Renames and moves files into `<artist> - <year>/album\|single\|mix/` layout |
 
 Run them individually or all at once with **Run All**.
 
@@ -153,18 +155,56 @@ Removes the service and control script. Your music files and databases are untou
 
 ---
 
+## Running on Windows
+
+`install.sh` is Linux-only (it installs a systemd user unit), but nothing in the
+app is. On Windows, run it directly:
+
+```powershell
+py -m pip install -r requirements.txt
+py web_ui.py
+```
+
+Then open the URL it prints. What changes on Windows:
+
+| | Behaviour |
+|---|---|
+| **📁 Browse** | Opens the native `FolderBrowserDialog` (via PowerShell) instead of zenity. It draws on the desktop of the account running the server, so it only helps when you're at that machine — from a browser elsewhere it falls back to the in-page tree browser automatically. |
+| **Tree browser** | `/` is a virtual root listing the drive letters (`C:\`, `D:\`, …), since Windows has no single filesystem root. Network shares work by UNC path (`\\host\share`). |
+| **Restart service** | There's no systemd unit to restart, so the app starts a replacement process and exits. That assumes **you** started it — if you wrapped it in a service manager (NSSM et al.) that also restarts the process, use the service manager's own restart instead or you'll end up with two copies fighting over port 8082. |
+| **Config** | Still `~/.config/music-organiser/config.toml`, which resolves to `C:\Users\<you>\.config\music-organiser\config.toml`. Paths in it are per-machine — a config copied from a Linux box points at `/mnt/...` folders that don't exist here, and a non-existent path just yields nothing rather than erroring. |
+
+**Long paths.** The default one-folder-per-track scheme produces long names, and a
+folder name plus a filename can pass the old 260-character `MAX_PATH` limit. Either
+enable long paths once (Windows 10 1607+, admin PowerShell):
+
+```powershell
+New-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\FileSystem" `
+  -Name LongPathsEnabled -Value 1 -PropertyType DWord -Force
+```
+
+or lower `max_component_length` (default `200`) in `config.toml`.
+
+Illegal filename characters (`< > : " / \ | ? *`) are already stripped from every
+path component on all platforms, so tags with a `:` or `?` in them are safe.
+
+---
+
 ## Folder layout
+
+One folder per track, five slots in a fixed order —
+`Artist - Release - Track - Mix - Year`. Empty slots are dropped, never padded:
 
 ```
 <output>/
-  2024 - Artist Name/
-    single/
-      01 - Track Title.flac
-  2023 - VA - Album Name/
-    mix/
-      01 - Track.flac
-      cover.jpg
+  Bjorn Akesson - Paper Dreams - Original Mix - 2015/
+    01 - Bjorn Akesson - Paper Dreams (Original Mix).flac
+  Chimo Bayo - Exta Si Exta No - Bombas - 1991/
+    03 - Chimo Bayo - Bombas.flac
 ```
+
+Set `folder_scheme = "release"` in `config.toml` for the older one-folder-per-release
+layout instead: `(<catno>) <Title> (<Year>)/NN - <Artist> - <Title>.ext`.
 
 ---
 

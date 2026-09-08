@@ -6,7 +6,7 @@ Open: http://192.168.0.65:8082
 """
 from __future__ import annotations
 
-import asyncio, json, logging, re, signal, socket, sqlite3, sys, threading, time
+import asyncio, json, logging, os, re, shutil, signal, socket, sqlite3, subprocess, sys, threading, time
 from pathlib import Path
 from queue import Empty, Queue
 from typing import Any
@@ -238,6 +238,64 @@ def _do_organise(ui, dest, cfg, dry_run):
     organise_in_place(db, cfg=override, ui=ui, dry_run=dry_run)
 
 
+def _do_direct(ui, sources, dest, provider_ids, cfg, dry_run):
+    """Direct mode: import → fetch tags → organise, chained on a single
+    throwaway in-memory DB (Database(":memory:") — see database.py). Nothing
+    persists to a database file; sources+dest are the only inputs, output is
+    just organised files on disk with Beatport-style "(catno) Artist - Album
+    (Year)/NN - Title.ext" naming (see organise.artist_led_folder in
+    organiser_core.build_destination_path)."""
+    from database import Database
+    from importer import import_sources, organise_in_place
+    from metadata_lookup import fill_missing_metadata
+    from metadata_providers import make_provider
+
+    if not sources:
+        ui.log("broken", "no source folder set"); return
+    if not dest:
+        ui.log("broken", "no output folder set"); return
+
+    override = dict(cfg)
+    p = dict(override.get("paths", {}))
+    p["sources"] = sources
+    p["destination_root"] = dest
+    p["database"] = ":memory:"
+    override["paths"] = p
+    organise_cfg = dict(override.get("organise", {}))
+    organise_cfg["artist_led_folder"] = True
+    override["organise"] = organise_cfg
+
+    ui.log("info", "DIRECT MODE — no database will be written, files only")
+    if dry_run: ui.log("info", "DRY RUN — nothing will be moved or written")
+
+    db = Database(":memory:")
+    try:
+        import_sources(sources, cfg=override, db=db, ui=ui, dry_run=dry_run)
+
+        provs = []
+        for pid in provider_ids:
+            pr = make_provider(pid)
+            if pr is None: continue
+            try: pr.configure(cfg, lambda **kw: None)
+            except Exception: pass
+            provs.append(pr)
+        if provs:
+            ui.log("info", f"providers: {[pr.id for pr in provs]}")
+            fill_missing_metadata(
+                db, providers=provs,
+                target_columns=["year","label","catalog_number","genre","country",
+                                "mb_release_id","discogs_release_id","release_type","barcode"],
+                only_missing=True, write_to_files=not dry_run,
+                db_path=":memory:", resume=False, ui=ui,
+            )
+        else:
+            ui.log("warning", "no providers configured — organising from existing tags only")
+
+        organise_in_place(db, cfg=override, ui=ui, dry_run=dry_run)
+    finally:
+        db.close()
+
+
 def _do_rebuild(ui, dest, cfg):
     from database import Database
     from indexer import index_tree
@@ -296,6 +354,8 @@ def _run_job(kind, sources, dest, provider_ids, cfg, dry_run):
                 _do_fetch(ui, provider_ids, cfg, dry_run, only_missing=False)
             elif kind == "organise":
                 _do_organise(ui, dest, cfg, dry_run)
+            elif kind == "direct":
+                _do_direct(ui, sources, dest, provider_ids, cfg, dry_run)
             elif kind == "rebuild":
                 _do_rebuild(ui, dest, cfg)
             elif kind == "vacuum":
@@ -316,6 +376,14 @@ app = FastAPI(title="music-organiser")
 
 @app.get("/", response_class=HTMLResponse)
 def root(): return HTMLResponse(_HTML)
+
+
+@app.get("/wallpaper.jpg")
+def wallpaper():
+    from fastapi.responses import FileResponse
+    import os
+    p = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets", "wallpaper-pirate.jpg")
+    return FileResponse(p, media_type="image/jpeg")
 
 
 @app.get("/api/config")
@@ -344,8 +412,9 @@ def get_config():
     except Exception as exc:
         plist = [{"id":"error","name":str(exc),"requires_auth":False,
                   "key_field":None,"has_key":False,"key_hint":"","enabled":False}]
-    br = paths.get("destination_root","") or "/mnt"
-    if not Path(br).exists(): br = "/"
+    # Where the tree browser opens. "/" is the drive list on Windows.
+    br = paths.get("destination_root", "") or ("" if os.name == "nt" else "/mnt")
+    if not br or not Path(br).exists(): br = "/"
     return JSONResponse({
         "sources": paths.get("sources", []),
         "destination_root": paths.get("destination_root",""),
@@ -364,8 +433,34 @@ async def save_config(request: Request):
         return JSONResponse({"error": str(exc)}, status_code=500)
 
 
+# "/" is the tree browser's root. On Linux that is a real directory; on
+# Windows there is no single root, so "/" is a VIRTUAL root listing the drives
+# (C:\\, D:\\, …). Path("/") is a real, valid path on Windows too — it means
+# "root of the current drive" — so the virtual root has to be intercepted
+# before any Path() work, or D: would be unreachable from the browser.
+_VROOT = "/"
+
+
+def _windows_drives() -> list[str]:
+    """Drive roots that currently exist, e.g. ['C:\\', 'D:\\']."""
+    import ctypes, string
+    try:
+        mask = ctypes.windll.kernel32.GetLogicalDrives()
+    except Exception:
+        return []
+    return [f"{letter}:\\" for i, letter in enumerate(string.ascii_uppercase)
+            if mask >> i & 1]
+
+
+def _is_vroot(path: str) -> bool:
+    return os.name == "nt" and path.strip() in ("", "/", "\\", _VROOT)
+
+
 @app.get("/api/browse")
 def browse(path: str = "/"):
+    if _is_vroot(path):
+        entries = [{"name": d, "path": d, "is_dir": True} for d in _windows_drives()]
+        return JSONResponse({"path": _VROOT, "parent": None, "entries": entries})
     p = Path(path)
     if not p.is_dir(): p = p.parent
     try:
@@ -375,7 +470,138 @@ def browse(path: str = "/"):
     except PermissionError:
         entries = []
     parent = str(p.parent) if str(p) != str(p.parent) else None
+    # At a drive root (C:\) the parent is itself, which would dead-end the
+    # browser on that one drive — send it back to the drive list instead.
+    if parent is None and os.name == "nt":
+        parent = _VROOT
     return JSONResponse({"path": str(p), "parent": parent, "entries": entries})
+
+
+_PICKER_LOCK = threading.Lock()
+
+
+def _picker_start_dir(start: str) -> Path | None:
+    """Normalise the 'open here' hint: an existing dir, else its parent."""
+    if not start.strip():
+        return None
+    d = Path(start).expanduser()
+    if d.is_dir():
+        return d
+    return d.parent if d.parent.is_dir() else None
+
+
+def _pick_zenity(start_dir: Path | None) -> tuple[bool, str]:
+    """GTK folder chooser on this machine's X display (Linux)."""
+    if not shutil.which("zenity"):
+        return False, "zenity not installed"
+    if not os.environ.get("DISPLAY") and not os.environ.get("WAYLAND_DISPLAY"):
+        return False, "no display"
+    cmd = ["zenity", "--file-selection", "--directory",
+           "--title=music-organiser — choose a folder"]
+    if start_dir is not None:
+        # trailing slash: zenity opens INSIDE the dir rather than beside it
+        cmd.append(f"--filename={start_dir}/")
+    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+    if proc.returncode != 0:
+        return False, "cancelled"
+    return True, (proc.stdout or "").strip()
+
+
+def _windows_has_desktop() -> bool:
+    """False when we're running as a session-0 service, which has no desktop
+    to draw a dialog on — the dialog would hang invisibly until the timeout."""
+    import ctypes
+    try:
+        k32 = ctypes.windll.kernel32
+        sid = ctypes.c_ulong()
+        if not k32.ProcessIdToSessionId(k32.GetCurrentProcessId(), ctypes.byref(sid)):
+            return True          # couldn't tell — let it try
+        return sid.value != 0
+    except Exception:
+        return True
+
+
+def _pick_windows(start_dir: Path | None) -> tuple[bool, str]:
+    """WinForms FolderBrowserDialog via PowerShell (Windows).
+
+    powershell.exe needs -STA for WinForms; pwsh (7+) dropped that switch and
+    is already STA, hence the two spellings. The chosen path goes to stdout on
+    its own — anything PowerShell writes as a warning stays on stderr.
+    """
+    if not _windows_has_desktop():
+        return False, "no interactive desktop (running as a service)"
+    exe = shutil.which("powershell") or shutil.which("powershell.exe")
+    args = ["-NoProfile", "-STA", "-NonInteractive", "-Command", "-"]
+    if not exe:
+        exe = shutil.which("pwsh")
+        args = ["-NoProfile", "-NonInteractive", "-Command", "-"]
+    if not exe:
+        return False, "powershell not found"
+    initial = str(start_dir) if start_dir is not None else ""
+    script = (
+        "Add-Type -AssemblyName System.Windows.Forms | Out-Null\n"
+        "$d = New-Object System.Windows.Forms.FolderBrowserDialog\n"
+        "$d.Description = 'music-organiser - choose a folder'\n"
+        "$d.ShowNewFolderButton = $true\n"
+        f"$d.SelectedPath = '{initial.replace(chr(39), chr(39) * 2)}'\n"
+        "if ($d.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) "
+        "{ [Console]::Out.Write($d.SelectedPath) }\n"
+    )
+    proc = subprocess.run([exe] + args, input=script,
+                          capture_output=True, text=True, timeout=300)
+    chosen = (proc.stdout or "").strip()
+    if not chosen:
+        return False, "cancelled"
+    return True, chosen
+
+
+def _pick_macos(start_dir: Path | None) -> tuple[bool, str]:
+    """Finder's own chooser via osascript (macOS)."""
+    if not shutil.which("osascript"):
+        return False, "osascript not found"
+    default = f' default location POSIX file "{start_dir}"' if start_dir else ""
+    script = f'POSIX path of (choose folder with prompt "Choose a folder"{default})'
+    proc = subprocess.run(["osascript", "-e", script],
+                          capture_output=True, text=True, timeout=300)
+    if proc.returncode != 0:
+        return False, "cancelled"
+    return True, (proc.stdout or "").strip()
+
+
+@app.get("/api/pick-folder")
+def pick_folder(start: str = ""):
+    """Open the platform's own folder chooser and return the chosen directory.
+
+    zenity on Linux, a WinForms FolderBrowserDialog on Windows, osascript on
+    macOS. The dialog is drawn on THIS machine's desktop, so it only helps when
+    the UI is being driven from the box the server runs on — a browser on
+    another machine has no desktop here to draw on. In that case (or with no
+    picker binary available) we return ok=False and the front-end silently
+    falls back to the in-page tree browser, which works from anywhere.
+    """
+    # One dialog at a time — a second would fight for focus and the user would
+    # have no idea which field they were answering.
+    if not _PICKER_LOCK.acquire(blocking=False):
+        return JSONResponse({"ok": False, "reason": "a picker is already open"})
+    try:
+        start_dir = _picker_start_dir(start)
+        if os.name == "nt":
+            ok, result = _pick_windows(start_dir)
+        elif sys.platform == "darwin":
+            ok, result = _pick_macos(start_dir)
+        else:
+            ok, result = _pick_zenity(start_dir)
+        if not ok:
+            return JSONResponse({"ok": False, "reason": result})
+        if not result or not Path(result).is_dir():
+            return JSONResponse({"ok": False, "reason": "cancelled"})
+        return JSONResponse({"ok": True, "path": result})
+    except subprocess.TimeoutExpired:
+        return JSONResponse({"ok": False, "reason": "timed out"})
+    except Exception as exc:
+        return JSONResponse({"ok": False, "reason": str(exc)})
+    finally:
+        _PICKER_LOCK.release()
 
 
 @app.get("/api/scan")
@@ -567,7 +793,7 @@ async def job_stream():
 @app.post("/api/job/{kind}")
 async def start_job(kind: str, request: Request):
     global _job_thread
-    valid = {"import","fetch","fetch_broken","organise","pipeline",
+    valid = {"import","fetch","fetch_broken","organise","pipeline","direct",
              "rebuild","vacuum","stop"}
     if kind not in valid:
         return JSONResponse({"error": f"unknown job: {kind}"}, status_code=400)
@@ -610,6 +836,85 @@ def health():
     })
 
 
+def _restart_mode() -> str:
+    """How this instance can restart itself.
+
+    "systemd" when we are actually running as the user unit (the only case
+    where `systemctl --user restart` restarts US and not some other, possibly
+    stopped, copy). Otherwise "respawn" — launch a fresh process and exit,
+    which is what a hand-started run on Windows or macOS needs.
+    """
+    if os.name == "nt" or not shutil.which("systemctl"):
+        return "respawn"
+    try:
+        r = subprocess.run(
+            ["systemctl", "--user", "is-active", "music-organiser.service"],
+            capture_output=True, text=True, timeout=5,
+        )
+        if (r.stdout or "").strip() == "active":
+            return "systemd"
+    except Exception:
+        pass
+    return "respawn"
+
+
+def _respawn_self(delay: float = 3.0) -> None:
+    """Start a replacement process, then exit this one.
+
+    The replacement can't bind the port until we've let go of it, so it is a
+    tiny launcher that sleeps first and only then starts the real server —
+    detached, so it survives our exit. Assumes you started the app yourself:
+    under a supervisor that restarts the process (NSSM, a systemd unit we
+    failed to detect) this would leave two copies fighting over the port.
+    """
+    argv = [sys.executable, str(Path(__file__).resolve())] + sys.argv[1:]
+    launcher = ("import subprocess,sys,time;"
+                "time.sleep(float(sys.argv[1]));"
+                "subprocess.Popen(sys.argv[2:])")
+    kwargs: dict[str, Any] = {
+        "cwd": str(Path(__file__).resolve().parent),
+        "stdout": subprocess.DEVNULL, "stderr": subprocess.DEVNULL,
+    }
+    if os.name == "nt":
+        # DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP — no console, own group,
+        # so closing/killing this process doesn't take the replacement with it.
+        kwargs["creationflags"] = 0x00000008 | 0x00000200
+    else:
+        kwargs["start_new_session"] = True
+    subprocess.Popen([sys.executable, "-c", launcher, str(delay)] + argv, **kwargs)
+
+    def _bye():
+        time.sleep(1.0)   # let this request's response reach the browser first
+        os._exit(0)
+    threading.Thread(target=_bye, daemon=True).start()
+
+
+@app.post("/api/restart")
+async def restart_service(request: Request):
+    body = await request.json() if await request.body() else {}
+    force = bool(body.get("force"))
+    job_running = bool(_job_thread and _job_thread.is_alive())
+    if job_running and not force:
+        return JSONResponse(
+            {"error": "a job is currently running — stop it first, or pass force"},
+            status_code=409,
+        )
+    mode = _restart_mode()
+    log.info("restart requested via web UI (%s)%s", mode,
+             " (forced, job was running)" if force and job_running else "")
+    if mode == "systemd":
+        # Detached, delayed so this request's response reaches the client before
+        # the service (and this process) goes down. start_new_session=True keeps
+        # it alive independently of this process's own group.
+        subprocess.Popen(
+            ["/bin/sh", "-c", "sleep 1 && systemctl --user restart music-organiser.service"],
+            start_new_session=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+    else:
+        _respawn_self()
+    return JSONResponse({"ok": True, "mode": mode})
+
+
 # ─── HTML ─────────────────────────────────────────────────────────────────────
 _HTML = r"""<!DOCTYPE html>
 <html lang="en">
@@ -619,20 +924,32 @@ _HTML = r"""<!DOCTYPE html>
 <title>music-organiser</title>
 <style>
 :root{
-  --bg:#0c0c14;--panel:#12121c;--card:#17172280;--border:#252538;
-  --acc:#7c6aff;--acc2:#ff6a9b;--text:#c8c8d8;--dim:#55556a;
+  --bg:#0a0908;--panel:#14110dee;--card:#1a150e88;--border:#3a2f22;
+  --acc:#d63a2f;--acc2:#e0a53a;--text:#e8ddc6;--dim:#847660;
   --ok:#4ecb71;--warn:#f0c040;--err:#ff5566;--info:#60b8ff;--dup:#c060f0;
 }
 *{box-sizing:border-box;margin:0;padding:0}
-body{background:var(--bg);color:var(--text);
+body{color:var(--text);background:var(--bg);
      font-family:'JetBrains Mono','Fira Code','Cascadia Code',monospace;
      font-size:13px;height:100vh;display:flex;flex-direction:column;overflow:hidden}
+/* fixed pirate-flag backdrop, heavily darkened so the dense UI stays readable */
+body::before{content:"";position:fixed;inset:0;z-index:-1;pointer-events:none;
+     background:
+       radial-gradient(ellipse at top,rgba(30,22,14,.30) 0%,transparent 60%),
+       linear-gradient(rgba(8,7,6,.80),rgba(6,5,4,.90)),
+       url("/wallpaper.jpg") center/cover no-repeat fixed}
 
 /* HEADER */
 header{background:var(--panel);border-bottom:1px solid var(--border);
-       padding:6px 14px;display:flex;align-items:center;gap:10px;flex-shrink:0}
-header h1{font-size:13px;background:linear-gradient(90deg,var(--acc),var(--acc2));
-          -webkit-background-clip:text;-webkit-text-fill-color:transparent;white-space:nowrap}
+       padding:7px 16px;display:flex;align-items:center;gap:14px;flex-shrink:0}
+/* street-graffiti stencil wordmark: bone fill, hard black stencil edge, red
+   overspray, roughened by the #graffiti-rough turbulence filter */
+header h1{font-family:"Impact","Haettenschweiler","Franklin Gothic Bold","Arial Black",sans-serif;
+          font-size:25px;font-weight:900;letter-spacing:1px;text-transform:uppercase;line-height:1;
+          color:#ece3d0;white-space:nowrap;-webkit-text-stroke:1.4px #0a0a0a;
+          text-shadow:2px 2px 0 #0a0a0a,0 0 5px rgba(0,0,0,.9),
+                      0 0 16px rgba(214,58,47,.55),0 0 32px rgba(214,58,47,.25);
+          filter:url(#graffiti-rough)}
 .tabs{display:flex;gap:2px;margin-left:6px}
 .tab-btn{background:none;border:1px solid transparent;color:var(--dim);
          padding:3px 11px;border-radius:4px;cursor:pointer;font:inherit;font-size:11px;
@@ -652,20 +969,24 @@ header h1{font-size:13px;background:linear-gradient(90deg,var(--acc),var(--acc2)
 
 /* ═══ PIPELINE TAB ═══ */
 #tab-pipeline{flex-direction:row}
+#tab-direct{flex-direction:row}
 aside{width:310px;min-width:240px;border-right:1px solid var(--border);
       display:flex;flex-direction:column;overflow:hidden;flex-shrink:0}
 .card{border-bottom:1px solid var(--border);padding:10px 12px;flex-shrink:0}
 .card h3{font-size:9px;text-transform:uppercase;letter-spacing:.12em;
          color:var(--dim);margin-bottom:8px}
-.path-row{display:flex;gap:4px;margin-bottom:5px;align-items:center}
-.path-label{font-size:10px;color:var(--dim);min-width:38px}
-.path-input{flex:1;background:#181824;border:1px solid var(--border);
-            color:var(--text);padding:4px 7px;border-radius:3px;
-            font:inherit;font-size:11px;min-width:0}
-.path-input:focus{outline:none;border-color:var(--acc)}
-.path-input.active-target{border-color:var(--acc)!important}
-.btn-xs{background:var(--acc);border:none;color:#fff;padding:4px 9px;
-        border-radius:3px;cursor:pointer;font:inherit;font-size:10px;white-space:nowrap}
+.path-row{display:flex;gap:6px;margin-bottom:8px;align-items:center}
+.path-label{font-size:9px;font-weight:800;text-transform:uppercase;letter-spacing:.09em;
+            min-width:54px;padding:6px 6px;border-radius:4px;text-align:center;color:#120c04}
+.path-label.src{background:var(--acc2)}
+.path-label.out{background:var(--acc);color:#fff}
+.path-input{flex:1;background:#1c1710;border:1px solid var(--border);
+            color:var(--text);padding:7px 9px;border-radius:4px;
+            font:inherit;font-size:12px;min-width:0;transition:border-color .15s,box-shadow .15s}
+.path-input:focus{outline:none;border-color:var(--acc2);box-shadow:0 0 0 2px rgba(224,165,58,.18)}
+.path-input.active-target{border-color:var(--acc2)!important;box-shadow:0 0 0 2px rgba(224,165,58,.22)}
+.btn-xs{background:var(--acc);border:none;color:#fff;padding:6px 11px;
+        border-radius:4px;cursor:pointer;font:inherit;font-size:10px;font-weight:700;white-space:nowrap}
 .btn-xs:hover{opacity:.82}
 .btn-xs.ghost{background:#1e1e30;color:var(--dim)}
 .btn-xs.ghost:hover{color:var(--text)}
@@ -849,16 +1170,24 @@ textarea.sql-input:focus{outline:none;border-color:var(--acc)}
 </style>
 </head>
 <body>
+<svg width="0" height="0" style="position:absolute" aria-hidden="true">
+  <filter id="graffiti-rough">
+    <feTurbulence type="fractalNoise" baseFrequency="0.02 0.03" numOctaves="2" seed="7" result="n"/>
+    <feDisplacementMap in="SourceGraphic" in2="n" scale="3" xChannelSelector="R" yChannelSelector="G"/>
+  </filter>
+</svg>
 <header>
-  <h1>♪ music-organiser</h1>
+  <h1 title="music-organiser">Smash-n-Grab</h1>
   <nav class="tabs">
     <button class="tab-btn active" onclick="switchTab('pipeline')">Pipeline</button>
+    <button class="tab-btn" onclick="switchTab('direct')">Direct</button>
     <button class="tab-btn" onclick="switchTab('session')">Session</button>
     <button class="tab-btn" onclick="switchTab('library')">Library</button>
     <button class="tab-btn" onclick="switchTab('tools')">Tools</button>
   </nav>
   <span id="hdr-status">idle</span>
   <button class="hdr-btn" id="save-btn" onclick="saveConfig()">Save config</button>
+  <button class="hdr-btn" id="restart-btn" onclick="restartService()">Restart service</button>
 </header>
 
 <!-- ═══════════════ PIPELINE TAB ═══════════════ -->
@@ -867,14 +1196,14 @@ textarea.sql-input:focus{outline:none;border-color:var(--acc)}
   <div class="card">
     <h3>Input / Output</h3>
     <div class="path-row">
-      <span class="path-label">Source</span>
-      <input class="path-input" id="src-in" placeholder="/mnt/…" oninput="setActiveTarget('src')">
-      <button class="btn-xs ghost" onclick="activateBrowser('src')">browse</button>
+      <span class="path-label src">Source</span>
+      <input class="path-input" id="src-in" placeholder="folder to read from" oninput="setActiveTarget('src')">
+      <button class="btn-xs" onclick="nativePick('src',this)">📁 Browse</button>
     </div>
     <div class="path-row">
-      <span class="path-label">Output</span>
-      <input class="path-input" id="dest-in" placeholder="/mnt/…" oninput="setActiveTarget('dest')">
-      <button class="btn-xs ghost" onclick="activateBrowser('dest')">browse</button>
+      <span class="path-label out">Output</span>
+      <input class="path-input" id="dest-in" placeholder="folder to organise into" oninput="setActiveTarget('dest')">
+      <button class="btn-xs" onclick="nativePick('dest',this)">📁 Browse</button>
     </div>
     <div style="display:flex;gap:5px;margin-top:4px">
       <button class="btn-xs" style="flex:1" onclick="scanSource()">Scan source</button>
@@ -924,6 +1253,66 @@ textarea.sql-input:focus{outline:none;border-color:var(--acc)}
   </div>
 </div>
 </div><!-- /pipeline -->
+
+<!-- ═══════════════ DIRECT TAB ═══════════════ -->
+<div id="tab-direct" class="tab-content">
+<aside>
+  <div class="card">
+    <h3>Direct mode — input / output, no database</h3>
+    <div class="path-row">
+      <span class="path-label src">Source</span>
+      <input class="path-input" id="direct-src-in" placeholder="folder to read from" oninput="setActiveTargetDirect('src')">
+      <button class="btn-xs" onclick="nativePickDirect('src',this)">📁 Browse</button>
+    </div>
+    <div class="path-row">
+      <span class="path-label out">Output</span>
+      <input class="path-input" id="direct-dest-in" placeholder="folder to organise into" oninput="setActiveTargetDirect('dest')">
+      <button class="btn-xs" onclick="nativePickDirect('dest',this)">📁 Browse</button>
+    </div>
+    <div style="display:flex;gap:5px;margin-top:4px">
+      <button class="btn-xs" style="flex:1" onclick="scanSourceDirect()">Scan source</button>
+      <span id="direct-scan-result" style="font-size:10px;color:var(--dim);line-height:22px"></span>
+    </div>
+    <p style="font-size:10px;color:var(--dim);margin-top:8px;line-height:1.4">
+      Fix + organise straight to disk — no session/library DB involved.
+      One shot: reads tags, looks up Discogs/MusicBrainz/etc for whatever's
+      missing, writes tags back to the files, then moves everything into
+      <code>(catalog#) Artist - Album (Year)/NN - Title.ext</code>.
+    </p>
+  </div>
+  <div class="card">
+    <h3>Providers &amp; API keys</h3>
+    <div id="direct-prov-list"></div>
+  </div>
+  <div class="card" style="padding-bottom:5px;flex-shrink:0">
+    <h3>Filesystem browser</h3>
+    <div class="browser-target">
+      <button class="btn-xs ghost active" id="direct-bt-src" onclick="activateBrowserDirect('src')">▸ Source</button>
+      <button class="btn-xs ghost" id="direct-bt-dest" onclick="activateBrowserDirect('dest')">▸ Output</button>
+    </div>
+    <div class="bpath" id="direct-b-path">/</div>
+  </div>
+  <div class="browser-wrap" id="direct-browser"></div>
+</aside>
+
+<div class="log-area">
+  <div class="action-bar">
+    <button class="btn run-all" id="direct-btn-all" onclick="runDirect()">▶ Run All</button>
+    <button class="btn ghost"   onclick="clearLogDirect()">Clear log</button>
+    <button class="btn danger"  id="direct-btn-stop" onclick="stopJob()" hidden>■ Stop</button>
+    <label class="dry-label"><input type="checkbox" id="direct-dry-run"> dry run</label>
+  </div>
+  <div class="progress-bar"><div class="progress-fill" id="direct-prog" style="width:0%"></div></div>
+  <div class="log" id="direct-log"></div>
+  <div class="stat-bar">
+    <span id="direct-s-imp">imported: —</span>
+    <span id="direct-s-dup">duplicate: —</span>
+    <span id="direct-s-bad">broken: —</span>
+    <span id="direct-s-prog">0 / 0</span>
+    <span id="direct-s-el">elapsed: —</span>
+  </div>
+</div>
+</div><!-- /direct -->
 
 <!-- ═══════════════ SESSION TAB ═══════════════ -->
 <div id="tab-session" class="tab-content">
@@ -1111,7 +1500,7 @@ function switchTab(name){
   document.querySelectorAll('.tab-btn').forEach(el=>el.classList.remove('active'));
   document.getElementById('tab-'+name).classList.add('active');
   const btns=[...document.querySelectorAll('.tab-btn')];
-  const labels={pipeline:'Pipeline',session:'Session',library:'Library',tools:'Tools'};
+  const labels={pipeline:'Pipeline',direct:'Direct',session:'Session',library:'Library',tools:'Tools'};
   btns.forEach(b=>{ if(b.textContent===labels[name]) b.classList.add('active'); });
   if(name==='session') loadSession();
   if(name==='library'){ loadLibraryStats(); loadLibrary(0); }
@@ -1123,9 +1512,13 @@ async function init(){
   const r=await fetch('/api/config'); const c=await r.json();
   document.getElementById('src-in').value  = (c.sources||[])[0]||'';
   document.getElementById('dest-in').value = c.destination_root||'';
+  document.getElementById('direct-src-in').value  = (c.sources||[])[0]||'';
+  document.getElementById('direct-dest-in').value = c.destination_root||'';
   provs = c.providers||[];
   renderProviders();
+  renderProvidersDirect();
   browse(c.browse_root||'/');
+  browseDirect(c.browse_root||'/');
 }
 
 // ── providers ─────────────────────────────────────────────────────────────────
@@ -1147,7 +1540,20 @@ function renderProviders(){
   }).join('');
 }
 function toggleKey(id){ const el=document.getElementById('key-'+id); if(el) el.type=el.type==='password'?'text':'password'; }
-function setProv(id,on){ const p=provs.find(x=>x.id===id); if(p) p.enabled=on; }
+function setProv(id,on){
+  const p=provs.find(x=>x.id===id); if(p) p.enabled=on;
+  const dp=document.getElementById('dp-'+id); if(dp) dp.checked=on;
+  const pp=document.getElementById('p-'+id); if(pp) pp.checked=on;
+}
+function renderProvidersDirect(){
+  document.getElementById('direct-prov-list').innerHTML = provs.map(p=>`
+    <div class="prov-row">
+      <input type="checkbox" id="dp-${p.id}" ${p.enabled?'checked':''}
+             onchange="setProv('${p.id}',this.checked)">
+      <label for="dp-${p.id}">${p.name||p.id}</label>
+      ${p.requires_auth ? (p.has_key ? `<span class="badge set">key ✓</span>` : `<span class="badge unset">no key</span>`) : ''}
+    </div>`).join('');
+}
 
 // ── save config ───────────────────────────────────────────────────────────────
 async function saveConfig(){
@@ -1176,6 +1582,39 @@ async function saveConfig(){
     setTimeout(()=>{btn.textContent='Save config';btn.className='hdr-btn';},3000);
     appendLog('broken','config save: '+(j.error||'unknown'));
   }
+}
+
+async function restartService(force){
+  const btn=document.getElementById('restart-btn');
+  if(!force && !confirm('Restart the music-organiser service now?'+
+      ' This drops your connection for a few seconds while it comes back up.')) return;
+  btn.textContent='Restarting…'; btn.disabled=true;
+  const r=await fetch('/api/restart',{method:'POST',
+    headers:{'Content-Type':'application/json'}, body:JSON.stringify({force:!!force})});
+  if(r.status===409){
+    btn.textContent='Restart service'; btn.disabled=false;
+    if(confirm('A job is currently running — restarting will interrupt it. Restart anyway?'))
+      return restartService(true);
+    return;
+  }
+  const j=await r.json().catch(()=>({}));
+  if(!r.ok || !j.ok){
+    btn.textContent='Error'; btn.className='hdr-btn err';
+    appendLog('broken','restart failed: '+(j.error||r.status));
+    setTimeout(()=>{btn.textContent='Restart service';btn.className='hdr-btn';btn.disabled=false;},3000);
+    return;
+  }
+  // Service is about to go down — poll /api/health until it's back, then reload the page.
+  let tries=0;
+  const poll=setInterval(async ()=>{
+    tries++;
+    try{
+      const hr=await fetch('/api/health',{cache:'no-store'});
+      if(hr.ok){ clearInterval(poll); location.reload(); return; }
+    }catch(e){ /* still down, keep polling */ }
+    btn.textContent='Restarting… ('+tries+'s)';
+    if(tries>60){ clearInterval(poll); btn.textContent='Still down?'; btn.className='hdr-btn err'; }
+  },1000);
 }
 
 // ── filesystem browser ────────────────────────────────────────────────────────
@@ -1213,6 +1652,39 @@ function pickFolder(path,target){
   document.getElementById(target==='src'?'src-in':'dest-in').value=path;
   activateBrowser(target);
   if(target==='src') scanSource();
+}
+// ── native folder picker ──────────────────────────────────────────────────────
+// Opens a real GTK folder chooser on this machine's own desktop. If there's no
+// display to draw on (you're on another machine), fall back to the in-page tree.
+async function nativePick(target,btn){
+  const inp=document.getElementById(target==='src'?'src-in':'dest-in');
+  if(btn) btn.disabled=true;
+  try{
+    const r=await fetch('/api/pick-folder?start='+encodeURIComponent(inp.value||''));
+    const d=await r.json();
+    if(d.ok&&d.path){
+      inp.value=d.path; activateBrowser(target);
+      if(target==='src') scanSource();
+    } else if(d.reason!=='cancelled'){
+      activateBrowser(target); browse(inp.value||'/');
+    }
+  }catch(e){ activateBrowser(target); }
+  finally{ if(btn) btn.disabled=false; }
+}
+async function nativePickDirect(target,btn){
+  const inp=document.getElementById(target==='src'?'direct-src-in':'direct-dest-in');
+  if(btn) btn.disabled=true;
+  try{
+    const r=await fetch('/api/pick-folder?start='+encodeURIComponent(inp.value||''));
+    const d=await r.json();
+    if(d.ok&&d.path){
+      inp.value=d.path; activateBrowserDirect(target);
+      if(target==='src') scanSourceDirect();
+    } else if(d.reason!=='cancelled'){
+      activateBrowserDirect(target); browseDirect(inp.value||'/');
+    }
+  }catch(e){ activateBrowserDirect(target); }
+  finally{ if(btn) btn.disabled=false; }
 }
 async function scanSource(){
   const p=document.getElementById('src-in').value.trim(); if(!p)return;
@@ -1297,6 +1769,100 @@ function appendLog(level,text){
 }
 function clearLog(){ document.getElementById('log').innerHTML=''; }
 function esc(s){ return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
+
+// ── direct mode (no database — folder in, folder out) ──────────────────────────
+let browserTargetDirect_='src';
+let esDirect=null, jobStartDirect=0;
+function activateBrowserDirect(t){
+  browserTargetDirect_=t;
+  document.getElementById('direct-src-in').classList.toggle('active-target',t==='src');
+  document.getElementById('direct-dest-in').classList.toggle('active-target',t==='dest');
+  document.getElementById('direct-bt-src').classList.toggle('active',t==='src');
+  document.getElementById('direct-bt-dest').classList.toggle('active',t==='dest');
+}
+function setActiveTargetDirect(t){ browserTargetDirect_=t; activateBrowserDirect(t); }
+async function browseDirect(path){
+  document.getElementById('direct-b-path').textContent=path;
+  const r=await fetch('/api/browse?path='+encodeURIComponent(path));
+  const d=await r.json();
+  let html='';
+  if(d.parent)
+    html+=`<div class="be be-up" onclick="browseDirect(${J(d.parent)})"><span class="ico">▲</span><span class="nm">..</span></div>`;
+  for(const e of d.entries){
+    if(e.is_dir){
+      html+=`<div class="be"><span class="ico">▶</span>
+        <span class="nm" onclick="browseDirect(${J(e.path)})">${e.name}</span>
+        <span class="bbtns">
+          <button class="bbtn" onclick="pickFolderDirect(${J(e.path)},'src')">src</button>
+          <button class="bbtn dest" onclick="pickFolderDirect(${J(e.path)},'dest')">dest</button>
+        </span></div>`;
+    } else {
+      html+=`<div class="be be-file"><span class="ico">·</span><span class="nm">${e.name}</span></div>`;
+    }
+  }
+  document.getElementById('direct-browser').innerHTML=html||'<div style="padding:8px 12px;color:var(--dim);font-size:11px">(empty)</div>';
+}
+function pickFolderDirect(path,target){
+  document.getElementById(target==='src'?'direct-src-in':'direct-dest-in').value=path;
+  activateBrowserDirect(target);
+  if(target==='src') scanSourceDirect();
+}
+async function scanSourceDirect(){
+  const p=document.getElementById('direct-src-in').value.trim(); if(!p)return;
+  document.getElementById('direct-scan-result').textContent='scanning…';
+  const r=await fetch('/api/scan?path='+encodeURIComponent(p));
+  const d=await r.json();
+  document.getElementById('direct-scan-result').textContent=
+    d.error?d.error:d.count.toLocaleString()+' files';
+}
+async function runDirect(){
+  const body={
+    sources:[document.getElementById('direct-src-in').value.trim()].filter(Boolean),
+    dest:document.getElementById('direct-dest-in').value.trim(),
+    providers:provs.filter(p=>p.enabled).map(p=>p.id),
+    dry_run:document.getElementById('direct-dry-run').checked,
+  };
+  if(!body.sources.length){ appendLogDirect('broken','set a source folder first'); return; }
+  if(!body.dest){ appendLogDirect('broken','set an output folder first'); return; }
+  if(body.dry_run) appendLogDirect('warning','DRY RUN — nothing will be written');
+  const r=await fetch('/api/job/direct',{method:'POST',
+    headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+  const j=await r.json();
+  if(j.error){ appendLogDirect('broken',j.error); return; }
+  setRunningDirect(true); jobStartDirect=Date.now();
+  if(esDirect) esDirect.close();
+  esDirect=new EventSource('/api/job/stream');
+  esDirect.onmessage=e=>{
+    const m=JSON.parse(e.data);
+    if(m.type==='log')      appendLogDirect(m.level,m.text);
+    else if(m.type==='progress') onProgressDirect(m);
+    else if(m.type==='done'){ setRunningDirect(false); esDirect.close(); esDirect=null; }
+  };
+  esDirect.onerror=()=>{ setRunningDirect(false); if(esDirect){esDirect.close();esDirect=null;} };
+}
+function setRunningDirect(on){
+  document.getElementById('direct-btn-all').disabled=on;
+  document.getElementById('direct-btn-stop').hidden=!on;
+  if(!on) document.getElementById('direct-prog').style.width='0%';
+}
+function onProgressDirect(m){
+  const pct=m.total>0?(m.done/m.total*100).toFixed(1):0;
+  document.getElementById('direct-prog').style.width=pct+'%';
+  if(m.imported!==undefined) document.getElementById('direct-s-imp').textContent='imported: '+m.imported.toLocaleString();
+  if(m.duplicate!==undefined) document.getElementById('direct-s-dup').textContent='duplicate: '+m.duplicate.toLocaleString();
+  if(m.broken!==undefined) document.getElementById('direct-s-bad').textContent='broken: '+m.broken.toLocaleString();
+  document.getElementById('direct-s-prog').textContent=m.done.toLocaleString()+' / '+m.total.toLocaleString();
+  document.getElementById('direct-s-el').textContent='elapsed: '+Math.round((Date.now()-jobStartDirect)/1000)+'s';
+}
+function appendLogDirect(level,text){
+  const el=document.getElementById('direct-log');
+  const ts=new Date().toTimeString().slice(0,8);
+  const div=document.createElement('div');
+  div.className='ll '+(level||'info');
+  div.innerHTML=`<span class="ts">${ts}</span><span class="lv">${level}</span><span class="tx">${esc(text)}</span>`;
+  el.appendChild(div); el.scrollTop=el.scrollHeight;
+}
+function clearLogDirect(){ document.getElementById('direct-log').innerHTML=''; }
 
 // ── session tab ───────────────────────────────────────────────────────────────
 async function loadSession(){

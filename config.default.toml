@@ -4,7 +4,7 @@ sources = [
     "/mnt/usb-a/drive/downloads/nicotine-downloads",
 ]
 
-destination_root = "/mnt/usb-a/drive/Music"
+destination_root = "/mnt/usb-a/drive/SCENE_MUSIC_[FLAC-WAV]"
 
 database = "~/.local/share/music-organiser/library.db"
 
@@ -95,6 +95,16 @@ random_crap_min_files = 3
 orphan_bonus_max_audio = 2
 
 [organise]
+# Folder layout. "artist_release_track_mix_year" (the default) puts every
+# track in its own folder named:
+#     Artist - Release - Track - Mix - Year
+# Empty slots are dropped, so a track with no mix info just reads
+# "Artist - Release - Track - Year". The mix comes from a trailing
+# "(Original Mix)"-style fragment in the title, falling back to the
+# remixer tag. Set this to "release" for the older one-folder-per-release
+# "(catno) Title (Year)" layout.
+folder_scheme = "artist_release_track_mix_year"
+
 mix_artist_diversity_threshold = 0.5
 
 delete_orphaned_extras = true
