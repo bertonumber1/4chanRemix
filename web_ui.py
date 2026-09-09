@@ -2,7 +2,10 @@
 """
 web_ui.py — Browser frontend for music-organiser.
 Run:  python3 web_ui.py
-Open: http://192.168.0.65:8082
+Open: http://127.0.0.1:8082 on the machine running it, or
+      http://<its-LAN-IP>:8082 from another device on the network
+      (printed on startup below — it's different on every machine, not
+      a fixed address).
 """
 from __future__ import annotations
 
@@ -2711,11 +2714,14 @@ if __name__ == "__main__":
     except Exception:
         _lan_ip = "localhost"
 
-    url = f"http://{_lan_ip}:{args.port}"
+    local_url = f"http://127.0.0.1:{args.port}"
+    lan_url = f"http://{_lan_ip}:{args.port}"
     log.info("=" * 56)
     log.info(f"  music-organiser  v{_VERSION}")
-    log.info(f"  open  →  {url}")
-    log.info(f"  log   →  {_LOG_FILE}")
+    log.info(f"  open (this machine)      -> {local_url}")
+    if _lan_ip != "localhost":
+        log.info(f"  open (other device, LAN) -> {lan_url}")
+    log.info(f"  log -> {_LOG_FILE}")
     log.info("=" * 56)
 
     # Clean shutdown on SIGTERM (systemd stop)

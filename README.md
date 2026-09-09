@@ -43,11 +43,17 @@ bash install.sh --deps
 
 ## Open the UI
 
-After install, open your browser to the URL shown in the terminal — something like:
+On the same machine the server is running on, it's always:
 
 ```
-http://192.168.1.x:8082
+http://127.0.0.1:8082
 ```
+
+From a **different** device on your network (e.g. running headless on a
+Chromebox, opening it from a laptop), use the LAN address the terminal
+prints on startup instead — something like `http://192.168.1.x:8082`. That
+address is specific to whichever machine is running the server; it's
+different on every network, not a fixed address to reuse elsewhere.
 
 The service runs in the background and auto-starts whenever you log in.
 
@@ -168,7 +174,9 @@ py -m pip install -r requirements.txt
 py web_ui.py
 ```
 
-Then open the URL it prints. What changes on Windows:
+Then open **http://127.0.0.1:8082** — that's this machine, always the same
+regardless of whose computer it is or what network it's on. What changes on
+Windows:
 
 | | Behaviour |
 |---|---|
