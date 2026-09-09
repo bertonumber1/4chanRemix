@@ -1477,16 +1477,16 @@ textarea.sql-input:focus{outline:none;border-color:var(--acc)}
 <header>
   <h1 title="music-organiser">Smash-n-Grab</h1>
   <nav class="tabs">
-    <button class="tab-btn active" onclick="switchTab('pipeline')">Pipeline</button>
-    <button class="tab-btn" onclick="switchTab('direct')">Direct</button>
-    <button class="tab-btn" onclick="switchTab('session')">Session</button>
-    <button class="tab-btn" onclick="switchTab('library')">Library</button>
-    <button class="tab-btn" onclick="switchTab('tools')">Tools</button>
-    <button class="tab-btn" onclick="switchTab('fakeflac')">Fake-FLAC</button>
+    <button class="tab-btn active" onclick="switchTab('pipeline')" title="Full pipeline — import, fetch tags, and organise into the library">Pipeline</button>
+    <button class="tab-btn" onclick="switchTab('direct')" title="Organise straight through, no database">Direct</button>
+    <button class="tab-btn" onclick="switchTab('session')" title="Browse the current import batch before committing it">Session</button>
+    <button class="tab-btn" onclick="switchTab('library')" title="Search and browse the full permanent library">Library</button>
+    <button class="tab-btn" onclick="switchTab('tools')" title="Database maintenance, audits, and ad-hoc SQL">Tools</button>
+    <button class="tab-btn" onclick="switchTab('fakeflac')" title="Scan for lossy-transcoded-into-FLAC files and inspect spectrograms">Fake-FLAC</button>
   </nav>
   <span id="hdr-status">idle</span>
-  <button class="hdr-btn" id="save-btn" onclick="saveConfig()">Save config</button>
-  <button class="hdr-btn" id="restart-btn" onclick="restartService()">Restart service</button>
+  <button class="hdr-btn" id="save-btn" onclick="saveConfig()" title="Write Source/Output paths and API keys to config.toml">Save config</button>
+  <button class="hdr-btn" id="restart-btn" onclick="restartService()" title="Restart the web_ui.py process">Restart service</button>
 </header>
 
 <!-- ═══════════════ PIPELINE TAB ═══════════════ -->
@@ -1496,18 +1496,18 @@ textarea.sql-input:focus{outline:none;border-color:var(--acc)}
     <h3>Input / Output</h3>
     <div class="path-row">
       <span class="path-label src">Source</span>
-      <input class="path-input" id="src-in" readonly placeholder="not set" onclick="setActiveTarget('src')">
-      <button class="btn-xs" onclick="nativePick('src',this)">📁 Browse</button>
+      <input class="path-input" id="src-in" readonly placeholder="not set" onclick="setActiveTarget('src')" title="Click to make this the active target for the filesystem browser below">
+      <button class="btn-xs" onclick="nativePick('src',this)" title="Choose the source folder with the system folder picker">📁 Browse</button>
       <button class="btn-xs ghost" onclick="openInFileManager('src-in',this)" title="Show this folder in the file manager">↗ Open</button>
     </div>
     <div class="path-row">
       <span class="path-label out">Output</span>
-      <input class="path-input" id="dest-in" readonly placeholder="not set" onclick="setActiveTarget('dest')">
-      <button class="btn-xs" onclick="nativePick('dest',this)">📁 Browse</button>
+      <input class="path-input" id="dest-in" readonly placeholder="not set" onclick="setActiveTarget('dest')" title="Click to make this the active target for the filesystem browser below">
+      <button class="btn-xs" onclick="nativePick('dest',this)" title="Choose the output folder with the system folder picker">📁 Browse</button>
       <button class="btn-xs ghost" onclick="openInFileManager('dest-in',this)" title="Show this folder in the file manager">↗ Open</button>
     </div>
     <div style="display:flex;gap:5px;margin-top:4px">
-      <button class="btn-xs" style="flex:1" onclick="scanSource()">Scan source</button>
+      <button class="btn-xs" style="flex:1" onclick="scanSource()" title="Count audio files in the source folder without importing anything">Scan source</button>
       <span id="scan-result" style="font-size:10px;color:var(--dim);line-height:22px"></span>
     </div>
   </div>
@@ -1518,8 +1518,8 @@ textarea.sql-input:focus{outline:none;border-color:var(--acc)}
   <div class="card" style="padding-bottom:5px;flex-shrink:0">
     <h3>Filesystem browser</h3>
     <div class="browser-target">
-      <button class="btn-xs ghost active" id="bt-src" onclick="activateBrowser('src')">▸ Source</button>
-      <button class="btn-xs ghost" id="bt-dest" onclick="activateBrowser('dest')">▸ Output</button>
+      <button class="btn-xs ghost active" id="bt-src" onclick="activateBrowser('src')" title="Browse folders to fill in Source">▸ Source</button>
+      <button class="btn-xs ghost" id="bt-dest" onclick="activateBrowser('dest')" title="Browse folders to fill in Output">▸ Output</button>
     </div>
     <div class="bpath" id="b-path">/</div>
   </div>
@@ -1535,13 +1535,13 @@ textarea.sql-input:focus{outline:none;border-color:var(--acc)}
     <div class="phase" id="ph-organise"><span class="dot"></span>Organise</div>
   </div>
   <div class="action-bar">
-    <button class="btn run-all" id="btn-all"      onclick="run('pipeline')">▶ Run All</button>
-    <button class="btn ghost"   id="btn-import"   onclick="run('import')">Import</button>
-    <button class="btn ghost"   id="btn-fetch"    onclick="run('fetch')">Fetch Tags</button>
-    <button class="btn ghost"   id="btn-organise" onclick="run('organise')">Organise</button>
-    <button class="btn ghost"   onclick="clearLog()">Clear log</button>
-    <button class="btn danger"  id="btn-stop" onclick="stopJob()" hidden>■ Stop</button>
-    <label class="dry-label"><input type="checkbox" id="dry-run"> dry run</label>
+    <button class="btn run-all" id="btn-all"      onclick="run('pipeline')" title="Import → Fetch Tags → Organise, one after another">▶ Run All</button>
+    <button class="btn ghost"   id="btn-import"   onclick="run('import')" title="Copy/move files from Source into the session database">Import</button>
+    <button class="btn ghost"   id="btn-fetch"    onclick="run('fetch')" title="Look up missing metadata from the enabled providers">Fetch Tags</button>
+    <button class="btn ghost"   id="btn-organise" onclick="run('organise')" title="Move session files into their final Output location">Organise</button>
+    <button class="btn ghost"   onclick="clearLog()" title="Clear the log panel below">Clear log</button>
+    <button class="btn danger"  id="btn-stop" onclick="stopJob()" hidden title="Stop the running job">■ Stop</button>
+    <label class="dry-label" title="Preview what would happen without writing or moving anything"><input type="checkbox" id="dry-run"> dry run</label>
   </div>
   <div class="progress-bar"><div class="progress-fill" id="prog" style="width:0%"></div></div>
   <div class="log" id="log"></div>
@@ -1562,18 +1562,18 @@ textarea.sql-input:focus{outline:none;border-color:var(--acc)}
     <h3>Direct mode — input / output, no database</h3>
     <div class="path-row">
       <span class="path-label src">Source</span>
-      <input class="path-input" id="direct-src-in" readonly placeholder="not set" onclick="setActiveTargetDirect('src')">
-      <button class="btn-xs" onclick="nativePickDirect('src',this)">📁 Browse</button>
+      <input class="path-input" id="direct-src-in" readonly placeholder="not set" onclick="setActiveTargetDirect('src')" title="Click to make this the active target for the filesystem browser below">
+      <button class="btn-xs" onclick="nativePickDirect('src',this)" title="Choose the source folder with the system folder picker">📁 Browse</button>
       <button class="btn-xs ghost" onclick="openInFileManager('direct-src-in',this)" title="Show this folder in the file manager">↗ Open</button>
     </div>
     <div class="path-row">
       <span class="path-label out">Output</span>
-      <input class="path-input" id="direct-dest-in" readonly placeholder="not set" onclick="setActiveTargetDirect('dest')">
-      <button class="btn-xs" onclick="nativePickDirect('dest',this)">📁 Browse</button>
+      <input class="path-input" id="direct-dest-in" readonly placeholder="not set" onclick="setActiveTargetDirect('dest')" title="Click to make this the active target for the filesystem browser below">
+      <button class="btn-xs" onclick="nativePickDirect('dest',this)" title="Choose the output folder with the system folder picker">📁 Browse</button>
       <button class="btn-xs ghost" onclick="openInFileManager('direct-dest-in',this)" title="Show this folder in the file manager">↗ Open</button>
     </div>
     <div style="display:flex;gap:5px;margin-top:4px">
-      <button class="btn-xs" style="flex:1" onclick="scanSourceDirect()">Scan source</button>
+      <button class="btn-xs" style="flex:1" onclick="scanSourceDirect()" title="Count audio files in the source folder without organising anything">Scan source</button>
       <span id="direct-scan-result" style="font-size:10px;color:var(--dim);line-height:22px"></span>
     </div>
     <p style="font-size:10px;color:var(--dim);margin-top:8px;line-height:1.4">
@@ -1590,8 +1590,8 @@ textarea.sql-input:focus{outline:none;border-color:var(--acc)}
   <div class="card" style="padding-bottom:5px;flex-shrink:0">
     <h3>Filesystem browser</h3>
     <div class="browser-target">
-      <button class="btn-xs ghost active" id="direct-bt-src" onclick="activateBrowserDirect('src')">▸ Source</button>
-      <button class="btn-xs ghost" id="direct-bt-dest" onclick="activateBrowserDirect('dest')">▸ Output</button>
+      <button class="btn-xs ghost active" id="direct-bt-src" onclick="activateBrowserDirect('src')" title="Browse folders to fill in Source">▸ Source</button>
+      <button class="btn-xs ghost" id="direct-bt-dest" onclick="activateBrowserDirect('dest')" title="Browse folders to fill in Output">▸ Output</button>
     </div>
     <div class="bpath" id="direct-b-path">/</div>
   </div>
@@ -1600,10 +1600,10 @@ textarea.sql-input:focus{outline:none;border-color:var(--acc)}
 
 <div class="log-area">
   <div class="action-bar">
-    <button class="btn run-all" id="direct-btn-all" onclick="runDirect()">▶ Run All</button>
-    <button class="btn ghost"   onclick="clearLogDirect()">Clear log</button>
-    <button class="btn danger"  id="direct-btn-stop" onclick="stopJob()" hidden>■ Stop</button>
-    <label class="dry-label"><input type="checkbox" id="direct-dry-run"> dry run</label>
+    <button class="btn run-all" id="direct-btn-all" onclick="runDirect()" title="Fetch tags and organise Source straight into Output, no database">▶ Run All</button>
+    <button class="btn ghost"   onclick="clearLogDirect()" title="Clear the log panel below">Clear log</button>
+    <button class="btn danger"  id="direct-btn-stop" onclick="stopJob()" hidden title="Stop the running job">■ Stop</button>
+    <label class="dry-label" title="Preview what would happen without writing or moving anything"><input type="checkbox" id="direct-dry-run"> dry run</label>
   </div>
   <div class="progress-bar"><div class="progress-fill" id="direct-prog" style="width:0%"></div></div>
   <div class="log" id="direct-log"></div>
@@ -1629,14 +1629,14 @@ textarea.sql-input:focus{outline:none;border-color:var(--acc)}
   <div class="toolbar">
     <input class="search-input" id="sess-search" placeholder="filter artist / album / title…" oninput="filterSession()">
     <div class="filter-chips">
-      <button class="chip active" onclick="setSessFilter('all',this)">All</button>
-      <button class="chip" onclick="setSessFilter('imported',this)">Imported</button>
-      <button class="chip" onclick="setSessFilter('broken',this)">Broken</button>
-      <button class="chip" onclick="setSessFilter('duplicate',this)">Duplicate</button>
+      <button class="chip active" onclick="setSessFilter('all',this)" title="Show every file in this session">All</button>
+      <button class="chip" onclick="setSessFilter('imported',this)" title="Show only successfully imported files">Imported</button>
+      <button class="chip" onclick="setSessFilter('broken',this)" title="Show files that failed to process">Broken</button>
+      <button class="chip" onclick="setSessFilter('duplicate',this)" title="Show files skipped as duplicates">Duplicate</button>
     </div>
-    <button class="btn ghost" onclick="loadSession()" style="margin-left:auto">↺ Refresh</button>
-    <button class="btn warn"  id="btn-refetch" onclick="refetchBroken()" hidden>↺ Re-fetch broken</button>
-    <button class="btn ok"    id="btn-commit"  onclick="commitSession()">↑ Commit to library</button>
+    <button class="btn ghost" onclick="loadSession()" style="margin-left:auto" title="Reload from the session database">↺ Refresh</button>
+    <button class="btn warn"  id="btn-refetch" onclick="refetchBroken()" hidden title="Retry ALL tags for files that came back broken">↺ Re-fetch broken</button>
+    <button class="btn ok"    id="btn-commit"  onclick="commitSession()" title="Merge this session's files into the permanent library.db">↑ Commit to library</button>
   </div>
   <div class="tbl-wrap">
     <table id="sess-table">
@@ -1669,12 +1669,12 @@ textarea.sql-input:focus{outline:none;border-color:var(--acc)}
     <input class="search-input" id="lib-search" placeholder="search artist / album / title / label…"
            oninput="debounceLibSearch()" style="width:300px">
     <div class="filter-chips">
-      <button class="chip active" onclick="setLibFilter('',this)">All</button>
-      <button class="chip" onclick="setLibFilter('imported',this)">Imported</button>
-      <button class="chip" onclick="setLibFilter('indexed',this)">Indexed</button>
-      <button class="chip" onclick="setLibFilter('broken',this)">Broken</button>
+      <button class="chip active" onclick="setLibFilter('',this)" title="Show every file">All</button>
+      <button class="chip" onclick="setLibFilter('imported',this)" title="Show only successfully imported files">Imported</button>
+      <button class="chip" onclick="setLibFilter('indexed',this)" title="Show files found by Rebuild index but not run through Import">Indexed</button>
+      <button class="chip" onclick="setLibFilter('broken',this)" title="Show files that failed to process">Broken</button>
     </div>
-    <button class="btn ghost" onclick="loadLibrary(0)" style="margin-left:auto">↺ Refresh</button>
+    <button class="btn ghost" onclick="loadLibrary(0)" style="margin-left:auto" title="Reload from library.db">↺ Refresh</button>
   </div>
   <div class="tbl-wrap">
     <table id="lib-table">
@@ -1691,9 +1691,9 @@ textarea.sql-input:focus{outline:none;border-color:var(--acc)}
     </table>
   </div>
   <div class="pagination">
-    <button class="btn-xs ghost" onclick="libPage(-1)">← Prev</button>
+    <button class="btn-xs ghost" onclick="libPage(-1)" title="Previous page">← Prev</button>
     <span id="lib-page-info">page 1 of 1</span>
-    <button class="btn-xs ghost" onclick="libPage(1)">Next →</button>
+    <button class="btn-xs ghost" onclick="libPage(1)" title="Next page">Next →</button>
     <span id="lib-count" style="margin-left:auto;color:var(--dim)"></span>
   </div>
 </div>
@@ -1705,15 +1705,15 @@ textarea.sql-input:focus{outline:none;border-color:var(--acc)}
 
   <div class="tool-card">
     <h3>Database</h3>
-    <button class="tool-btn" onclick="runTool('rebuild')">
+    <button class="tool-btn" onclick="runTool('rebuild')" title="Walk the Output folder and rebuild library.db from what's actually on disk">
       <span class="tb-icon">⟳</span>
       <span class="tb-text">Rebuild index<br><span class="tb-hint">re-scan output → library.db</span></span>
     </button>
-    <button class="tool-btn" onclick="runTool('vacuum')">
+    <button class="tool-btn" onclick="runTool('vacuum')" title="Reclaim disk space and rebuild query statistics on library.db">
       <span class="tb-icon">◎</span>
       <span class="tb-text">Compact DB<br><span class="tb-hint">VACUUM + ANALYZE library.db</span></span>
     </button>
-    <button class="tool-btn commit-btn" onclick="commitSession()">
+    <button class="tool-btn commit-btn" onclick="commitSession()" title="Merge this session's files into the permanent library.db">
       <span class="tb-icon">↑</span>
       <span class="tb-text">Commit session → library<br><span class="tb-hint">merge session DB into library.db</span></span>
     </button>
@@ -1721,11 +1721,11 @@ textarea.sql-input:focus{outline:none;border-color:var(--acc)}
 
   <div class="tool-card">
     <h3>Fix &amp; Rescue</h3>
-    <button class="tool-btn" onclick="runTool('fetch_broken')">
+    <button class="tool-btn" onclick="runTool('fetch_broken')" title="Retry metadata lookup for every file in the session, not just the broken ones">
       <span class="tb-icon">↺</span>
       <span class="tb-text">Re-fetch broken<br><span class="tb-hint">retry ALL tags for session files</span></span>
     </button>
-    <button class="tool-btn" onclick="run('organise')">
+    <button class="tool-btn" onclick="run('organise')" title="Re-run the Organise step so files land at their current (possibly updated) target paths">
       <span class="tb-icon">⇄</span>
       <span class="tb-text">Re-organise session<br><span class="tb-hint">move files to updated paths</span></span>
     </button>
@@ -1733,7 +1733,7 @@ textarea.sql-input:focus{outline:none;border-color:var(--acc)}
 
   <div class="tool-card">
     <h3>Audit library.db</h3>
-    <button class="tool-btn" onclick="runAudits()">
+    <button class="tool-btn" onclick="runAudits()" title="Run all 13 data-quality checks against library.db">
       <span class="tb-icon">✓</span>
       <span class="tb-text">Run all checks<br><span class="tb-hint">13 quality checks on library.db</span></span>
     </button>
@@ -1750,8 +1750,8 @@ textarea.sql-input:focus{outline:none;border-color:var(--acc)}
         <option value="library">library.db</option>
         <option value="session">session.db</option>
       </select>
-      <button class="btn-xs" onclick="runSQL()">▶ Run</button>
-      <button class="btn-xs ghost" onclick="document.getElementById('sql-input').value='SELECT artist, album, year, label, status FROM files ORDER BY artist LIMIT 50'">example</button>
+      <button class="btn-xs" onclick="runSQL()" title="Run the SELECT/WITH query above against the chosen database">▶ Run</button>
+      <button class="btn-xs ghost" onclick="document.getElementById('sql-input').value='SELECT artist, album, year, label, status FROM files ORDER BY artist LIMIT 50'" title="Fill the box with a sample query">example</button>
       <span id="sql-status" style="font-size:11px;color:var(--dim);margin-left:auto"></span>
     </div>
     <textarea class="sql-input" id="sql-input" rows="5"
@@ -1772,13 +1772,14 @@ textarea.sql-input:focus{outline:none;border-color:var(--acc)}
       <option value="library">library.db</option>
       <option value="session">session.db</option>
     </select>
-    <label style="font-size:11px;color:var(--dim);display:flex;align-items:center;gap:5px;margin-left:8px">
+    <label style="font-size:11px;color:var(--dim);display:flex;align-items:center;gap:5px;margin-left:8px"
+           title="Re-check files that were already scanned, instead of skipping them">
       <input type="checkbox" id="ff-force"> force re-check
     </label>
-    <button class="btn" onclick="runFakeflacScan()">▶ Scan for fake FLACs</button>
+    <button class="btn" onclick="runFakeflacScan()" title="FFT spectral-cutoff scan — flags FLACs that look transcoded from a lossy source">▶ Scan for fake FLACs</button>
     <button class="btn ghost" id="ff-vamp-btn" onclick="runFakeflacVamp()" disabled
             title="checking availability…">⚛ Vamp-confirm suspects</button>
-    <button class="btn ghost" onclick="loadFakeflacSuspects(0)" style="margin-left:auto">↺ Refresh</button>
+    <button class="btn ghost" onclick="loadFakeflacSuspects(0)" style="margin-left:auto" title="Reload the suspects list">↺ Refresh</button>
   </div>
   <div class="tbl-wrap">
     <table id="ff-table">
@@ -1789,9 +1790,9 @@ textarea.sql-input:focus{outline:none;border-color:var(--acc)}
     </table>
   </div>
   <div class="pagination">
-    <button class="btn-xs ghost" onclick="ffPage(-1)">← Prev</button>
+    <button class="btn-xs ghost" onclick="ffPage(-1)" title="Previous page">← Prev</button>
     <span id="ff-page-info">page 1 of 1</span>
-    <button class="btn-xs ghost" onclick="ffPage(1)">Next →</button>
+    <button class="btn-xs ghost" onclick="ffPage(1)" title="Next page">Next →</button>
     <span id="ff-count" style="margin-left:auto;color:var(--dim)"></span>
   </div>
 </div>
@@ -1802,21 +1803,21 @@ textarea.sql-input:focus{outline:none;border-color:var(--acc)}
   <div class="popup" style="width:min(1280px,92vw)">
     <div class="popup-hdr">
       <h2 id="spec-title">Spectrogram</h2>
-      <button class="popup-close" onclick="closeSpecBtn()">✕</button>
+      <button class="popup-close" onclick="closeSpecBtn()" title="Close">✕</button>
     </div>
     <div class="popup-body">
       <div id="spec-meta" style="font-size:11px;color:var(--dim);margin-bottom:8px"></div>
       <div id="spec-img-wrap" style="background:#000;border-radius:4px;min-height:120px;display:flex;align-items:center;justify-content:center">
-        <img id="spec-img" style="width:100%;display:block" src="">
+        <img id="spec-img" style="width:100%;display:block" src="" title="Time left→right, frequency bottom→top, brightness = energy. A hard ceiling well below the top means a lossy source.">
       </div>
       <div class="toolbar" style="margin-top:10px">
-        <a class="btn-xs" id="spec-save" download>⭳ Save PNG</a>
-        <button class="btn-xs ghost" onclick="copySpecLink()">⎘ Copy link</button>
+        <a class="btn-xs" id="spec-save" download title="Download this spectrogram as a PNG file">⭳ Save PNG</a>
+        <button class="btn-xs ghost" onclick="copySpecLink()" title="Copy a direct link to this spectrogram image, for anyone else on the LAN">⎘ Copy link</button>
         <span id="spec-copy-status" style="font-size:11px;color:var(--dim)"></span>
         <span style="flex:1"></span>
-        <button class="btn-xs ghost" onclick="ffAction('dismiss')">✓ Dismiss (false positive)</button>
-        <button class="btn-xs ghost" onclick="ffAction('isolate')">⇥ Isolate</button>
-        <button class="btn-xs danger" onclick="ffAction('delete')">✕ Delete</button>
+        <button class="btn-xs ghost" onclick="ffAction('dismiss')" title="False positive — clear the suspected flag, leave the file where it is">✓ Dismiss (false positive)</button>
+        <button class="btn-xs ghost" onclick="ffAction('isolate')" title="Move this file into the Suspected Transcodes folder under Output">⇥ Isolate</button>
+        <button class="btn-xs danger" onclick="ffAction('delete')" title="Permanently delete this file — cannot be undone">✕ Delete</button>
       </div>
     </div>
   </div>
@@ -1827,7 +1828,7 @@ textarea.sql-input:focus{outline:none;border-color:var(--acc)}
   <div class="popup">
     <div class="popup-hdr">
       <h2 id="detail-title">File detail</h2>
-      <button class="popup-close" onclick="closeDetailBtn()">✕</button>
+      <button class="popup-close" onclick="closeDetailBtn()" title="Close">✕</button>
     </div>
     <div class="popup-body" id="detail-body"></div>
   </div>
@@ -1838,7 +1839,7 @@ textarea.sql-input:focus{outline:none;border-color:var(--acc)}
   <div class="popup" style="width:800px;max-height:70vh">
     <div class="popup-hdr">
       <h2 id="tool-log-title">Running…</h2>
-      <button class="popup-close" onclick="closeToolLogBtn()">✕</button>
+      <button class="popup-close" onclick="closeToolLogBtn()" title="Close">✕</button>
     </div>
     <div class="popup-body" style="padding:0">
       <div class="log" id="tool-log" style="padding:10px 14px;min-height:200px;max-height:55vh;overflow-y:auto"></div>
@@ -1893,10 +1894,10 @@ function renderProviders(){
     const keyInput = p.key_field ? `
       <input class="prov-key" id="key-${p.id}" type="password"
              placeholder="${p.has_key ? '(keep existing)' : 'paste key…'}">
-      <button class="key-eye" onclick="toggleKey('${p.id}')">👁</button>` : '';
+      <button class="key-eye" onclick="toggleKey('${p.id}')" title="Show/hide the key">👁</button>` : '';
     return `<div class="prov-row">
       <input type="checkbox" id="p-${p.id}" ${p.enabled?'checked':''}
-             onchange="setProv('${p.id}',this.checked)">
+             onchange="setProv('${p.id}',this.checked)" title="Enable/disable this metadata provider">
       <label for="p-${p.id}">${p.name||p.id}</label>
       ${badge}${keyInput}
     </div>`;
