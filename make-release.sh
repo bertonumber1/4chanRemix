@@ -13,7 +13,8 @@ PROJ_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 if [ "${1:-}" != "" ]; then
     RELEASE_NAME="${1}"
 else
-    VERSION=$(python3 -c "
+    PY=$(command -v python3 || command -v python || echo "")
+    VERSION=$("${PY}" -c "
 import re
 txt = open('${PROJ_DIR}/web_ui.py').read()
 m = re.search(r'_VERSION\s*=\s*\"([^\"]+)\"', txt)
@@ -51,6 +52,12 @@ for f in acoustid_helper.py detection.py; do
 done
 
 cp -r "${PROJ_DIR}/zzzzScriptstuff" "${STAGE}/"
+
+# web_ui.py serves these at fixed routes (/logo.png, /logo-icon.png,
+# /wallpaper.jpg) — without them those routes 404 and the header
+# logo/favicon/background just don't load.
+[ -d "${PROJ_DIR}/assets" ] && \
+    cp -r "${PROJ_DIR}/assets" "${STAGE}/"
 
 [ -f "${PROJ_DIR}/config.default.toml" ] && \
     cp "${PROJ_DIR}/config.default.toml" "${STAGE}/"
