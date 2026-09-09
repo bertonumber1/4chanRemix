@@ -32,6 +32,9 @@ except ImportError:
 # ─── constants ─────────────────────────────────────────────────────────────────
 _SESSION_DB = Path("~/.local/share/music-organiser/web_session.db").expanduser()
 _LIBRARY_DB = Path("~/.local/share/music-organiser/library.db").expanduser()
+# Throwaway DB for the Fake-FLAC tab's "check this folder directly" mode —
+# wiped and re-indexed on every scan, same disposable pattern as _SESSION_DB.
+_FOLDER_DB  = Path("~/.local/share/music-organiser/web_folder_scan.db").expanduser()
 _CFG_PATH   = Path("~/.config/music-organiser/config.toml").expanduser()
 _LOG_FILE   = Path("~/.local/share/music-organiser/web_ui.log").expanduser()
 _VERSION    = "1.6.0"
@@ -347,6 +350,33 @@ def _do_fake_flac_scan(ui, db_path: Path, force: bool):
         db.close()
 
 
+def _do_fake_flac_scan_folder(ui, folder: Path, cfg: dict, force: bool):
+    """Check an arbitrary folder directly — no import/catalog step first.
+    Indexes it into the disposable _FOLDER_DB (read-only walk, same as
+    Rebuild index) then runs the same Stage-1 scan against that."""
+    from database import Database
+    from indexer import index_tree
+    from fake_flac import verify_lossless_in_db, dependencies_available, missing_dependencies
+    if not dependencies_available():
+        ui.log("broken", f"fake-flac scan needs: {', '.join(missing_dependencies())} "
+                          f"— pip install -r requirements.txt")
+        return
+    if not folder.is_dir():
+        ui.log("broken", f"folder not found: {folder}")
+        return
+    if _FOLDER_DB.exists():
+        _FOLDER_DB.unlink()
+    _FOLDER_DB.parent.mkdir(parents=True, exist_ok=True)
+    db = Database(str(_FOLDER_DB))
+    try:
+        ui.log("info", f"indexing {folder} …")
+        index_tree(folder, cfg=cfg, db=db, ui=ui, force=force)
+        stats = verify_lossless_in_db(db, ui=ui, force=True)
+        ui.log("info", stats.summary().replace("\n", "  |  "))
+    finally:
+        db.close()
+
+
 def _do_fake_flac_vamp(ui, db_path: Path):
     from database import Database
     from rip_audio import run_on_suspects, find_sonic_annotator
@@ -399,10 +429,14 @@ def _run_job(kind, sources, dest, provider_ids, cfg, dry_run, db_target="library
             elif kind == "vacuum":
                 _do_vacuum(ui)
             elif kind == "fake_flac_scan":
-                db_path = _SESSION_DB if db_target == "session" else _LIBRARY_DB
-                _do_fake_flac_scan(ui, db_path, force)
+                if db_target == "folder":
+                    _do_fake_flac_scan_folder(ui, Path(dest), cfg, force)
+                else:
+                    db_path = _SESSION_DB if db_target == "session" else _LIBRARY_DB
+                    _do_fake_flac_scan(ui, db_path, force)
             elif kind == "fake_flac_vamp":
-                db_path = _SESSION_DB if db_target == "session" else _LIBRARY_DB
+                db_path = _FOLDER_DB if db_target == "folder" else \
+                          (_SESSION_DB if db_target == "session" else _LIBRARY_DB)
                 _do_fake_flac_vamp(ui, db_path)
     except _StopRequested:
         _msg_q.put({"type": "log", "level": "warning", "text": "stopped by user"})
@@ -903,6 +937,8 @@ def library_audits_api():
 
 # ─── fake-flac tab ──────────────────────────────────────────────────────────────
 def _fakeflac_db(db_target: str) -> Path:
+    if db_target == "folder":
+        return _FOLDER_DB
     return _SESSION_DB if db_target == "session" else _LIBRARY_DB
 
 
@@ -1769,10 +1805,17 @@ textarea.sql-input:focus{outline:none;border-color:var(--acc)}
 <!-- ═══════════════ FAKE-FLAC TAB ═══════════════ -->
 <div id="tab-fakeflac" class="tab-content">
 <div class="page-panel">
+  <div class="path-row" style="padding:10px 14px 0">
+    <span class="path-label src">Folder</span>
+    <input class="path-input" id="ff-folder-in" readonly placeholder="not set — pick a folder to check it directly, no import needed" title="Click Browse, or pick from library.db/session.db below instead">
+    <button class="btn-xs" onclick="nativePickFakeflacFolder(this)" title="Choose a folder to scan directly — bypasses the database entirely">📁 Browse</button>
+    <button class="btn-xs ghost" onclick="openInFileManager('ff-folder-in',this)" title="Show this folder in the file manager">↗ Open</button>
+  </div>
   <div class="toolbar">
-    <select class="sql-db-sel" id="ff-db" onchange="loadFakeflacSuspects(0)">
+    <select class="sql-db-sel" id="ff-db" onchange="loadFakeflacSuspects(0)" title="Which set of files to scan/browse">
       <option value="library">library.db</option>
       <option value="session">session.db</option>
+      <option value="folder">picked folder</option>
     </select>
     <label style="font-size:11px;color:var(--dim);display:flex;align-items:center;gap:5px;margin-left:8px"
            title="Re-check files that were already scanned, instead of skipping them">
@@ -2500,12 +2543,32 @@ function ffPage(delta){ loadFakeflacSuspects(Math.max(0,ffPage_+delta)); }
 async function runFakeflacScan(){
   const db=document.getElementById('ff-db').value;
   const force=document.getElementById('ff-force').checked;
-  openToolLog('Scanning for fake FLACs…');
+  const folder=document.getElementById('ff-folder-in').value.trim();
+  if(db==='folder' && !folder){ alert('Click Browse and pick a folder first'); return; }
+  openToolLog(db==='folder' ? `Checking ${folder}…` : 'Scanning for fake FLACs…');
   const r=await fetch('/api/job/fake_flac_scan',{method:'POST',
-    headers:{'Content-Type':'application/json'},body:JSON.stringify({db,force})});
+    headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({db,force,dest:folder})});
   const j=await r.json();
   if(j.error){ appendToolLog('broken',j.error); return; }
   startToolStream(()=>loadFakeflacSuspects(0));
+}
+
+async function nativePickFakeflacFolder(btn){
+  const inp=document.getElementById('ff-folder-in');
+  if(btn) btn.disabled=true;
+  try{
+    const r=await fetch('/api/pick-folder?start='+encodeURIComponent(inp.value||''));
+    const d=await r.json();
+    if(d.ok&&d.path){
+      inp.value=d.path;
+      document.getElementById('ff-db').value='folder';
+      loadFakeflacSuspects(0);
+    } else if(d.reason!=='cancelled'){
+      alert('Cannot open the folder picker: '+(d.reason||'unknown reason'));
+    }
+  }catch(e){ alert('Cannot open the folder picker'); }
+  finally{ if(btn) btn.disabled=false; }
 }
 
 async function runFakeflacVamp(){
