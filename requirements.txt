@@ -15,8 +15,12 @@ discogs-client>=2.3.0
 musicbrainzngs>=0.7.1
 pyacoustid>=1.3.0
 
-# Image processing (cover art)
+# Image processing (cover art, spectrograms)
 Pillow>=9.0.0
+
+# Fake-FLAC detection + spectrogram rendering (FFT spectral analysis)
+numpy>=1.24.0
+soundfile>=0.12.0
 
 # Config (Python 3.10 has no built-in tomllib)
 tomli>=2.0.0

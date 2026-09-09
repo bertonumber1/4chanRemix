@@ -122,6 +122,9 @@ Run them individually or all at once with **Run All**.
 - **Session** — browse the current batch, re-fetch broken files, commit to library
 - **Library** — search and browse the full permanent library
 - **Tools** — rebuild index, compact DB, SQL query, audit checks
+- **Fake-FLAC** — scan the library for lossy-transcoded-into-FLAC files (FFT
+  spectral cutoff, plus an optional Vamp CNN confirm pass if `sonic-annotator`
+  is installed), view a spectrogram per suspect, and isolate / delete / dismiss
 
 ---
 

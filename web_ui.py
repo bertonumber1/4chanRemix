@@ -34,7 +34,7 @@ _SESSION_DB = Path("~/.local/share/music-organiser/web_session.db").expanduser()
 _LIBRARY_DB = Path("~/.local/share/music-organiser/library.db").expanduser()
 _CFG_PATH   = Path("~/.config/music-organiser/config.toml").expanduser()
 _LOG_FILE   = Path("~/.local/share/music-organiser/web_ui.log").expanduser()
-_VERSION    = "1.5.1"
+_VERSION    = "1.6.0"
 
 # ─── logging ──────────────────────────────────────────────────────────────────
 def _setup_logging(verbose: bool = False) -> None:
@@ -329,8 +329,46 @@ def _do_vacuum(ui):
         ui.log("broken", f"vacuum failed: {e}")
 
 
+def _do_fake_flac_scan(ui, db_path: Path, force: bool):
+    from database import Database
+    from fake_flac import verify_lossless_in_db, dependencies_available, missing_dependencies
+    if not dependencies_available():
+        ui.log("broken", f"fake-flac scan needs: {', '.join(missing_dependencies())} "
+                          f"— pip install -r requirements.txt")
+        return
+    if not db_path.exists():
+        ui.log("warning", f"{db_path.name} not found — run Rebuild index (or Import) first")
+        return
+    db = Database(str(db_path))
+    try:
+        stats = verify_lossless_in_db(db, ui=ui, force=force)
+        ui.log("info", stats.summary().replace("\n", "  |  "))
+    finally:
+        db.close()
+
+
+def _do_fake_flac_vamp(ui, db_path: Path):
+    from database import Database
+    from rip_audio import run_on_suspects, find_sonic_annotator
+    if not find_sonic_annotator():
+        ui.log("warning", "sonic-annotator not installed — Vamp confirm skipped")
+        return
+    if not db_path.exists():
+        ui.log("warning", f"{db_path.name} not found — run a scan first")
+        return
+    db = Database(str(db_path))
+    try:
+        stats = run_on_suspects(db, quick=True, log_cb=ui.log)
+        ui.log("info", f"vamp confirm — checked={stats['checked']}  "
+                        f"lossy={stats['confirmed_lossy']}  "
+                        f"lossless={stats['confirmed_lossless']}  "
+                        f"errors={stats['errors']}")
+    finally:
+        db.close()
+
+
 # ─── job runner ───────────────────────────────────────────────────────────────
-def _run_job(kind, sources, dest, provider_ids, cfg, dry_run):
+def _run_job(kind, sources, dest, provider_ids, cfg, dry_run, db_target="library", force=False):
     ui = _WebUI()
     try:
         with ui:
@@ -360,6 +398,12 @@ def _run_job(kind, sources, dest, provider_ids, cfg, dry_run):
                 _do_rebuild(ui, dest, cfg)
             elif kind == "vacuum":
                 _do_vacuum(ui)
+            elif kind == "fake_flac_scan":
+                db_path = _SESSION_DB if db_target == "session" else _LIBRARY_DB
+                _do_fake_flac_scan(ui, db_path, force)
+            elif kind == "fake_flac_vamp":
+                db_path = _SESSION_DB if db_target == "session" else _LIBRARY_DB
+                _do_fake_flac_vamp(ui, db_path)
     except _StopRequested:
         _msg_q.put({"type": "log", "level": "warning", "text": "stopped by user"})
     except Exception as exc:
@@ -857,6 +901,138 @@ def library_audits_api():
         return JSONResponse({"error": str(e)}, status_code=500)
 
 
+# ─── fake-flac tab ──────────────────────────────────────────────────────────────
+def _fakeflac_db(db_target: str) -> Path:
+    return _SESSION_DB if db_target == "session" else _LIBRARY_DB
+
+
+@app.get("/api/fakeflac/vamp-available")
+def fakeflac_vamp_available():
+    """Whether Stage-2 Vamp confirm (sonic-annotator + the CNN plugin) is
+    installed on THIS machine. Expected to be False on a bare Windows box;
+    fine on the Chromebox if it has the plugin — the UI hides the button
+    either way, it just checks first instead of assuming."""
+    try:
+        from rip_audio import find_sonic_annotator
+        found = find_sonic_annotator()
+    except Exception:
+        found = None
+    return JSONResponse({"available": bool(found)})
+
+
+@app.get("/api/fakeflac/suspects")
+def fakeflac_suspects(db: str = "library", page: int = 0, per_page: int = 50):
+    db_path = _fakeflac_db(db)
+    if not db_path.exists():
+        return JSONResponse({"files": [], "total": 0, "page": 0, "pages": 0})
+    total = _db_one(db_path,
+        "SELECT COUNT(*) FROM files WHERE transcode_suspected = 1") or 0
+    offset = page * per_page
+    rows = _db_rows(db_path,
+        "SELECT path, artist, albumartist, album, title, size_bytes, "
+        "transcode_cutoff_hz, transcode_confidence, transcode_notes "
+        "FROM files WHERE transcode_suspected = 1 "
+        "ORDER BY transcode_confidence DESC, path "
+        "LIMIT ? OFFSET ?", [per_page, offset])
+    for r in rows:
+        r["filename"] = Path(r["path"]).name
+        r["mb"] = round((r.get("size_bytes") or 0) / 1048576, 1)
+    return JSONResponse({
+        "files": rows, "total": total, "page": page,
+        "pages": max(1, (total + per_page - 1) // per_page),
+    })
+
+
+@app.post("/api/fakeflac/isolate")
+async def fakeflac_isolate(request: Request):
+    """Move a suspected file into <destination_root>/<suspected_transcode_folder>/
+    and update its path in the DB so the library stays consistent."""
+    body = await request.json()
+    path = body.get("path", "")
+    db_path = _fakeflac_db(body.get("db", "library"))
+    p = Path(path)
+    if not p.is_file():
+        return JSONResponse({"error": "file not found"}, status_code=404)
+    cfg = _load_cfg()
+    paths_cfg = cfg.get("paths", {})
+    dest_root = paths_cfg.get("destination_root", "")
+    folder_name = paths_cfg.get("suspected_transcode_folder", "Suspected Transcodes")
+    if not dest_root:
+        return JSONResponse({"error": "no destination_root configured"}, status_code=400)
+    target_dir = Path(dest_root) / folder_name
+    try:
+        target_dir.mkdir(parents=True, exist_ok=True)
+        target = target_dir / p.name
+        n = 1
+        while target.exists():
+            target = target_dir / f"{p.stem} ({n}){p.suffix}"
+            n += 1
+        shutil.move(str(p), str(target))
+        if db_path.exists():
+            with sqlite3.connect(str(db_path)) as conn:
+                conn.execute("UPDATE files SET path = ? WHERE path = ?",
+                            (str(target), str(p)))
+                conn.commit()
+        return JSONResponse({"ok": True, "path": str(target)})
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+@app.post("/api/fakeflac/delete")
+async def fakeflac_delete(request: Request):
+    body = await request.json()
+    path = body.get("path", "")
+    db_path = _fakeflac_db(body.get("db", "library"))
+    p = Path(path)
+    if not p.is_file():
+        return JSONResponse({"error": "file not found"}, status_code=404)
+    try:
+        p.unlink()
+        if db_path.exists():
+            with sqlite3.connect(str(db_path)) as conn:
+                conn.execute("DELETE FROM files WHERE path = ?", (str(p),))
+                conn.commit()
+        return JSONResponse({"ok": True})
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+@app.post("/api/fakeflac/dismiss")
+async def fakeflac_dismiss(request: Request):
+    """False positive — clear transcode_suspected without touching the file."""
+    body = await request.json()
+    path = body.get("path", "")
+    db_path = _fakeflac_db(body.get("db", "library"))
+    if not db_path.exists():
+        return JSONResponse({"error": f"{db_path.name} not found"}, status_code=404)
+    try:
+        with sqlite3.connect(str(db_path)) as conn:
+            conn.execute("UPDATE files SET transcode_suspected = 0 WHERE path = ?", (path,))
+            conn.commit()
+        return JSONResponse({"ok": True})
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+@app.get("/api/spectrogram")
+def spectrogram_api(path: str = "", force: bool = False):
+    from spectrogram import get_or_render, dependencies_available, missing_dependencies
+    if not dependencies_available():
+        return JSONResponse(
+            {"error": f"spectrogram rendering needs: {', '.join(missing_dependencies())} "
+                      f"— pip install -r requirements.txt"},
+            status_code=500)
+    p = Path(path)
+    if not p.is_file():
+        return JSONResponse({"error": "file not found"}, status_code=404)
+    try:
+        png_path = get_or_render(p, force=force)
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+    from fastapi.responses import FileResponse
+    return FileResponse(str(png_path), media_type="image/png")
+
+
 @app.post("/api/commit")
 async def commit_api():
     """Merge web_session.db into library.db (INSERT OR REPLACE)."""
@@ -905,7 +1081,7 @@ async def job_stream():
 async def start_job(kind: str, request: Request):
     global _job_thread
     valid = {"import","fetch","fetch_broken","organise","pipeline","direct",
-             "rebuild","vacuum","stop"}
+             "rebuild","vacuum","fake_flac_scan","fake_flac_vamp","stop"}
     if kind not in valid:
         return JSONResponse({"error": f"unknown job: {kind}"}, status_code=400)
     if kind == "stop":
@@ -923,7 +1099,8 @@ async def start_job(kind: str, request: Request):
         target=_run_job,
         args=(kind, body.get("sources",[]), body.get("dest",""),
               body.get("providers",["discogs","musicbrainz"]),
-              cfg, bool(body.get("dry_run"))),
+              cfg, bool(body.get("dry_run")),
+              body.get("db","library"), bool(body.get("force"))),
         daemon=True,
     )
     _job_thread.start()
@@ -1061,15 +1238,16 @@ header h1{font-family:"Impact","Haettenschweiler","Franklin Gothic Bold","Arial 
           text-shadow:2px 2px 0 #0a0a0a,0 0 5px rgba(0,0,0,.9),
                       0 0 16px rgba(214,58,47,.55),0 0 32px rgba(214,58,47,.25);
           filter:url(#graffiti-rough)}
-.tabs{display:flex;gap:2px;margin-left:6px}
-.tab-btn{background:none;border:1px solid transparent;color:var(--dim);
-         padding:3px 11px;border-radius:4px;cursor:pointer;font:inherit;font-size:11px;
+.tabs{display:flex;gap:8px;margin-left:18px;align-items:stretch}
+.tab-btn{background:#181420;border:1px solid var(--border);border-bottom:2px solid transparent;
+         color:var(--dim);padding:9px 20px;border-radius:6px 6px 0 0;cursor:pointer;font:inherit;
+         font-size:12px;font-weight:800;letter-spacing:.07em;text-transform:uppercase;
          transition:all .15s}
-.tab-btn:hover{color:var(--text)}
-.tab-btn.active{background:#1e1e30;border-color:var(--acc);color:var(--acc)}
+.tab-btn:hover{color:var(--text);background:#201a2c}
+.tab-btn.active{background:#242038;border-color:var(--acc);border-bottom-color:var(--acc);color:var(--acc)}
 #hdr-status{font-size:11px;color:var(--dim);flex:1;white-space:nowrap}
 .hdr-btn{background:none;border:1px solid var(--border);color:var(--text);
-         padding:3px 10px;border-radius:4px;cursor:pointer;font:inherit;font-size:11px}
+         padding:7px 14px;border-radius:4px;cursor:pointer;font:inherit;font-size:11px}
 .hdr-btn:hover{border-color:var(--acc);color:var(--acc)}
 .hdr-btn.ok{border-color:var(--ok);color:var(--ok)}
 .hdr-btn.err{border-color:var(--err);color:var(--err)}
@@ -1086,22 +1264,31 @@ aside{width:310px;min-width:240px;border-right:1px solid var(--border);
 .card{border-bottom:1px solid var(--border);padding:10px 12px;flex-shrink:0}
 .card h3{font-size:9px;text-transform:uppercase;letter-spacing:.12em;
          color:var(--dim);margin-bottom:8px}
-.path-row{display:flex;gap:6px;margin-bottom:8px;align-items:center}
+.path-row{display:flex;gap:8px;margin-bottom:10px;align-items:center}
 .path-label{font-size:9px;font-weight:800;text-transform:uppercase;letter-spacing:.09em;
             min-width:54px;padding:6px 6px;border-radius:4px;text-align:center;color:#120c04}
 .path-label.src{background:var(--acc2)}
 .path-label.out{background:var(--acc);color:#fff}
-.path-input{flex:1;background:#1c1710;border:1px solid var(--border);
-            color:var(--text);padding:7px 9px;border-radius:4px;
-            font:inherit;font-size:12px;min-width:0;transition:border-color .15s,box-shadow .15s}
-.path-input:focus{outline:none;border-color:var(--acc2);box-shadow:0 0 0 2px rgba(224,165,58,.18)}
-.path-input.active-target{border-color:var(--acc2)!important;box-shadow:0 0 0 2px rgba(224,165,58,.22)}
-.btn-xs{background:var(--acc);border:none;color:#fff;padding:6px 11px;
-        border-radius:4px;cursor:pointer;font:inherit;font-size:10px;font-weight:700;white-space:nowrap}
+/* readonly — Browse is the only way to set these, so they read as plain
+   text next to the button rather than an editable box */
+.path-input{flex:1;background:transparent;border:1px solid transparent;
+            color:var(--text);padding:7px 9px;border-radius:4px;cursor:default;
+            white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
+            font:inherit;font-size:12px;min-width:0;transition:border-color .15s,box-shadow .15s,background .15s}
+.path-input::placeholder{color:var(--dim)}
+.path-input:focus{outline:none;border-color:var(--acc2);box-shadow:0 0 0 2px rgba(224,165,58,.18);background:#1c1710}
+.path-input.active-target{border-color:var(--acc2)!important;box-shadow:0 0 0 2px rgba(224,165,58,.22);background:#1c1710}
+.btn-xs{background:var(--acc);border:none;color:#fff;padding:8px 14px;
+        border-radius:4px;cursor:pointer;font:inherit;font-size:11px;font-weight:700;white-space:nowrap}
 .btn-xs:hover{opacity:.82}
 .btn-xs.ghost{background:#1e1e30;color:var(--dim)}
 .btn-xs.ghost:hover{color:var(--text)}
 .btn-xs.ghost.active{background:#2a2a48;color:var(--acc)}
+.btn-xs.danger{background:var(--err)}
+.ff-conf{display:inline-block;padding:2px 7px;border-radius:3px;font-size:10px;font-weight:700}
+.ff-conf.hi{background:#2a0a0a;color:var(--err)}
+.ff-conf.mid{background:#2a2000;color:var(--warn)}
+.ff-conf.lo{background:#1e1e30;color:var(--dim)}
 .browser-target{display:flex;gap:5px;margin-bottom:6px}
 .bpath{font-size:10px;color:var(--dim);padding:0 0 5px;word-break:break-all}
 .browser-wrap{flex:1;overflow-y:auto}
@@ -1144,10 +1331,10 @@ aside{width:310px;min-width:240px;border-right:1px solid var(--border);
 .phase.stopped .dot{background:var(--warn)}
 .phase-arrow{color:var(--dim);font-size:10px}
 @keyframes pulse{0%,100%{opacity:1}50%{opacity:.3}}
-.action-bar{padding:8px 14px;border-bottom:1px solid var(--border);
-            display:flex;align-items:center;gap:6px;flex-wrap:wrap;flex-shrink:0;margin-top:8px}
-.btn{background:var(--acc);border:none;color:#fff;padding:6px 14px;border-radius:4px;
-     cursor:pointer;font:inherit;font-size:12px;font-weight:600}
+.action-bar{padding:10px 14px;border-bottom:1px solid var(--border);
+            display:flex;align-items:center;gap:9px;flex-wrap:wrap;flex-shrink:0;margin-top:8px}
+.btn{background:var(--acc);border:none;color:#fff;padding:9px 18px;border-radius:4px;
+     cursor:pointer;font:inherit;font-size:13px;font-weight:600}
 .btn:hover:not(:disabled){opacity:.82}
 .btn:disabled{opacity:.35;cursor:not-allowed}
 .btn.run-all{background:linear-gradient(90deg,var(--acc),var(--acc2))}
@@ -1177,8 +1364,8 @@ aside{width:310px;min-width:240px;border-right:1px solid var(--border);
 
 /* ═══ SHARED TABLE STYLES ═══ */
 .page-panel{flex:1;display:flex;flex-direction:column;overflow:hidden}
-.toolbar{padding:8px 14px;border-bottom:1px solid var(--border);
-         display:flex;align-items:center;gap:8px;flex-shrink:0;flex-wrap:wrap}
+.toolbar{padding:10px 14px;border-bottom:1px solid var(--border);
+         display:flex;align-items:center;gap:10px;flex-shrink:0;flex-wrap:wrap}
 .search-input{background:#181824;border:1px solid var(--border);color:var(--text);
               padding:5px 10px;border-radius:3px;font:inherit;font-size:12px;width:220px}
 .search-input:focus{outline:none;border-color:var(--acc)}
@@ -1229,9 +1416,9 @@ tr:hover{background:#161622}
 .tool-card h3{font-size:9px;text-transform:uppercase;letter-spacing:.12em;
               color:var(--dim);margin-bottom:10px}
 .tool-btn{width:100%;background:#1e1e30;border:1px solid var(--border);
-          color:var(--text);padding:8px 12px;border-radius:4px;cursor:pointer;
-          font:inherit;font-size:12px;text-align:left;margin-bottom:6px;
-          display:flex;align-items:center;gap:8px;transition:all .15s}
+          color:var(--text);padding:10px 14px;border-radius:4px;cursor:pointer;
+          font:inherit;font-size:12px;text-align:left;margin-bottom:8px;
+          display:flex;align-items:center;gap:10px;transition:all .15s}
 .tool-btn:hover{border-color:var(--acc);color:var(--acc)}
 .tool-btn .tb-icon{font-size:14px;width:18px;text-align:center}
 .tool-btn .tb-text{flex:1}
@@ -1295,6 +1482,7 @@ textarea.sql-input:focus{outline:none;border-color:var(--acc)}
     <button class="tab-btn" onclick="switchTab('session')">Session</button>
     <button class="tab-btn" onclick="switchTab('library')">Library</button>
     <button class="tab-btn" onclick="switchTab('tools')">Tools</button>
+    <button class="tab-btn" onclick="switchTab('fakeflac')">Fake-FLAC</button>
   </nav>
   <span id="hdr-status">idle</span>
   <button class="hdr-btn" id="save-btn" onclick="saveConfig()">Save config</button>
@@ -1308,13 +1496,13 @@ textarea.sql-input:focus{outline:none;border-color:var(--acc)}
     <h3>Input / Output</h3>
     <div class="path-row">
       <span class="path-label src">Source</span>
-      <input class="path-input" id="src-in" placeholder="folder to read from" oninput="setActiveTarget('src')">
+      <input class="path-input" id="src-in" readonly placeholder="not set" onclick="setActiveTarget('src')">
       <button class="btn-xs" onclick="nativePick('src',this)">📁 Browse</button>
       <button class="btn-xs ghost" onclick="openInFileManager('src-in',this)" title="Show this folder in the file manager">↗ Open</button>
     </div>
     <div class="path-row">
       <span class="path-label out">Output</span>
-      <input class="path-input" id="dest-in" placeholder="folder to organise into" oninput="setActiveTarget('dest')">
+      <input class="path-input" id="dest-in" readonly placeholder="not set" onclick="setActiveTarget('dest')">
       <button class="btn-xs" onclick="nativePick('dest',this)">📁 Browse</button>
       <button class="btn-xs ghost" onclick="openInFileManager('dest-in',this)" title="Show this folder in the file manager">↗ Open</button>
     </div>
@@ -1374,13 +1562,13 @@ textarea.sql-input:focus{outline:none;border-color:var(--acc)}
     <h3>Direct mode — input / output, no database</h3>
     <div class="path-row">
       <span class="path-label src">Source</span>
-      <input class="path-input" id="direct-src-in" placeholder="folder to read from" oninput="setActiveTargetDirect('src')">
+      <input class="path-input" id="direct-src-in" readonly placeholder="not set" onclick="setActiveTargetDirect('src')">
       <button class="btn-xs" onclick="nativePickDirect('src',this)">📁 Browse</button>
       <button class="btn-xs ghost" onclick="openInFileManager('direct-src-in',this)" title="Show this folder in the file manager">↗ Open</button>
     </div>
     <div class="path-row">
       <span class="path-label out">Output</span>
-      <input class="path-input" id="direct-dest-in" placeholder="folder to organise into" oninput="setActiveTargetDirect('dest')">
+      <input class="path-input" id="direct-dest-in" readonly placeholder="not set" onclick="setActiveTargetDirect('dest')">
       <button class="btn-xs" onclick="nativePickDirect('dest',this)">📁 Browse</button>
       <button class="btn-xs ghost" onclick="openInFileManager('direct-dest-in',this)" title="Show this folder in the file manager">↗ Open</button>
     </div>
@@ -1576,6 +1764,64 @@ textarea.sql-input:focus{outline:none;border-color:var(--acc)}
 
 </div><!-- /tools -->
 
+<!-- ═══════════════ FAKE-FLAC TAB ═══════════════ -->
+<div id="tab-fakeflac" class="tab-content">
+<div class="page-panel">
+  <div class="toolbar">
+    <select class="sql-db-sel" id="ff-db" onchange="loadFakeflacSuspects(0)">
+      <option value="library">library.db</option>
+      <option value="session">session.db</option>
+    </select>
+    <label style="font-size:11px;color:var(--dim);display:flex;align-items:center;gap:5px;margin-left:8px">
+      <input type="checkbox" id="ff-force"> force re-check
+    </label>
+    <button class="btn" onclick="runFakeflacScan()">▶ Scan for fake FLACs</button>
+    <button class="btn ghost" id="ff-vamp-btn" onclick="runFakeflacVamp()" disabled
+            title="checking availability…">⚛ Vamp-confirm suspects</button>
+    <button class="btn ghost" onclick="loadFakeflacSuspects(0)" style="margin-left:auto">↺ Refresh</button>
+  </div>
+  <div class="tbl-wrap">
+    <table id="ff-table">
+      <thead><tr>
+        <th>File</th><th>Artist / Album</th><th>Cutoff</th><th>Confidence</th><th>Notes</th>
+      </tr></thead>
+      <tbody id="ff-tbody"></tbody>
+    </table>
+  </div>
+  <div class="pagination">
+    <button class="btn-xs ghost" onclick="ffPage(-1)">← Prev</button>
+    <span id="ff-page-info">page 1 of 1</span>
+    <button class="btn-xs ghost" onclick="ffPage(1)">Next →</button>
+    <span id="ff-count" style="margin-left:auto;color:var(--dim)"></span>
+  </div>
+</div>
+</div><!-- /fakeflac -->
+
+<!-- ═══════════════ SPECTROGRAM POPUP ═══════════════ -->
+<div class="popup-overlay hidden" id="spec-overlay" onclick="closeSpec(event)">
+  <div class="popup" style="width:min(1280px,92vw)">
+    <div class="popup-hdr">
+      <h2 id="spec-title">Spectrogram</h2>
+      <button class="popup-close" onclick="closeSpecBtn()">✕</button>
+    </div>
+    <div class="popup-body">
+      <div id="spec-meta" style="font-size:11px;color:var(--dim);margin-bottom:8px"></div>
+      <div id="spec-img-wrap" style="background:#000;border-radius:4px;min-height:120px;display:flex;align-items:center;justify-content:center">
+        <img id="spec-img" style="width:100%;display:block" src="">
+      </div>
+      <div class="toolbar" style="margin-top:10px">
+        <a class="btn-xs" id="spec-save" download>⭳ Save PNG</a>
+        <button class="btn-xs ghost" onclick="copySpecLink()">⎘ Copy link</button>
+        <span id="spec-copy-status" style="font-size:11px;color:var(--dim)"></span>
+        <span style="flex:1"></span>
+        <button class="btn-xs ghost" onclick="ffAction('dismiss')">✓ Dismiss (false positive)</button>
+        <button class="btn-xs ghost" onclick="ffAction('isolate')">⇥ Isolate</button>
+        <button class="btn-xs danger" onclick="ffAction('delete')">✕ Delete</button>
+      </div>
+    </div>
+  </div>
+</div>
+
 <!-- ═══════════════ DETAIL POPUP ═══════════════ -->
 <div class="popup-overlay hidden" id="detail-overlay" onclick="closeDetail(event)">
   <div class="popup">
@@ -1615,11 +1861,13 @@ function switchTab(name){
   document.querySelectorAll('.tab-btn').forEach(el=>el.classList.remove('active'));
   document.getElementById('tab-'+name).classList.add('active');
   const btns=[...document.querySelectorAll('.tab-btn')];
-  const labels={pipeline:'Pipeline',direct:'Direct',session:'Session',library:'Library',tools:'Tools'};
+  const labels={pipeline:'Pipeline',direct:'Direct',session:'Session',library:'Library',
+                tools:'Tools',fakeflac:'Fake-FLAC'};
   btns.forEach(b=>{ if(b.textContent===labels[name]) b.classList.add('active'); });
   if(name==='session') loadSession();
   if(name==='library'){ loadLibraryStats(); loadLibrary(0); }
   if(name==='tools'){ loadLibraryStats(); }
+  if(name==='fakeflac'){ loadFakeflacSuspects(0); checkVampAvailable(); }
 }
 
 // ── init ─────────────────────────────────────────────────────────────────────
@@ -2204,6 +2452,109 @@ function startToolStream(onDone){
     }
   };
   toolLogES.onerror=()=>{ if(toolLogES){toolLogES.close();toolLogES=null;} };
+}
+
+// ── fake-flac tab ────────────────────────────────────────────────────────────
+let ffPage_=0, ffRows_=[], ffCurrent_=null;
+
+async function checkVampAvailable(){
+  const btn=document.getElementById('ff-vamp-btn');
+  try{
+    const r=await fetch('/api/fakeflac/vamp-available');
+    const d=await r.json();
+    btn.disabled=!d.available;
+    btn.title=d.available
+      ? 'run sonic-annotator + the Vamp CNN plugin on all suspects'
+      : 'sonic-annotator not found on this machine';
+  }catch(e){ btn.disabled=true; }
+}
+
+async function loadFakeflacSuspects(page){
+  ffPage_=page;
+  const db=document.getElementById('ff-db').value;
+  const params=new URLSearchParams({db,page,per_page:50});
+  const r=await fetch('/api/fakeflac/suspects?'+params);
+  const d=await r.json();
+  ffRows_=d.files||[];
+  document.getElementById('ff-page-info').textContent=`page ${(d.page||0)+1} of ${d.pages||1}`;
+  document.getElementById('ff-count').textContent=`${(d.total||0).toLocaleString()} suspects`;
+  document.getElementById('ff-tbody').innerHTML=ffRows_.map((row,i)=>{
+    const conf=row.transcode_confidence||0;
+    const cls=conf>=0.6?'hi':conf>=0.3?'mid':'lo';
+    const who=[row.artist||row.albumartist,row.album].filter(Boolean).join(' — ');
+    return `<tr onclick="openFakeflacDetail(${i})" style="cursor:pointer">
+      <td>${esc(row.filename||'')}</td>
+      <td>${esc(who)}</td>
+      <td>${row.transcode_cutoff_hz?Math.round(row.transcode_cutoff_hz)+' Hz':'—'}</td>
+      <td><span class="ff-conf ${cls}">${Math.round(conf*100)}%</span></td>
+      <td title="${esc(row.transcode_notes||'')}">${esc(row.transcode_notes||'')}</td>
+    </tr>`;
+  }).join('') || '<tr><td colspan="5" style="padding:20px;color:var(--dim)">no suspects — run a scan above</td></tr>';
+}
+function ffPage(delta){ loadFakeflacSuspects(Math.max(0,ffPage_+delta)); }
+
+async function runFakeflacScan(){
+  const db=document.getElementById('ff-db').value;
+  const force=document.getElementById('ff-force').checked;
+  openToolLog('Scanning for fake FLACs…');
+  const r=await fetch('/api/job/fake_flac_scan',{method:'POST',
+    headers:{'Content-Type':'application/json'},body:JSON.stringify({db,force})});
+  const j=await r.json();
+  if(j.error){ appendToolLog('broken',j.error); return; }
+  startToolStream(()=>loadFakeflacSuspects(0));
+}
+
+async function runFakeflacVamp(){
+  const db=document.getElementById('ff-db').value;
+  openToolLog('Vamp-confirming suspects (slow)…');
+  const r=await fetch('/api/job/fake_flac_vamp',{method:'POST',
+    headers:{'Content-Type':'application/json'},body:JSON.stringify({db})});
+  const j=await r.json();
+  if(j.error){ appendToolLog('broken',j.error); return; }
+  startToolStream(()=>loadFakeflacSuspects(ffPage_));
+}
+
+function openFakeflacDetail(i){
+  const row=ffRows_[i];
+  if(!row) return;
+  ffCurrent_=row;
+  document.getElementById('spec-title').textContent=row.filename||row.path;
+  const who=[row.artist||row.albumartist,row.album].filter(Boolean).join(' — ');
+  document.getElementById('spec-meta').innerHTML=
+    `${esc(who)} &nbsp;•&nbsp; cutoff ${row.transcode_cutoff_hz?Math.round(row.transcode_cutoff_hz)+' Hz':'—'}
+     &nbsp;•&nbsp; confidence ${Math.round((row.transcode_confidence||0)*100)}%
+     &nbsp;•&nbsp; ${esc(row.transcode_notes||'')}`;
+  const url='/api/spectrogram?path='+encodeURIComponent(row.path);
+  document.getElementById('spec-img').src=url;
+  const saveLink=document.getElementById('spec-save');
+  saveLink.href=url;
+  saveLink.download=(row.filename||'spectrogram')+'.png';
+  document.getElementById('spec-copy-status').textContent='';
+  document.getElementById('spec-overlay').classList.remove('hidden');
+}
+function closeSpec(e){ if(e.target.id==='spec-overlay') closeSpecBtn(); }
+function closeSpecBtn(){ document.getElementById('spec-overlay').classList.add('hidden'); }
+
+function copySpecLink(){
+  const url=location.origin+document.getElementById('spec-img').getAttribute('src');
+  const status=document.getElementById('spec-copy-status');
+  navigator.clipboard.writeText(url)
+    .then(()=>{ status.textContent='copied'; })
+    .catch(()=>{ status.textContent=url; });
+}
+
+async function ffAction(kind){
+  if(!ffCurrent_) return;
+  if(kind==='delete' && !confirm(`Permanently delete ${ffCurrent_.filename}? This cannot be undone.`)) return;
+  if(kind==='isolate' && !confirm(`Move ${ffCurrent_.filename} to the Suspected Transcodes folder?`)) return;
+  const db=document.getElementById('ff-db').value;
+  const r=await fetch('/api/fakeflac/'+kind,{method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({path:ffCurrent_.path,db})});
+  const j=await r.json();
+  if(j.error){ alert(j.error); return; }
+  closeSpecBtn();
+  loadFakeflacSuspects(ffPage_);
 }
 
 // ── detail popup ──────────────────────────────────────────────────────────────

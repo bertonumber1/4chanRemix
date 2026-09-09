@@ -69,6 +69,9 @@ DEFAULT_CONFIG: dict[str, Any] = {
         # Set to "" if you don't want a quality-tier subdir.
         "high_quality_folder": "High Quality",
         "low_quality_folder": "Shit Quality",
+        # Where the web UI's Fake-FLAC tab moves files isolated as
+        # suspected lossy-transcodes-in-a-FLAC-wrapper.
+        "suspected_transcode_folder": "Suspected Transcodes",
     },
     "import": {
         # "copy" leaves originals in place. "move" deletes from source after

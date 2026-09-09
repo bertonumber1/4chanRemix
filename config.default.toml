@@ -12,6 +12,7 @@ broken_folder = "Broken"
 high_quality_folder = "High Quality"
 low_quality_folder = "Shit Quality"
 orphan_folder = "orphaned bonus files"
+suspected_transcode_folder = "Suspected Transcodes"
 
 out_of_library_dest = "/mnt/usb-a/drive/OrganiserStuff"
 
