@@ -460,8 +460,26 @@ def root(): return HTMLResponse(_HTML)
 def wallpaper():
     from fastapi.responses import FileResponse
     import os
-    p = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets", "wallpaper-pirate.jpg")
+    # wallpaper-pirate.jpg (the original theme) stays in assets/, just unused
+    # by default — swap the filename below to bring it back.
+    p = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets", "wallpaper-ice.jpg")
     return FileResponse(p, media_type="image/jpeg")
+
+
+@app.get("/logo.png")
+def logo():
+    from fastapi.responses import FileResponse
+    import os
+    p = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets", "logo-sas.png")
+    return FileResponse(p, media_type="image/png")
+
+
+@app.get("/logo-icon.png")
+def logo_icon():
+    from fastapi.responses import FileResponse
+    import os
+    p = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets", "logo-sas-icon.png")
+    return FileResponse(p, media_type="image/png")
 
 
 @app.get("/api/config")
@@ -1261,34 +1279,28 @@ _HTML = r"""<!DOCTYPE html>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>music-organiser</title>
+<link rel="icon" type="image/png" href="/logo-icon.png">
 <style>
 :root{
-  --bg:#0a0908;--panel:#14110dee;--card:#1a150e88;--border:#3a2f22;
-  --acc:#d63a2f;--acc2:#e0a53a;--text:#e8ddc6;--dim:#847660;
+  --bg:#070a0e;--panel:#0e141bee;--card:#141c2688;--border:#25384a;
+  --acc:#2f9fe0;--acc2:#8fe0f0;--text:#dce8f0;--dim:#5f7688;
   --ok:#4ecb71;--warn:#f0c040;--err:#ff5566;--info:#60b8ff;--dup:#c060f0;
 }
 *{box-sizing:border-box;margin:0;padding:0}
 body{color:var(--text);background:var(--bg);
      font-family:'JetBrains Mono','Fira Code','Cascadia Code',monospace;
      font-size:13px;height:100vh;display:flex;flex-direction:column;overflow:hidden}
-/* fixed pirate-flag backdrop, heavily darkened so the dense UI stays readable */
+/* fixed ice-cool faceted backdrop, heavily darkened so the dense UI stays readable */
 body::before{content:"";position:fixed;inset:0;z-index:-1;pointer-events:none;
      background:
-       radial-gradient(ellipse at top,rgba(30,22,14,.30) 0%,transparent 60%),
-       linear-gradient(rgba(8,7,6,.80),rgba(6,5,4,.90)),
+       radial-gradient(ellipse at top,rgba(20,35,48,.15) 0%,transparent 60%),
+       linear-gradient(rgba(5,8,11,.42),rgba(4,6,9,.55)),
        url("/wallpaper.jpg") center/cover no-repeat fixed}
 
 /* HEADER */
 header{background:var(--panel);border-bottom:1px solid var(--border);
        padding:7px 16px;display:flex;align-items:center;gap:14px;flex-shrink:0}
-/* street-graffiti stencil wordmark: bone fill, hard black stencil edge, red
-   overspray, roughened by the #graffiti-rough turbulence filter */
-header h1{font-family:"Impact","Haettenschweiler","Franklin Gothic Bold","Arial Black",sans-serif;
-          font-size:25px;font-weight:900;letter-spacing:1px;text-transform:uppercase;line-height:1;
-          color:#ece3d0;white-space:nowrap;-webkit-text-stroke:1.4px #0a0a0a;
-          text-shadow:2px 2px 0 #0a0a0a,0 0 5px rgba(0,0,0,.9),
-                      0 0 16px rgba(214,58,47,.55),0 0 32px rgba(214,58,47,.25);
-          filter:url(#graffiti-rough)}
+.brand-logo{height:52px;display:block}
 .tabs{display:flex;gap:8px;margin-left:18px;align-items:stretch}
 .tab-btn{background:#181420;border:1px solid var(--border);border-bottom:2px solid transparent;
          color:var(--dim);padding:9px 20px;border-radius:6px 6px 0 0;cursor:pointer;font:inherit;
@@ -1311,6 +1323,7 @@ header h1{font-family:"Impact","Haettenschweiler","Franklin Gothic Bold","Arial 
 #tab-pipeline{flex-direction:row}
 #tab-direct{flex-direction:row}
 aside{width:310px;min-width:240px;border-right:1px solid var(--border);
+      background:rgba(7,11,16,.72);
       display:flex;flex-direction:column;overflow:hidden;flex-shrink:0}
 .card{border-bottom:1px solid var(--border);padding:10px 12px;flex-shrink:0}
 .card h3{font-size:9px;text-transform:uppercase;letter-spacing:.12em;
@@ -1399,7 +1412,10 @@ aside{width:310px;min-width:240px;border-right:1px solid var(--border);
 .dry-label input{accent-color:var(--warn);cursor:pointer}
 .progress-bar{height:2px;background:var(--border);flex-shrink:0}
 .progress-fill{height:100%;background:linear-gradient(90deg,var(--acc),var(--acc2));transition:width .25s}
+/* transparent while empty (wallpaper shows through, like the idle Pipeline
+   log), opaque as soon as there's actual output to keep it readable */
 .log{flex:1;overflow-y:auto;padding:7px 14px;font-size:12px;line-height:1.65}
+.log:not(:empty){background:rgba(7,11,16,.82)}
 .ll{display:flex;gap:8px}
 .ll .ts{color:var(--dim);min-width:56px}
 .ll .lv{min-width:60px;font-size:10px;text-align:right;opacity:.7}
@@ -1434,7 +1450,7 @@ aside{width:310px;min-width:240px;border-right:1px solid var(--border);
 .stat-pill.imp .val{color:var(--ok)}
 .stat-pill.brk .val{color:var(--err)}
 .stat-pill.dup .val{color:var(--dup)}
-.tbl-wrap{flex:1;overflow:auto}
+.tbl-wrap{flex:1;overflow:auto;background:rgba(7,11,16,.72)}
 table{width:100%;border-collapse:collapse;font-size:12px}
 th{position:sticky;top:0;background:#0e0e1a;border-bottom:1px solid var(--border);
    padding:6px 10px;text-align:left;font-size:10px;text-transform:uppercase;
@@ -1463,6 +1479,7 @@ tr:hover{background:#161622}
 /* ═══ TOOLS TAB ═══ */
 #tab-tools{flex-direction:row;overflow:hidden}
 .tools-left{width:330px;min-width:240px;border-right:1px solid var(--border);
+            background:rgba(7,11,16,.72);
             display:flex;flex-direction:column;overflow-y:auto;flex-shrink:0}
 .tool-card{padding:18px 18px 14px}
 .tool-card + .tool-card{border-top:1px solid var(--border)}
@@ -1490,7 +1507,8 @@ textarea.sql-input{flex:0 0 100px;background:#181824;border:1px solid var(--bord
                    color:var(--text);padding:8px;border-radius:3px;
                    font:'JetBrains Mono',monospace;font-size:12px;resize:vertical}
 textarea.sql-input:focus{outline:none;border-color:var(--acc)}
-.sql-results{flex:1;overflow:auto;border:1px solid var(--border);border-radius:3px}
+.sql-results{flex:1;overflow:auto;border:1px solid var(--border);border-radius:3px;
+             background:rgba(7,11,16,.72)}
 .sql-results table td,.sql-results table th{max-width:300px}
 .audit-panel{border-top:1px solid var(--border);flex-shrink:0;max-height:280px;overflow-y:auto}
 .audit-row{display:flex;align-items:center;gap:8px;padding:5px 14px;
@@ -1522,14 +1540,8 @@ textarea.sql-input:focus{outline:none;border-color:var(--acc)}
 </style>
 </head>
 <body>
-<svg width="0" height="0" style="position:absolute" aria-hidden="true">
-  <filter id="graffiti-rough">
-    <feTurbulence type="fractalNoise" baseFrequency="0.02 0.03" numOctaves="2" seed="7" result="n"/>
-    <feDisplacementMap in="SourceGraphic" in2="n" scale="3" xChannelSelector="R" yChannelSelector="G"/>
-  </filter>
-</svg>
 <header>
-  <h1 title="music-organiser">Smash-n-Grab</h1>
+  <img class="brand-logo" src="/logo.png" alt="SeriousAboutSound" title="music-organiser">
   <nav class="tabs">
     <button class="tab-btn active" onclick="switchTab('pipeline')" title="Full pipeline — import, fetch tags, and organise into the library">Pipeline</button>
     <button class="tab-btn" onclick="switchTab('direct')" title="Organise straight through, no database">Direct</button>
