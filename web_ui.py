@@ -1410,19 +1410,21 @@ tr:hover{background:#161622}
 
 /* ═══ TOOLS TAB ═══ */
 #tab-tools{flex-direction:row;overflow:hidden}
-.tools-left{width:300px;min-width:220px;border-right:1px solid var(--border);
+.tools-left{width:330px;min-width:240px;border-right:1px solid var(--border);
             display:flex;flex-direction:column;overflow-y:auto;flex-shrink:0}
-.tool-card{padding:12px 14px;border-bottom:1px solid var(--border)}
-.tool-card h3{font-size:9px;text-transform:uppercase;letter-spacing:.12em;
-              color:var(--dim);margin-bottom:10px}
+.tool-card{padding:18px 18px 14px}
+.tool-card + .tool-card{border-top:1px solid var(--border)}
+.tool-card h3{font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.1em;
+              color:var(--acc2);margin-bottom:14px}
 .tool-btn{width:100%;background:#1e1e30;border:1px solid var(--border);
-          color:var(--text);padding:10px 14px;border-radius:4px;cursor:pointer;
-          font:inherit;font-size:12px;text-align:left;margin-bottom:8px;
-          display:flex;align-items:center;gap:10px;transition:all .15s}
+          color:var(--text);padding:13px 16px;border-radius:5px;cursor:pointer;
+          font:inherit;font-size:13px;font-weight:600;text-align:left;margin-bottom:11px;
+          display:flex;align-items:center;gap:13px;transition:all .15s}
+.tool-btn:last-child{margin-bottom:0}
 .tool-btn:hover{border-color:var(--acc);color:var(--acc)}
-.tool-btn .tb-icon{font-size:14px;width:18px;text-align:center}
-.tool-btn .tb-text{flex:1}
-.tool-btn .tb-hint{font-size:10px;color:var(--dim)}
+.tool-btn .tb-icon{font-size:17px;width:22px;text-align:center;flex-shrink:0}
+.tool-btn .tb-text{flex:1;line-height:1.5}
+.tool-btn .tb-hint{display:block;margin-top:2px;font-size:11px;font-weight:400;color:var(--dim)}
 .tool-btn:hover .tb-hint{color:var(--acc)}
 .tool-btn.danger:hover{border-color:var(--err);color:var(--err)}
 .tool-btn.commit-btn:hover{border-color:var(--ok);color:var(--ok)}
@@ -1815,6 +1817,7 @@ textarea.sql-input:focus{outline:none;border-color:var(--acc)}
         <button class="btn-xs ghost" onclick="copySpecLink()" title="Copy a direct link to this spectrogram image, for anyone else on the LAN">⎘ Copy link</button>
         <span id="spec-copy-status" style="font-size:11px;color:var(--dim)"></span>
         <span style="flex:1"></span>
+        <button class="btn-xs ghost" onclick="openFakeflacFolder(this)" title="Show this file in the file manager">↗ Open</button>
         <button class="btn-xs ghost" onclick="ffAction('dismiss')" title="False positive — clear the suspected flag, leave the file where it is">✓ Dismiss (false positive)</button>
         <button class="btn-xs ghost" onclick="ffAction('isolate')" title="Move this file into the Suspected Transcodes folder under Output">⇥ Isolate</button>
         <button class="btn-xs danger" onclick="ffAction('delete')" title="Permanently delete this file — cannot be undone">✕ Delete</button>
@@ -2542,6 +2545,18 @@ function copySpecLink(){
   navigator.clipboard.writeText(url)
     .then(()=>{ status.textContent='copied'; })
     .catch(()=>{ status.textContent=url; });
+}
+
+async function openFakeflacFolder(btn){
+  if(!ffCurrent_) return;
+  const label=btn?btn.textContent:'';
+  if(btn){ btn.disabled=true; btn.textContent='…'; }
+  try{
+    const r=await fetch('/api/open-folder?path='+encodeURIComponent(ffCurrent_.path));
+    const d=await r.json();
+    if(!d.ok) alert('Cannot open folder: '+(d.reason||'failed'));
+  }catch(e){ alert('Cannot open folder'); }
+  finally{ if(btn){ btn.disabled=false; btn.textContent=label; } }
 }
 
 async function ffAction(kind){
