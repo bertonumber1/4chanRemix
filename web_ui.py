@@ -6,7 +6,7 @@ Open: http://192.168.0.65:8082
 """
 from __future__ import annotations
 
-import asyncio, json, logging, os, re, shutil, signal, socket, sqlite3, subprocess, sys, threading, time
+import asyncio, json, logging, os, re, shutil, signal, socket, sqlite3, subprocess, sys, tempfile, threading, time
 from pathlib import Path
 from queue import Empty, Queue
 from typing import Any
@@ -687,22 +687,37 @@ def _pick_windows(start_dir: Path | None) -> tuple[bool, str]:
     powershell.exe needs -STA for the shell dialog; pwsh (7+) dropped that
     switch and is already STA, hence the two spellings. The chosen path goes
     to stdout on its own — PowerShell warnings stay on stderr.
+
+    The script goes to a temp .ps1 file run with -File, NOT piped via stdin
+    with -Command -. Piping it in (subprocess.run(..., input=script)) looked
+    fine — exit 0, no stderr — but produced zero stdout and never showed the
+    dialog at all when the parent process's stdin is itself redirected/piped
+    (exactly how uvicorn's worker launches this). -File with a real script
+    file opens the dialog reliably in the same situation; confirmed by
+    reproducing both paths directly outside the app.
     """
     if not _windows_has_desktop():
         return False, "no interactive desktop (running as a service)"
     exe = shutil.which("powershell") or shutil.which("powershell.exe")
-    args = ["-NoProfile", "-STA", "-NonInteractive", "-Command", "-"]
+    args = ["-NoProfile", "-STA", "-NonInteractive"]
     if not exe:
         exe = shutil.which("pwsh")
-        args = ["-NoProfile", "-NonInteractive", "-Command", "-"]
+        args = ["-NoProfile", "-NonInteractive"]
     if not exe:
         return False, "powershell not found"
     initial = str(start_dir) if start_dir is not None else ""
-    # Fed through a single-quoted here-string, so the only thing that can end
-    # it early is a line that is exactly "'@" — a path can never be that.
     script = _WIN_PICKER_PS.replace("__INITIAL__", initial)
-    proc = subprocess.run([exe] + args, input=script,
-                          capture_output=True, text=True, timeout=300)
+    fd, tmp_path = tempfile.mkstemp(suffix=".ps1", prefix="mo_pick_")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(script)
+        proc = subprocess.run([exe] + args + ["-File", tmp_path],
+                              capture_output=True, text=True, timeout=300)
+    finally:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
     chosen = (proc.stdout or "").strip()
     if not chosen:
         return False, "cancelled"
@@ -1309,6 +1324,7 @@ aside{width:310px;min-width:240px;border-right:1px solid var(--border);
    text next to the button rather than an editable box */
 .path-input{flex:1;background:transparent;border:1px solid transparent;
             color:var(--text);padding:7px 9px;border-radius:4px;cursor:default;
+            caret-color:transparent;user-select:text;
             white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
             font:inherit;font-size:12px;min-width:0;transition:border-color .15s,box-shadow .15s,background .15s}
 .path-input::placeholder{color:var(--dim)}
@@ -1534,13 +1550,13 @@ textarea.sql-input:focus{outline:none;border-color:var(--acc)}
     <h3>Input / Output</h3>
     <div class="path-row">
       <span class="path-label src">Source</span>
-      <input class="path-input" id="src-in" readonly placeholder="not set" onclick="setActiveTarget('src')" title="Click to make this the active target for the filesystem browser below">
+      <input class="path-input" id="src-in" readonly tabindex="-1" onfocus="setTimeout(()=>this.blur())" placeholder="not set" onclick="setActiveTarget('src')" title="Click to make this the active target for the filesystem browser below">
       <button class="btn-xs" onclick="nativePick('src',this)" title="Choose the source folder with the system folder picker">📁 Browse</button>
       <button class="btn-xs ghost" onclick="openInFileManager('src-in',this)" title="Show this folder in the file manager">↗ Open</button>
     </div>
     <div class="path-row">
       <span class="path-label out">Output</span>
-      <input class="path-input" id="dest-in" readonly placeholder="not set" onclick="setActiveTarget('dest')" title="Click to make this the active target for the filesystem browser below">
+      <input class="path-input" id="dest-in" readonly tabindex="-1" onfocus="setTimeout(()=>this.blur())" placeholder="not set" onclick="setActiveTarget('dest')" title="Click to make this the active target for the filesystem browser below">
       <button class="btn-xs" onclick="nativePick('dest',this)" title="Choose the output folder with the system folder picker">📁 Browse</button>
       <button class="btn-xs ghost" onclick="openInFileManager('dest-in',this)" title="Show this folder in the file manager">↗ Open</button>
     </div>
@@ -1600,13 +1616,13 @@ textarea.sql-input:focus{outline:none;border-color:var(--acc)}
     <h3>Direct mode — input / output, no database</h3>
     <div class="path-row">
       <span class="path-label src">Source</span>
-      <input class="path-input" id="direct-src-in" readonly placeholder="not set" onclick="setActiveTargetDirect('src')" title="Click to make this the active target for the filesystem browser below">
+      <input class="path-input" id="direct-src-in" readonly tabindex="-1" onfocus="setTimeout(()=>this.blur())" placeholder="not set" onclick="setActiveTargetDirect('src')" title="Click to make this the active target for the filesystem browser below">
       <button class="btn-xs" onclick="nativePickDirect('src',this)" title="Choose the source folder with the system folder picker">📁 Browse</button>
       <button class="btn-xs ghost" onclick="openInFileManager('direct-src-in',this)" title="Show this folder in the file manager">↗ Open</button>
     </div>
     <div class="path-row">
       <span class="path-label out">Output</span>
-      <input class="path-input" id="direct-dest-in" readonly placeholder="not set" onclick="setActiveTargetDirect('dest')" title="Click to make this the active target for the filesystem browser below">
+      <input class="path-input" id="direct-dest-in" readonly tabindex="-1" onfocus="setTimeout(()=>this.blur())" placeholder="not set" onclick="setActiveTargetDirect('dest')" title="Click to make this the active target for the filesystem browser below">
       <button class="btn-xs" onclick="nativePickDirect('dest',this)" title="Choose the output folder with the system folder picker">📁 Browse</button>
       <button class="btn-xs ghost" onclick="openInFileManager('direct-dest-in',this)" title="Show this folder in the file manager">↗ Open</button>
     </div>
@@ -1807,7 +1823,7 @@ textarea.sql-input:focus{outline:none;border-color:var(--acc)}
 <div class="page-panel">
   <div class="path-row" style="padding:10px 14px 0">
     <span class="path-label src">Folder</span>
-    <input class="path-input" id="ff-folder-in" readonly placeholder="not set — pick a folder to check it directly, no import needed" title="Click Browse, or pick from library.db/session.db below instead">
+    <input class="path-input" id="ff-folder-in" readonly tabindex="-1" onfocus="setTimeout(()=>this.blur())" placeholder="not set — pick a folder to check it directly, no import needed" title="Click Browse, or pick from library.db/session.db below instead">
     <button class="btn-xs" onclick="nativePickFakeflacFolder(this)" title="Choose a folder to scan directly — bypasses the database entirely">📁 Browse</button>
     <button class="btn-xs ghost" onclick="openInFileManager('ff-folder-in',this)" title="Show this folder in the file manager">↗ Open</button>
   </div>
