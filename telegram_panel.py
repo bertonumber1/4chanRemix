@@ -131,7 +131,11 @@ class Job:
                 argv, cwd=cwd or None, env=env,
                 stdin=subprocess.DEVNULL,       # a service has no usable stdin
                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                text=True, bufsize=1,
+                # Channel names are full of emoji and accents. text=True alone
+                # decodes with the LOCALE codec, which on Windows is cp1252 and
+                # raises UnicodeDecodeError inside the reader thread -- silently,
+                # because it is a daemon thread, so the box just stayed empty.
+                text=True, encoding="utf-8", errors="replace", bufsize=1,
                 creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0,
             )
         except Exception as exc:
@@ -144,11 +148,20 @@ class Job:
         return True, "started"
 
     def _pump(self) -> None:
+        """Drain the child's output. Never let this thread die quietly -- an
+        exception in here used to leave the UI showing an empty log for a job
+        that had actually run fine."""
         assert self.proc and self.proc.stdout
-        for line in self.proc.stdout:
-            self._add(line)
-        self.proc.wait()
-        self.rc = self.proc.returncode
+        try:
+            for line in self.proc.stdout:
+                self._add(line)
+        except Exception as exc:
+            self._add("[output reader failed: %r]" % (exc,))
+        try:
+            self.proc.wait()
+            self.rc = self.proc.returncode
+        except Exception:
+            self.rc = -1
         self._add("--- finished, exit %s ---" % self.rc)
 
     def stop(self) -> tuple[bool, str]:
