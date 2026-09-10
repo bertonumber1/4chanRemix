@@ -88,13 +88,18 @@ class Job:
         return self.proc is not None and self.proc.poll() is None
 
     def snapshot(self, since: int = 0) -> dict:
+        # If the process is gone but the pump thread has not recorded rc yet,
+        # report the real exit code rather than a misleading "still starting".
+        rc = self.rc
+        if rc is None and self.proc is not None:
+            rc = self.proc.poll()
         with self._lock:
             first = self.seq - len(self.lines)
             start = max(0, since - first)
             return {
                 "running": self.running(),
                 "label": self.label,
-                "rc": self.rc,
+                "rc": rc,
                 "seq": self.seq,
                 "elapsed": int(time.time() - self.started) if self.started else 0,
                 "lines": list(self.lines)[start:],
@@ -124,6 +129,7 @@ class Job:
         try:
             self.proc = subprocess.Popen(
                 argv, cwd=cwd or None, env=env,
+                stdin=subprocess.DEVNULL,       # a service has no usable stdin
                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                 text=True, bufsize=1,
                 creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0,
@@ -177,9 +183,12 @@ def scraper_argv(st: dict, mode: str, channel: str, opts: dict) -> list[str]:
         if opts.get("max_gb"):
             argv += ["--max-gb", str(float(opts["max_gb"]))]
     if st["scraper_ssh"]:
-        # -tt so the remote process dies with the ssh session instead of being
-        # orphaned when Stop is pressed.
-        argv = ["ssh", "-tt", st["scraper_ssh"]] + argv
+        # -n (stdin from /dev/null) and BatchMode: the UI runs as a service with
+        # no usable stdin, and `ssh -tt` there dies before it produces a single
+        # line of output. BatchMode also turns a missing key into an immediate
+        # error instead of a password prompt nobody can answer.
+        argv = ["ssh", "-n", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10",
+                st["scraper_ssh"]] + argv
     return argv
 
 
