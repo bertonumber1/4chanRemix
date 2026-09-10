@@ -40,7 +40,13 @@ _LIBRARY_DB = Path("~/.local/share/music-organiser/library.db").expanduser()
 _FOLDER_DB  = Path("~/.local/share/music-organiser/web_folder_scan.db").expanduser()
 _CFG_PATH   = Path("~/.config/music-organiser/config.toml").expanduser()
 _LOG_FILE   = Path("~/.local/share/music-organiser/web_ui.log").expanduser()
-_VERSION    = "1.7.0"
+_VERSION    = "1.8.0"
+
+try:
+    import telegram_panel as tgp
+except Exception as _tg_err:            # a broken panel must not kill the app
+    tgp = None
+    _TG_ERR = repr(_tg_err)
 
 # ─── logging ──────────────────────────────────────────────────────────────────
 def _setup_logging(verbose: bool = False) -> None:
@@ -829,6 +835,57 @@ def open_folder(path: str = ""):
         return JSONResponse({"ok": False, "reason": str(exc)})
 
 
+# ─── telegram control panel ───────────────────────────────────────────────────
+def _tg_guard():
+    if tgp is None:
+        return JSONResponse({"ok": False, "reason": "telegram_panel failed to load: %s" % _TG_ERR})
+    return None
+
+
+@app.get("/api/tg/status")
+def tg_status(since: int = 0):
+    g = _tg_guard()
+    if g:
+        return g
+    return JSONResponse(tgp.status(_load_cfg(), since))
+
+
+@app.post("/api/tg/scraper")
+async def tg_scraper(req: Request):
+    g = _tg_guard()
+    if g:
+        return g
+    body = await req.json()
+    ok, msg = tgp.run_scraper(_load_cfg(), body.get("mode", ""), body.get("channel", ""),
+                              body.get("opts") or {})
+    return JSONResponse({"ok": ok, "reason": msg})
+
+
+@app.post("/api/tg/scraper/stop")
+def tg_scraper_stop():
+    g = _tg_guard()
+    if g:
+        return g
+    ok, msg = tgp.JOB.stop()
+    return JSONResponse({"ok": ok, "reason": msg})
+
+
+@app.post("/api/tg/uploader")
+async def tg_uploader(req: Request):
+    g = _tg_guard()
+    if g:
+        return g
+    body = await req.json()
+    act = body.get("action", "")
+    if act in ("on", "off"):
+        ok, msg = tgp.uploader_set(_load_cfg(), act == "on")
+    elif act == "retry":
+        ok, msg = tgp.uploader_retry_failed(_load_cfg())
+    else:
+        ok, msg = False, "unknown action %r" % act
+    return JSONResponse({"ok": ok, "reason": msg})
+
+
 @app.get("/api/scan")
 def scan_source(path: str = ""):
     if not path:
@@ -1540,6 +1597,68 @@ textarea.sql-input:focus{outline:none;border-color:var(--acc)}
 .meta-grid .mv.ok{color:var(--ok)}
 .meta-grid .mv.err{color:var(--err)}
 .meta-grid .mv.warn{color:var(--warn)}
+
+/* ── telegram control panel ───────────────────────────────────────────── */
+/* .tab-content.active is display:flex, so this tab's children would sit in a
+   ROW and the grid would be squeezed to its minimum. Make it a column. */
+#tab-telegram.active{flex-direction:column;overflow:auto;padding:14px 16px 22px;gap:12px}
+.tg-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(400px,1fr));
+         gap:14px;align-items:start;width:100%}
+.tg-card{background:var(--card);border:1px solid var(--border);border-radius:8px;
+         padding:16px 16px 14px;display:flex;flex-direction:column;gap:10px}
+.tg-head{display:flex;align-items:center;gap:9px;border-bottom:1px solid var(--border);
+         padding-bottom:9px;margin-bottom:2px}
+.tg-head h3{margin:0;font-size:14px;font-weight:600;letter-spacing:.02em;flex:1}
+.tg-dot{width:8px;height:8px;border-radius:50%;background:var(--dim);flex:none}
+.tg-dot.on{background:#3fd07a;box-shadow:0 0 7px #3fd07a99}
+.tg-dot.off{background:#e0703f}
+.tg-state{font-size:10.5px;color:var(--dim);text-transform:uppercase;letter-spacing:.07em}
+
+.tg-switch{display:flex;align-items:center;gap:10px;cursor:pointer;user-select:none}
+.tg-switch input{position:absolute;opacity:0;width:0;height:0}
+.tg-track{width:42px;height:23px;border-radius:12px;background:#1b2733;
+          border:1px solid var(--border);position:relative;transition:background .18s;flex:none}
+.tg-knob{position:absolute;top:2px;left:2px;width:17px;height:17px;border-radius:50%;
+         background:var(--dim);transition:transform .18s,background .18s}
+.tg-switch input:checked + .tg-track{background:#12405c;border-color:var(--acc)}
+.tg-switch input:checked + .tg-track .tg-knob{transform:translateX(19px);background:var(--acc2)}
+.tg-switch input:focus-visible + .tg-track{outline:2px solid var(--acc);outline-offset:2px}
+.tg-switch-label{font-size:12.5px}
+
+.tg-note{font-size:10.5px;color:var(--dim);margin:0;line-height:1.5}
+.tg-bar{height:5px;background:#111a22;border-radius:3px;overflow:hidden}
+.tg-bar-fill{height:100%;width:0;background:linear-gradient(90deg,var(--acc),var(--acc2));
+             transition:width .4s}
+.tg-stats{display:grid;grid-template-columns:repeat(4,1fr);gap:1px;margin:0;
+          background:var(--border);border:1px solid var(--border);border-radius:5px;overflow:hidden}
+.tg-stats div{background:#0d141b;padding:7px 9px}
+.tg-stats dt{font-size:9.5px;color:var(--dim);text-transform:uppercase;letter-spacing:.06em;margin:0 0 2px}
+.tg-stats dd{margin:0;font-size:13px;font-weight:600;font-variant-numeric:tabular-nums}
+.tg-last{font-size:11px;color:var(--dim);margin:0;word-break:break-word}
+.tg-err{font-size:11px;color:#e0703f;margin:0;word-break:break-word}
+
+.tg-field{display:flex;flex-direction:column;gap:4px}
+.tg-field label{font-size:9.5px;color:var(--dim);text-transform:uppercase;letter-spacing:.07em}
+.tg-field input{background:#0b1118;border:1px solid var(--border);color:var(--text);
+                border-radius:5px;padding:8px 10px;font:inherit;font-size:12.5px}
+.tg-field input:focus{outline:none;border-color:var(--acc)}
+.tg-opts{display:flex;flex-wrap:wrap;gap:8px 16px;align-items:center;font-size:11.5px;color:var(--dim)}
+.tg-opts label{display:flex;align-items:center;gap:5px;cursor:pointer}
+.tg-num{display:flex;align-items:center;gap:5px}
+.tg-num input{width:74px;background:#0b1118;border:1px solid var(--border);color:var(--text);
+              border-radius:4px;padding:4px 7px;font:inherit;font-size:11.5px}
+.tg-row{display:flex;flex-wrap:wrap;gap:7px}
+.btn-xs.accent{background:#12405c;color:var(--acc2);border-color:var(--acc)}
+
+.tg-log{background:#070c11;border:1px solid var(--border);border-radius:5px;
+        padding:10px 11px;margin:0;font-size:11px;line-height:1.55;color:var(--dim);
+        max-height:190px;overflow:auto;white-space:pre;
+        font-family:ui-monospace,"Cascadia Mono","Consolas",monospace}
+/* tg-scraper prints aligned columns; wrapping them destroys the alignment, so
+   the box scrolls sideways instead. */
+.tg-log.tall{max-height:340px;min-height:170px}
+.tg-log:empty{display:none}
+.tg-paths{font-size:10px;color:var(--dim);margin:12px 2px 0;word-break:break-all}
 </style>
 </head>
 <body>
@@ -1551,6 +1670,7 @@ textarea.sql-input:focus{outline:none;border-color:var(--acc)}
     <button class="tab-btn" onclick="switchTab('session')" title="Browse the current import batch before committing it">Session</button>
     <button class="tab-btn" onclick="switchTab('library')" title="Search and browse the full permanent library">Library</button>
     <button class="tab-btn" onclick="switchTab('tools')" title="Database maintenance, audits, and ad-hoc SQL">Tools</button>
+    <button class="tab-btn" onclick="switchTab('telegram')" title="Control the Telegram scraper and the channel uploader">Telegram</button>
     <button class="tab-btn" onclick="switchTab('fakeflac')" title="Scan for lossy-transcoded-into-FLAC files and inspect spectrograms">Fake-FLAC</button>
   </nav>
   <span id="hdr-status">idle</span>
@@ -1834,6 +1954,78 @@ textarea.sql-input:focus{outline:none;border-color:var(--acc)}
 </div><!-- /tools -->
 
 <!-- ═══════════════ FAKE-FLAC TAB ═══════════════ -->
+<div id="tab-telegram" class="tab-content">
+
+  <div class="tg-grid">
+
+    <!-- ── OUTBOUND ───────────────────────────────────────────────── -->
+    <section class="tg-card">
+      <div class="tg-head">
+        <h3>Channel uploader</h3>
+        <span class="tg-dot" id="tg-up-dot"></span>
+        <span class="tg-state" id="tg-up-state">checking…</span>
+      </div>
+
+      <label class="tg-switch" title="Off writes the STOP latch; the run finishes its current release, then exits">
+        <input type="checkbox" id="tg-up-toggle" onchange="tgUploader(this.checked?'on':'off')">
+        <span class="tg-track"><span class="tg-knob"></span></span>
+        <span class="tg-switch-label">Posting to the channel</span>
+      </label>
+      <p class="tg-note" id="tg-up-note">Turning this off never kills a release mid-flight — state is only saved once every file lands.</p>
+
+      <div class="tg-bar"><div class="tg-bar-fill" id="tg-up-bar"></div></div>
+      <dl class="tg-stats">
+        <div><dt>Posted</dt><dd id="tg-up-posted">–</dd></div>
+        <div><dt>Files</dt><dd id="tg-up-files">–</dd></div>
+        <div><dt>Failed</dt><dd id="tg-up-failed">–</dd></div>
+        <div><dt>Drip task</dt><dd id="tg-up-task">–</dd></div>
+      </dl>
+      <p class="tg-last" id="tg-up-last"></p>
+      <p class="tg-err" id="tg-up-err" hidden></p>
+      <div class="tg-row">
+        <button class="btn-xs" onclick="tgUploader('retry')" title="Clear the failed list so the next run retries those releases">Retry failed</button>
+        <button class="btn-xs ghost" onclick="tgOpenUploadDir()">↗ Open folder</button>
+      </div>
+      <pre class="tg-log" id="tg-up-log"></pre>
+    </section>
+
+    <!-- ── INBOUND ────────────────────────────────────────────────── -->
+    <section class="tg-card">
+      <div class="tg-head">
+        <h3>Channel scraper</h3>
+        <span class="tg-dot" id="tg-job-dot"></span>
+        <span class="tg-state" id="tg-job-state">idle</span>
+      </div>
+
+      <div class="tg-field">
+        <label for="tg-channel">Channel</label>
+        <input id="tg-channel" type="text" placeholder="id, @username, or part of the name" spellcheck="false">
+      </div>
+      <p class="tg-note">Ambiguous names print the candidates instead of guessing — mining the wrong chat costs an evening.</p>
+
+      <div class="tg-opts">
+        <label title="List exactly what would be fetched, take nothing"><input type="checkbox" id="tg-dry" checked> Dry run</label>
+        <label title="Oldest messages first (default is newest first)"><input type="checkbox" id="tg-oldest"> Oldest first</label>
+        <label title="Also fetch archives whose NAME says lossless"><input type="checkbox" id="tg-arch"> Archives</label>
+      </div>
+      <div class="tg-opts">
+        <span class="tg-num"><label for="tg-limit">Limit</label><input id="tg-limit" type="number" min="1" placeholder="files"></span>
+        <span class="tg-num"><label for="tg-maxgb">Max GB</label><input id="tg-maxgb" type="number" min="0" step="0.5" placeholder="GB"></span>
+      </div>
+
+      <div class="tg-row">
+        <button class="btn-xs" onclick="tgRun('list')">List channels</button>
+        <button class="btn-xs" onclick="tgRun('scan')">Scan</button>
+        <button class="btn-xs accent" onclick="tgRun('download')">Download</button>
+        <button class="btn-xs ghost" id="tg-stop" onclick="tgStopJob()" disabled>Stop</button>
+      </div>
+      <pre class="tg-log tall" id="tg-job-log">Pick a channel and scan it.</pre>
+    </section>
+  </div>
+
+  <p class="tg-paths" id="tg-paths"></p>
+</div>
+
 <div id="tab-fakeflac" class="tab-content">
 <div class="page-panel">
   <div class="path-row" style="padding:10px 14px 0">
@@ -1934,6 +2126,127 @@ let libPage_=0, libStatus_='', libQ_='', libDebounce=null;
 let toolLogES=null;
 
 // ── tab switching ─────────────────────────────────────────────────────────────
+
+// ── telegram control panel ───────────────────────────────────────────────────
+let tgSeq_=0, tgTimer_=null, tgBusy_=false;
+
+function tgOpts(){
+  const n=id=>{const v=document.getElementById(id).value.trim();return v?Number(v):0;};
+  return {dry_run:document.getElementById('tg-dry').checked,
+          oldest:document.getElementById('tg-oldest').checked,
+          archives:document.getElementById('tg-arch').checked,
+          limit:n('tg-limit'), max_gb:n('tg-maxgb')};
+}
+
+async function tgRun(mode){
+  const ch=document.getElementById('tg-channel').value.trim();
+  const body={mode:mode, channel:ch, opts:tgOpts()};
+  const log=document.getElementById('tg-job-log');
+  log.textContent='starting…';
+  try{
+    const r=await fetch('/api/tg/scraper',{method:'POST',headers:{'Content-Type':'application/json'},
+                                          body:JSON.stringify(body)});
+    const d=await r.json();
+    if(!d.ok){ log.textContent=d.reason||'could not start'; return; }
+    tgSeq_=0; tgPoll(true);
+  }catch(e){ log.textContent='request failed: '+e; }
+}
+
+async function tgStopJob(){
+  await fetch('/api/tg/scraper/stop',{method:'POST'});
+  tgPoll(true);
+}
+
+async function tgUploader(action){
+  const note=document.getElementById('tg-up-note');
+  try{
+    const r=await fetch('/api/tg/uploader',{method:'POST',headers:{'Content-Type':'application/json'},
+                                            body:JSON.stringify({action})});
+    const d=await r.json();
+    note.textContent=d.reason||'';
+    if(!d.ok) note.style.color='#e0703f'; else note.style.color='';
+  }catch(e){ note.textContent='request failed: '+e; }
+  tgPoll(true);
+}
+
+function tgOpenUploadDir(){
+  const p=(window.__tgUploadDir||'');
+  if(!p){ alert('The uploader folder is not configured on this machine.'); return; }
+  fetch('/api/open-folder?path='+encodeURIComponent(p))
+    .then(r=>r.json()).then(d=>{ if(!d.ok) alert('Cannot open: '+(d.reason||'failed')); });
+}
+
+function tgPaint(d){
+  // ---- uploader ----
+  const u=d.uploader||{}, dot=document.getElementById('tg-up-dot'),
+        st=document.getElementById('tg-up-state'), tog=document.getElementById('tg-up-toggle');
+  window.__tgUploadDir=u.dir||'';
+  dot.className='tg-dot '+(u.running?'on':(u.configured?'off':''));
+  if(!u.configured){ st.textContent='not on this machine'; tog.disabled=true; }
+  else{ st.textContent=u.running?'posting':(u.stopped_by_latch?'stopped':'idle'); tog.disabled=false; }
+  // reflect reality, but never fight the user mid-click
+  if(!tgBusy_) tog.checked = u.configured && !u.stopped_by_latch;
+
+  document.getElementById('tg-up-posted').textContent=(u.posted||0).toLocaleString();
+  document.getElementById('tg-up-files').textContent=(u.files||0).toLocaleString();
+  document.getElementById('tg-up-failed').textContent=(u.failed||0).toLocaleString();
+  document.getElementById('tg-up-task').textContent=u.task||'–';
+  const pct=(u.total&&u.posted)?Math.min(100,u.posted/(u.posted+u.total)*100):0;
+  document.getElementById('tg-up-bar').style.width=pct.toFixed(1)+'%';
+  document.getElementById('tg-up-last').textContent=u.last?('last: '+u.last):'';
+  const err=document.getElementById('tg-up-err');
+  err.hidden=!u.last_error; err.textContent=u.last_error||'';
+  const ul=document.getElementById('tg-up-log');
+  ul.textContent=(u.log_tail&&u.log_tail.length)?u.log_tail.join('\n'):'';
+
+  // ---- scraper job ----
+  const j=d.job||{};
+  document.getElementById('tg-job-dot').className='tg-dot '+(j.running?'on':'');
+  document.getElementById('tg-job-state').textContent=
+      j.running?(j.label||'running')+' · '+j.elapsed+'s'
+               :(j.rc===null||j.rc===undefined?'idle':'exit '+j.rc);
+  document.getElementById('tg-stop').disabled=!j.running;
+  if(j.lines&&j.lines.length){
+    const box=document.getElementById('tg-job-log');
+    const stick=box.scrollTop+box.clientHeight>=box.scrollHeight-24;
+    if(tgSeq_===0) box.textContent='';
+    box.textContent+=(box.textContent?'\n':'')+j.lines.join('\n');
+    if(stick) box.scrollTop=box.scrollHeight;
+  }
+  if(typeof j.seq==='number') tgSeq_=j.seq;
+
+  const pa=d.paths||{};
+  document.getElementById('tg-paths').textContent=
+    'scraper: '+(pa.scraper||'—')+(pa.scraper_ok?'':'  (NOT FOUND)')+
+    '   ·   uploader: '+(pa.upload_dir||'—')+
+    '   ·   host: '+(d.platform||'?');
+}
+
+async function tgPoll(force){
+  if(document.getElementById('tab-telegram')===null) return;
+  const visible=document.getElementById('tab-telegram').classList.contains('active');
+  if(!visible&&!force) return;
+  try{
+    const r=await fetch('/api/tg/status?since='+tgSeq_);
+    const d=await r.json();
+    if(d.ok===false){ document.getElementById('tg-paths').textContent=d.reason||''; return; }
+    tgPaint(d);
+  }catch(e){ /* transient; next tick retries */ }
+}
+
+function tgStartPolling(){
+  if(tgTimer_) return;
+  tgTimer_=setInterval(tgPoll,2000);
+  tgPoll(true);
+}
+document.addEventListener('DOMContentLoaded',tgStartPolling);
+// don't let the toggle flicker back while a click is in flight
+document.addEventListener('DOMContentLoaded',()=>{
+  const t=document.getElementById('tg-up-toggle');
+  if(t){ t.addEventListener('mousedown',()=>{tgBusy_=true;
+         setTimeout(()=>{tgBusy_=false;},1500);}); }
+});
+
 function switchTab(name){
   document.querySelectorAll('.tab-content').forEach(el=>el.classList.remove('active'));
   document.querySelectorAll('.tab-btn').forEach(el=>el.classList.remove('active'));
