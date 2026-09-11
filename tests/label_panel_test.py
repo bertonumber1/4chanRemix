@@ -574,6 +574,72 @@ def main():
         res_cl2 = P.cross_label_check("owned")
         eq(res_cl2["rows"], [],
            "checking a role with no matching roots returns nothing, not an error")
+
+        print("\n[fix_tags]")
+        import numpy as np
+        import soundfile as sf
+        from mutagen.flac import FLAC
+
+        def flac_track(path, title, artist=None, tracknumber=None):
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            sf.write(path, np.zeros(4410, dtype="float32"), 44100, format="FLAC")
+            f = FLAC(path)
+            f["title"] = title
+            if artist is not None:
+                f["artist"] = artist
+            if tracknumber is not None:
+                f["tracknumber"] = tracknumber
+            f.save()
+
+        ft_root = os.path.join(tmp, "fix-tags-incoming")
+        ft_release = os.path.join(ft_root, "(FT-001) Fix Tags Release (2001)")
+        # Track 1: no artist, no tracknumber — both should get filled in.
+        flac_track(os.path.join(ft_release, "01 - Alpha.flac"), "Alpha")
+        # Track 2: already tagged correctly — only_missing must leave it alone.
+        flac_track(os.path.join(ft_release, "02 - Beta.flac"), "Beta",
+                   artist="Right Artist", tracknumber="2")
+        P.add_root(ft_root, "owned")
+
+        ft_catno = "FT-001"
+        ft_key = sorted(P.L.catno_keys(ft_catno))[0]
+        P.L.LabelCache(P.CACHE_DIR, P.load_state()["label_id"]).save_tracklists(
+            {ft_key: {"tracks": ["Alpha", "Beta"]}})
+        P._write_scan({"label_id": P.load_state()["label_id"], "rows": [
+            {"folder": ft_release, "artist": "Right Artist", "catno": ft_catno,
+             "title": "Fix Tags Release"},
+        ]})
+
+        r_dry = P.fix_tags([ft_release], dry_run=True)
+        eq(r_dry["results"][0]["fixed_files"], 1,
+           "dry run reports exactly the one file that needs fixing")
+        eq(FLAC(os.path.join(ft_release, "01 - Alpha.flac")).get("artist"), None,
+           "dry run writes nothing to disk")
+
+        r_fix = P.fix_tags([ft_release])
+        check(r_fix["ok"], "fix_tags reports ok", str(r_fix))
+        eq(r_fix["results"][0]["fixed_files"], 1, "exactly one file actually needed a write")
+
+        tags1 = FLAC(os.path.join(ft_release, "01 - Alpha.flac"))
+        eq(tags1.get("artist"), ["Right Artist"],
+           "the missing artist was filled in from the catalogue")
+        eq(tags1.get("tracknumber"), ["1"],
+           "the missing track number was filled in from tracklist position")
+
+        tags2 = FLAC(os.path.join(ft_release, "02 - Beta.flac"))
+        eq(tags2.get("artist"), ["Right Artist"],
+           "track 2's already-correct artist tag is unchanged")
+        eq(tags2.get("tracknumber"), ["2"],
+           "track 2's already-correct track number is unchanged")
+
+        r_again = P.fix_tags([ft_release])
+        eq(r_again["results"][0]["fixed_files"], 0,
+           "run again: nothing left to fix, reported as such — not re-written")
+
+        outside_ft = os.path.join(tmp, "somewhere-else-ft")
+        os.makedirs(outside_ft, exist_ok=True)
+        r_outside = P.fix_tags([outside_ft])
+        check("outside every configured folder" in r_outside["results"][0]["reason"],
+              "a folder outside every root is refused, same as move_folders")
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 

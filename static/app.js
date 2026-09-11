@@ -1665,6 +1665,11 @@ function lbRowClick(ev){
         t.contradicts_artist.map(x=>esc(x.track)+' ('+esc(x.tag)+' vs '+esc(x.catalogue)+')').join(', ')+'</div>');
       if(t.contradicts_catno.length) lines.push('<div><b>Catalogue-number tag disagrees</b> on: '+
         t.contradicts_catno.map(x=>esc(x.track)+' ('+esc(x.tag)+' vs '+esc(x.catalogue)+')').join(', ')+'</div>');
+      if((t.missing_artist.length||t.missing_tracknumber.length) && r.folder)
+        lines.push('<div><button class="btn-xs" data-fix-tags="'+esc(r.folder)+'" '+
+          'title="Fill in ONLY the missing artist/track-number tags shown above, from this '+
+          'catalogue entry. Never touches a tag that already has a value, right or wrong.">'+
+          'Fix tags</button></div>');
     }
     if(cc.artwork){
       lines.push('<div><b>Artwork</b> — '+
@@ -1682,6 +1687,8 @@ function lbRowClick(ev){
   }
   const op=ev.target.closest('[data-open]');
   if(op){ fetch('/api/open-folder?path='+encodeURIComponent(op.dataset.open)); return; }
+  const ft=ev.target.closest('[data-fix-tags]');
+  if(ft){ lbFixTags(ft.dataset.fixTags); return; }
   const un=ev.target.closest('[data-undo]');
   if(un){ lbUndo(un.dataset.undo); return; }
   const cb=ev.target.closest('input[data-pick]');
@@ -1855,5 +1862,17 @@ async function lbUndo(dest){
   const r=await (await fetch('/api/label/undo',{method:'POST',
     headers:{'Content-Type':'application/json'},body:JSON.stringify({dest})})).json();
   lbLog(r.ok?'info':'broken', r.reason||'');
+  lbLoad();
+}
+
+// Opt-in, one folder at a time — same as every other write this tab does.
+// No dry-run prompt here: write_tags_to_file's only_missing=True already
+// makes this a strictly additive fill-in-the-gaps action, never an overwrite.
+async function lbFixTags(folder){
+  const r=await (await fetch('/api/label/fix-tags',{method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({paths:[folder]})})).json();
+  const row=(r.results||[])[0];
+  lbLog(row && row.ok ? 'info' : 'broken', (row && row.reason) || r.reason || '');
   lbLoad();
 }

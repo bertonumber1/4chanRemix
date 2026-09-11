@@ -434,7 +434,8 @@ def folder_tracks(path: str) -> dict:
     both are cached automatically inside FolderCache's per-folder `info` dict.
     """
     files = audio_files(path)
-    ids, tags_list, lossless, lossy, convert, bytes_ = [], [], 0, 0, 0, 0
+    ids, tags_list, lossless_paths, lossless, lossy, convert, bytes_ = \
+        [], [], [], 0, 0, 0, 0
     has_artwork = False
     for full in files:
         f = os.path.basename(full)
@@ -457,6 +458,7 @@ def folder_tracks(path: str) -> dict:
         if file_tags.get("has_picture"):
             has_artwork = True
         tags_list.append(file_tags)
+        lossless_paths.append(full)
         title = file_tags.get("title", "")
         # filename minus a leading "NN -", "NN." or vinyl position "A1."/"B2."
         fn = re.sub(r"^\s*[A-Da-d]?\d+\s*[-.]?\s*", "", os.path.splitext(f)[0])
@@ -474,7 +476,7 @@ def folder_tracks(path: str) -> dict:
             pass
     return {"ids": ids, "lossless": lossless, "lossy": lossy,
             "needs_convert": convert, "bytes": bytes_, "files": len(files),
-            "tags": tags_list, "has_artwork": has_artwork}
+            "tags": tags_list, "paths": lossless_paths, "has_artwork": has_artwork}
 
 
 # CD1 / Disc 2 / Disco 3 — a disc is PART of a release, never a release.

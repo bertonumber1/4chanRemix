@@ -1657,6 +1657,16 @@ async def label_move(req: Request):
     return JSONResponse(res)
 
 
+@app.post("/api/label/fix-tags")
+async def label_fix_tags(req: Request):
+    g = _lbl_guard()
+    if g:
+        return g
+    body = await req.json()
+    res = lbl.fix_tags(body.get("paths") or [], bool(body.get("dry_run")))
+    return JSONResponse(res)
+
+
 @app.get("/api/label/moves")
 def label_moves(limit: int = 200):
     g = _lbl_guard()

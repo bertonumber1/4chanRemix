@@ -398,6 +398,92 @@ def cross_check_release(row: dict, folder_info: dict | None, tls: dict) -> dict:
     return result
 
 
+def fix_tags(paths: list, dry_run: bool = False) -> dict:
+    """Fill in missing artist / track-number tags, per row, from the label's
+    own cached scan and Discogs tracklist.
+
+    Deliberately narrow: writes ONLY the two fields tag_check() already flags
+    as missing (never a contradiction — picking a side between a file's own
+    tag and the catalogue is a human call, not this button's), and reuses
+    write_tags_to_file's only_missing=True so an existing tag, right or
+    wrong, is never touched. Same "outside the configured roots" refusal as
+    move_folders — this writes to files, so it gets the same guard.
+
+    Reads the folder FRESH rather than through FolderCache: this runs on one
+    or two folders at a time, opt-in, so the per-file read cost that the
+    cache exists to avoid on a full scan is not a concern here — and a cache
+    entry from before this folder's tags were fixed (or from before the
+    'paths' field below existed) must never be trusted for a write.
+    """
+    from tag_writer import write_tags_to_file
+
+    st = load_state()
+    roots = [r["path"] for r in st.get("roots") or []]
+    scan_ = last_scan()
+    if not scan_:
+        return {"ok": False, "results": [],
+                "reason": "no scan yet — run Scan folders first"}
+    by_folder = {row["folder"]: row for row in scan_["rows"] if row.get("folder")}
+    tls = cache(st).tracklists()
+
+    results = []
+    for src in paths:
+        src = os.path.abspath(src)
+        name = os.path.basename(src.rstrip(os.sep))
+        out = {"path": src, "name": name, "fixed_files": 0, "ok": False, "reason": ""}
+
+        if not any(_under(src, r) for r in roots):
+            out["reason"] = "outside every configured folder — refusing to touch it"
+            results.append(out)
+            continue
+        row = by_folder.get(src)
+        if row is None:
+            out["reason"] = "not in the last scan — rescan first"
+            results.append(out)
+            continue
+
+        expected = L.tracklist_for(row, tls)
+        info = L.folder_tracks(src)
+        matched = L.match_tracks(expected, info.get("ids") or []) if expected else {}
+        file_paths = info.get("paths") or []
+        file_tags = info.get("tags") or []
+        row_artist = (row.get("artist") or "").strip()
+        various = row_artist.lower() in ("", "various", "various artists", "va", "v/a")
+
+        fixed = errors = 0
+        for ti in range(len(expected)):
+            fi = matched.get(ti)
+            if fi is None or fi < 0 or fi >= len(file_paths):
+                continue
+            tags_on_file = file_tags[fi] if fi < len(file_tags) else {}
+            new_tags = {}
+            if not various and not (tags_on_file.get("artist") or "").strip():
+                new_tags["artist"] = row_artist
+            if not (tags_on_file.get("tracknumber") or "").strip():
+                new_tags["track_number"] = str(ti + 1)
+            if not new_tags:
+                continue
+            res = write_tags_to_file(file_paths[fi], new_tags,
+                                     only_missing=True, dry_run=dry_run)
+            if res.error:
+                errors += 1
+            elif res.written_fields:
+                fixed += 1
+        out["fixed_files"] = fixed
+        out["ok"] = errors == 0
+        if dry_run:
+            out["reason"] = "would fix %d file(s)" % fixed
+        elif errors:
+            out["reason"] = "%d error(s) writing tags" % errors
+        elif fixed:
+            out["reason"] = "fixed %d file(s)" % fixed
+        else:
+            out["reason"] = "nothing to fix"
+        results.append(out)
+    return {"ok": bool(results) and all(r["ok"] for r in results),
+            "results": results, "dry_run": dry_run}
+
+
 def scan(cfg: dict, log=print, should_stop=None) -> dict:
     st = load_state()
     c = cache(st)
