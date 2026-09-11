@@ -141,6 +141,14 @@ FILE_COLUMNS: list[tuple[str, str]] = [
     ("transcode_cutoff_hz",   "REAL"),          # detected cutoff frequency
     ("transcode_confidence",  "REAL"),          # 0.0 - 1.0
     ("transcode_notes",       "TEXT"),          # human-readable explanation
+    # From the spectral analyser (spectral.py): clean | suspect | lossy |
+    # padded | upsampled | lossy_format | unreadable. A verdict is only
+    # "lossy" when the cutoff, the wall AND the dead band above it all agree —
+    # a mastering engineer can produce any one of those, an encoder produces
+    # all three.
+    ("transcode_verdict",     "TEXT"),
+    ("transcode_wall_db",     "REAL"),          # dB drop across the cutoff
+    ("transcode_above_db",    "REAL"),          # energy above it, dB
     # --- musicbrainz / discogs IDs ---------------------------------------
     ("musicbrainz_trackid",       "TEXT"),
     ("musicbrainz_albumid",       "TEXT"),

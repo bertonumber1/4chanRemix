@@ -76,6 +76,10 @@ class TranscodeAnalysis:
     confidence: float
     notes: str
 
+    verdict: str = ""          # set by the spectral analyser, blank otherwise
+    wall_db: float = 0.0
+    above_db: float = 0.0
+
     def to_db_columns(self) -> dict[str, Any]:
         """Format as DB column updates."""
         return {
@@ -84,6 +88,9 @@ class TranscodeAnalysis:
             "transcode_cutoff_hz": float(self.cutoff_hz),
             "transcode_confidence": float(self.confidence),
             "transcode_notes": self.notes,
+            "transcode_verdict": self.verdict or "",
+            "transcode_wall_db": float(self.wall_db),
+            "transcode_above_db": float(self.above_db),
         }
 
 
@@ -249,7 +256,76 @@ def _classify(cutoff_hz: float, sample_rate: int, mean_db: float) -> tuple[bool,
         return False, 0.0, f"cutoff at {cutoff_hz:.0f} Hz (sample rate {sample_rate} Hz)"
 
 
+def _spectral_analyse(path):
+    """The better analyser, when it is available.
+
+    `spectral.py` (from bpdl-web, where this library's fake-lossless checking
+    has been done for months) decodes a long stretch rather than one window,
+    and asks THREE independent questions before it says lossy: is the cutoff
+    well below Nyquist, is there a brick wall at it, and is the band above it
+    dead. It also recognises two things this module cannot see at all — a file
+    padded from 16 to 24 bits, and one upsampled to a high sample rate.
+
+    Returns a TranscodeAnalysis so callers do not have to care which ran.
+    """
+    try:
+        import spectral
+    except Exception:
+        return None
+    if not spectral.ffmpeg_available():
+        return None
+    try:
+        r = spectral.analyse(str(path))
+    except Exception:
+        return None
+    if not getattr(r, "ok", False) or r.verdict == "unreadable":
+        return None
+    # The house rule: condemn lossy / padded / upsampled, never "suspect".
+    condemned = r.verdict in ("lossy", "padded", "upsampled", "lossy_format")
+    # `confidence` here has always meant "how sure are we this is LOSSY", so a
+    # clean verdict is 0 however sure the analyser is of it — otherwise a clean
+    # file reads as half-suspicious in the table.
+    if condemned:
+        conf = (r.confidence or 0) / 100.0
+    elif r.verdict == "suspect":
+        conf = min((r.confidence or 0) / 100.0, 0.5)
+    else:
+        conf = 0.0
+    note = "; ".join(r.reasons or []) or r.verdict
+    if r.estimated_source:
+        note += " — sounds like %s" % r.estimated_source
+    a = TranscodeAnalysis(suspected=bool(condemned or r.verdict == "suspect"),
+                          cutoff_hz=float(r.cutoff_hz or 0.0),
+                          confidence=float(conf),
+                          notes=note[:600])
+    a.verdict = r.verdict
+    a.wall_db = float(r.wall_db or 0.0)
+    a.above_db = float(r.above_db or 0.0)
+    return a
+
+
 def analyse(path: str | Path) -> TranscodeAnalysis | None:
+    """One analyser, one verdict.
+
+    `spectral.py` is THE detector — the same one bpdl-web uses, so the two
+    tools can never disagree about the same file. The old single-window check
+    below is a last resort for a machine without ffmpeg, and when it runs the
+    verdict is labelled `window-only` so a weaker answer is never mistaken for
+    the real one. (They did disagree: a file this module called 90% lossy at a
+    14.1 kHz cutoff is clean at 21.4 kHz once a proper stretch is decoded.)
+    """
+    best = _spectral_analyse(path)
+    if best is not None:
+        return best
+    weak = _analyse_window(path)
+    if weak is not None:
+        weak.verdict = "window-only"
+        weak.notes = ("[single-window check — ffmpeg not available, so this is "
+                      "the weaker analyser] " + (weak.notes or ""))[:600]
+    return weak
+
+
+def _analyse_window(path: str | Path) -> TranscodeAnalysis | None:
     """
     Run the fake-FLAC check on a single file.
 
