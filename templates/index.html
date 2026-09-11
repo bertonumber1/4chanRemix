@@ -1,0 +1,821 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>music-organiser</title>
+<link rel="icon" type="image/svg+xml" href="/static/favicon.svg?v=__ASSETV__">
+<link rel="stylesheet" href="/static/app.css?v=__ASSETV__">
+</head>
+<body>
+<header>
+  <!-- Wordmark: the app's own name, drawn as CSS + inline SVG. No logo image,
+       so there is no binary asset to keep in step with the theme. -->
+  <a class="brand" href="/" title="music-organiser — click to reload the page">
+    <svg class="brand-mark" viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+      <rect x="1"  y="9"  width="3" height="6"  rx="1.5"/>
+      <rect x="6"  y="5"  width="3" height="14" rx="1.5"/>
+      <rect x="11" y="2"  width="3" height="20" rx="1.5"/>
+      <rect x="16" y="6"  width="3" height="12" rx="1.5"/>
+      <rect x="21" y="10" width="2" height="4"  rx="1"/>
+    </svg>
+    <span class="brand-name">music<span class="brand-dash">-</span>organiser</span>
+  </a>
+  <nav class="tabs">
+    <button data-tab="pipeline" class="tab-btn active" onclick="switchTab('pipeline')" title="Full pipeline — import, fetch tags, and organise into the library">Pipeline</button>
+    <button data-tab="direct" class="tab-btn" onclick="switchTab('direct')" title="Organise straight through, no database">Direct</button>
+    <button data-tab="session" class="tab-btn" onclick="switchTab('session')" title="Browse the current import batch before committing it">Session</button>
+    <button data-tab="library" class="tab-btn" onclick="switchTab('library')" title="Search and browse the full permanent library">Library</button>
+    <button data-tab="tools" class="tab-btn" onclick="switchTab('tools')" title="Database maintenance, audits, and ad-hoc SQL">Tools</button>
+    <button data-tab="telegram" class="tab-btn" onclick="switchTab('telegram')" title="Control the Telegram scraper and the channel uploader">Telegram</button>
+    <button data-tab="labels" class="tab-btn" onclick="switchTab('labels')" title="Label sorter — compare a record label's Discogs catalogue against the folders you hold, and list what is still missing">Labels</button>
+    <button data-tab="fakeflac" class="tab-btn" onclick="switchTab('fakeflac')" title="SPEK-TRO — spectrogram analysis. Finds FLACs that were made from a lossy source (an MP3 re-wrapped as FLAC), and shows you the picture that proves it.">SPEK-TRO</button>
+  </nav>
+  <span id="hdr-status">idle</span>
+  <!-- Language. The page is written in English and a language is a dictionary
+       from those English strings, so an untranslated control reads English
+       rather than showing a key. -->
+  <select id="lang-sel" class="hdr-sel" title="Change the language of this page" data-i18n-skip>
+    <option value="en">English</option>
+    <option value="es">Español</option>
+  </select>
+  <button class="hdr-btn" id="save-btn" onclick="saveConfig()" title="Write Source/Output paths and API keys to config.toml">Save config</button>
+  <button class="hdr-btn" id="restart-btn" onclick="restartService()" title="Restart the web_ui.py process">Restart service</button>
+</header>
+
+<!-- Config problems that would otherwise fail in silence -->
+<div id="doctor-bar" hidden>
+  <span class="doc-ico">!</span>
+  <span id="doctor-text"></span>
+  <button class="doc-x" onclick="dismissDoctor()" title="Hide until the next reload">dismiss</button>
+</div>
+
+<!-- ═══════════════ PIPELINE TAB ═══════════════ -->
+<div id="tab-pipeline" class="tab-content active">
+<aside>
+  <div class="card">
+    <h3>Input / Output</h3>
+    <div class="path-row">
+      <span class="path-label src">Source</span>
+      <input class="path-input" id="src-in" readonly tabindex="-1" onfocus="setTimeout(()=>this.blur())" placeholder="not set" onclick="openBrowser('src')" title="Click to choose this folder">
+      <button class="btn-xs" onclick="nativePick('src',this)" title="Pick the folder to read from. There is deliberately no default — a path left over from another machine scans nothing and reports success.">📁 Browse</button>
+      <button class="btn-xs ghost" onclick="openInFileManager('src-in',this)" title="Opens this folder in the file manager so you can look at the files. Browse PICKS the folder; Open SHOWS you what is in the one already picked.">↗ Open</button>
+    </div>
+    <div class="path-row">
+      <span class="path-label out">Output</span>
+      <input class="path-input" id="dest-in" readonly tabindex="-1" onfocus="setTimeout(()=>this.blur())" placeholder="not set" onclick="openBrowser('dest')" title="Click to choose this folder">
+      <button class="btn-xs" onclick="nativePick('dest',this)" title="Pick the folder to file into. There is deliberately no default.">📁 Browse</button>
+      <button class="btn-xs ghost" onclick="openInFileManager('dest-in',this)" title="Opens this folder in the file manager so you can look at the files. Browse PICKS the folder; Open SHOWS you what is in the one already picked.">↗ Open</button>
+    </div>
+    <div style="display:flex;gap:5px;margin-top:4px">
+      <button class="btn-xs" style="flex:1" onclick="scanSource()" title="Count audio files in the source folder without importing anything">Scan source</button>
+      <span id="scan-result" style="font-size:10px;color:var(--dim);line-height:22px"></span>
+    </div>
+  </div>
+  <div class="card">
+    <h3>Providers &amp; API keys</h3>
+    <div id="prov-list"></div>
+  </div>
+</aside>
+
+<div class="log-area">
+  <div class="pipeline">
+    <div class="phase" id="ph-import"><span class="dot"></span>Import</div>
+    <span class="phase-arrow">→</span>
+    <div class="phase" id="ph-fetch"><span class="dot"></span>Fetch Tags</div>
+    <span class="phase-arrow">→</span>
+    <div class="phase" id="ph-organise"><span class="dot"></span>Organise</div>
+  </div>
+  <div class="action-bar">
+    <button class="btn run-all" id="btn-all"      onclick="run('pipeline')" title="Import → Fetch Tags → Organise, one after another">▶ Run All</button>
+    <button class="btn ghost"   id="btn-import"   onclick="run('import')" title="Copy/move files from Source into the session database">Import</button>
+    <button class="btn ghost"   id="btn-fetch"    onclick="run('fetch')" title="Look up missing metadata from the enabled providers">Fetch Tags</button>
+    <button class="btn ghost"   id="btn-organise" onclick="run('organise')" title="Move session files into their final Output location">Organise</button>
+    <button class="btn ghost"   onclick="clearLog()" title="Clear the log panel below">Clear log</button>
+    <button class="btn danger"  id="btn-stop" onclick="stopJob(this)" disabled title="Stop the running job at the next file. Anything already written stays written.">■ Stop</button>
+    <label class="dry-label" title="Preview what would happen without writing or moving anything"><input type="checkbox" id="dry-run"> dry run</label>
+  </div>
+  <div class="progress-bar"><div class="progress-fill" id="prog" style="width:0%"></div></div>
+  <div class="log" id="log"></div>
+  <div class="stat-bar">
+    <span id="s-imp">imported: —</span>
+    <span id="s-dup">duplicate: —</span>
+    <span id="s-bad">broken: —</span>
+    <span id="s-prog">0 / 0</span>
+    <span id="s-el">elapsed: —</span>
+  </div>
+</div>
+</div><!-- /pipeline -->
+
+<!-- ═══════════════ DIRECT TAB ═══════════════ -->
+<div id="tab-direct" class="tab-content">
+<aside>
+  <div class="card">
+    <h3>Direct mode — input / output, no database</h3>
+    <div class="path-row">
+      <span class="path-label src">Source</span>
+      <input class="path-input" id="direct-src-in" readonly tabindex="-1" onfocus="setTimeout(()=>this.blur())" placeholder="not set" onclick="openBrowser('direct-src')" title="Click to choose this folder">
+      <button class="btn-xs" onclick="openBrowser('direct-src')" title="Pick the folder to read from. There is deliberately no default — a path left over from another machine scans nothing and reports success.">📁 Browse</button>
+      <button class="btn-xs ghost" onclick="openInFileManager('direct-src-in',this)" title="Opens this folder in the file manager so you can look at the files. Browse PICKS the folder; Open SHOWS you what is in the one already picked.">↗ Open</button>
+    </div>
+    <div class="path-row">
+      <span class="path-label out">Output</span>
+      <input class="path-input" id="direct-dest-in" readonly tabindex="-1" onfocus="setTimeout(()=>this.blur())" placeholder="not set" onclick="openBrowser('direct-dest')" title="Click to choose this folder">
+      <button class="btn-xs" onclick="openBrowser('direct-dest')" title="Pick the folder to file into. There is deliberately no default.">📁 Browse</button>
+      <button class="btn-xs ghost" onclick="openInFileManager('direct-dest-in',this)" title="Opens this folder in the file manager so you can look at the files. Browse PICKS the folder; Open SHOWS you what is in the one already picked.">↗ Open</button>
+    </div>
+    <div style="display:flex;gap:5px;margin-top:4px">
+      <button class="btn-xs" style="flex:1" onclick="scanSourceDirect()" title="Count audio files in the source folder without organising anything">Scan source</button>
+      <span id="direct-scan-result" style="font-size:10px;color:var(--dim);line-height:22px"></span>
+    </div>
+    <p style="font-size:10px;color:var(--dim);margin-top:8px;line-height:1.4">
+      Fix + organise straight to disk — no session/library DB involved.
+      One shot: reads tags, looks up Discogs/MusicBrainz/etc for whatever's
+      missing, writes tags back to the files, then moves everything into
+      <code>(catalog#) Artist - Album (Year)/NN - Title.ext</code>.
+    </p>
+  </div>
+  <div class="card">
+    <h3>Providers &amp; API keys</h3>
+    <div id="direct-prov-list"></div>
+  </div>
+</aside>
+
+<div class="log-area">
+  <div class="action-bar">
+    <button class="btn run-all" id="direct-btn-all" onclick="runDirect()" title="All three steps: read the folder, look up what is missing, then move the files into Output">▶ Run All</button>
+    <button class="btn ghost" id="direct-btn-scan" onclick="runDirectStep('direct_scan')" title="Read the source folder and report what is there. Writes nothing, moves nothing.">Scan only</button>
+    <button class="btn ghost" id="direct-btn-tags" onclick="runDirectStep('direct_tags')" title="Look up what is missing and write the tags into the files — but leave every file exactly where it is">Fetch tags only</button>
+    <button class="btn ghost" id="direct-btn-org" onclick="runDirectStep('direct_organise')" title="Move and rename into Output using the tags the files already have — no provider lookups, so no waiting on the internet">Organise only</button>
+    <button class="btn ghost"   onclick="clearLogDirect()" title="Clear the log panel below">Clear log</button>
+    <button class="btn danger"  id="direct-btn-stop" onclick="stopJob(this)" disabled title="Stop the running job at the next file. Anything already written stays written.">■ Stop</button>
+    <label class="dry-label" title="Preview what would happen without writing or moving anything"><input type="checkbox" id="direct-dry-run"> dry run</label>
+  </div>
+  <div class="progress-bar"><div class="progress-fill" id="direct-prog" style="width:0%"></div></div>
+  <div class="log" id="direct-log"></div>
+  <div class="stat-bar">
+    <span id="direct-s-imp">imported: —</span>
+    <span id="direct-s-dup">duplicate: —</span>
+    <span id="direct-s-bad">broken: —</span>
+    <span id="direct-s-prog">0 / 0</span>
+    <span id="direct-s-el">elapsed: —</span>
+  </div>
+</div>
+</div><!-- /direct -->
+
+<!-- ═══════════════ SESSION TAB ═══════════════ -->
+<div id="tab-session" class="tab-content">
+<div class="page-panel">
+  <p class="tab-blurb">
+    <b>Session</b> — the batch you are working on now, held in <code>web_session.db</code>.
+    Import fills it, you check it here, and <b>Tools → Commit session</b> merges it into the
+    permanent library. Nothing here is final: clearing a session throws away the record,
+    never the audio.
+  </p>
+  <div class="stats-ribbon" id="sess-ribbon">
+    <span class="stat-pill"><span class="val" id="ss-total">—</span><span class="lbl">total</span></span>
+    <span class="stat-pill imp"><span class="val" id="ss-imp">—</span><span class="lbl">imported</span></span>
+    <span class="stat-pill brk"><span class="val" id="ss-brk">—</span><span class="lbl">broken</span></span>
+    <span class="stat-pill dup"><span class="val" id="ss-dup">—</span><span class="lbl">duplicate</span></span>
+  </div>
+  <div class="toolbar">
+    <input class="search-input" id="sess-search" placeholder="filter artist / album / title…" oninput="filterSession()">
+    <div class="filter-chips">
+      <button class="chip active" onclick="setSessFilter('all',this)" title="Show every file in this session">All</button>
+      <button class="chip" onclick="setSessFilter('imported',this)" title="Show only successfully imported files">Imported</button>
+      <button class="chip" onclick="setSessFilter('broken',this)" title="Show files that failed to process">Broken</button>
+      <button class="chip" onclick="setSessFilter('duplicate',this)" title="Show files skipped as duplicates">Duplicate</button>
+    </div>
+    <button class="btn ghost" onclick="loadSession()" style="margin-left:auto" title="Reload from the session database">↺ Refresh</button>
+    <button class="btn warn"  id="btn-refetch" onclick="refetchBroken()" hidden title="Retry ALL tags for files that came back broken">↺ Re-fetch broken</button>
+    <button class="btn ok"    id="btn-commit"  onclick="commitSession()" title="Merge this session's files into the permanent library.db">↑ Commit to library</button>
+  </div>
+  <div class="toolbar sess-bulk">
+    <span id="sess-sel-count" class="ff-selinfo" title="How many rows are ticked">0 selected</span>
+    <button class="btn-xs sel-helper" onclick="sessSelectAll(true)" title="Tick every row currently shown by the filter">Select all shown</button>
+    <button class="btn-xs sel-helper" onclick="sessSelectAll(false)" title="Untick everything">Clear</button>
+    <span class="ff-sep"></span>
+    <button class="btn-xs act-file" onclick="sessAct('move')" title="Move the ticked files to a folder you choose. The session's paths follow them.">⇥ Move to…</button>
+    <button class="btn-xs act-file" onclick="sessAct('copy')" title="Copy the ticked files somewhere — export a selection without disturbing the originals">⧉ Export copy…</button>
+    <button class="btn-xs act-read" onclick="sessAct('retag')" title="Re-read the tags from the files on disk and update the session. Use after editing tags elsewhere.">↻ Update from files</button>
+    <button class="btn-xs act-read" onclick="sessExportCsv()" title="Save the ticked rows as a CSV you can open in a spreadsheet">⭳ Export list (CSV)</button>
+    <span class="ff-sep"></span>
+    <button class="btn-xs act-db" onclick="sessAct('forget')" title="Remove the ticked rows from the session only. The files themselves are not touched.">✕ Remove from session</button>
+    <button class="btn-xs danger" onclick="sessAct('delete')" title="Permanently delete the ticked FILES from disk — cannot be undone">✕ Delete files</button>
+  </div>
+  <div class="tbl-wrap">
+    <table id="sess-table">
+      <thead><tr>
+        <th class="ff-tick" title="Tick rows to act on several at once"><input type="checkbox" id="sess-all" onclick="sessSelectAll(this.checked)"></th>
+        <th onclick="sortSess('filename')">File</th>
+        <th onclick="sortSess('artist')">Artist</th>
+        <th onclick="sortSess('album')">Album</th>
+        <th onclick="sortSess('year')">Year</th>
+        <th onclick="sortSess('label')">Label</th>
+        <th onclick="sortSess('catalog_number')">Cat#</th>
+        <th onclick="sortSess('dur')">Dur</th>
+        <th onclick="sortSess('status')">Status</th>
+      </tr></thead>
+      <tbody id="sess-tbody"></tbody>
+    </table>
+  </div>
+</div>
+</div><!-- /session -->
+
+<!-- ═══════════════ LIBRARY TAB ═══════════════ -->
+<div id="tab-library" class="tab-content">
+<div class="page-panel">
+  <p class="tab-blurb">
+    <b>Library</b> — everything this app has ever filed, kept in <code>library.db</code>.
+    It is a <em>record of what is on disk</em>, not the disk itself: deleting a row here
+    changes nothing about your files. Rows arrive from <b>Import</b> (files moved into the
+    output folder) or from <b>Tools → Rebuild index</b> (a fresh walk of that folder).
+    The <b>Session</b> tab is the batch you are working on right now; this is the permanent
+    one it gets committed into.
+  </p>
+  <div class="stats-ribbon" id="lib-ribbon">
+    <span class="stat-pill" title="Rows in library.db — one per audio file"><span class="val" id="ls-total">—</span><span class="lbl">files</span></span>
+    <span class="stat-pill" title="Distinct artist tags across those files"><span class="val" id="ls-artists">—</span><span class="lbl">artists</span></span>
+    <span class="stat-pill" title="Distinct record labels — only as good as the tags"><span class="val" id="ls-labels">—</span><span class="lbl">labels</span></span>
+    <span class="stat-pill" title="Total size of the files these rows point at"><span class="val" id="ls-size">—</span><span class="lbl">GB</span></span>
+  </div>
+  <div class="toolbar">
+    <input class="search-input" id="lib-search" placeholder="search artist / album / title / label…"
+           oninput="debounceLibSearch()" style="width:300px"
+           title="Matches artist, album, title and label. Plain text, no wildcards needed — typing part of a word is enough.">
+    <div class="filter-chips">
+      <button class="chip active" onclick="setLibFilter('',this)" title="Every row, whatever its state">All</button>
+      <button class="chip" onclick="setLibFilter('imported',this)" title="Files this app moved into the output folder and tagged. The normal, finished state.">Imported</button>
+      <button class="chip" onclick="setLibFilter('indexed',this)" title="Files found by Rebuild index — they are on disk and catalogued, but never went through Import, so they were not renamed or re-tagged.">Indexed</button>
+      <button class="chip" onclick="setLibFilter('broken',this)" title="Missing artist, album or title. It means the TAGS are incomplete — it says nothing about the audio, which usually plays perfectly. Tools → Tags from filenames often fixes these.">Broken</button>
+    </div>
+    <button class="btn ghost" onclick="loadLibrary(0)" style="margin-left:auto" title="Re-read library.db. Use it after an import or a rebuild.">↺ Refresh</button>
+  </div>
+  <div class="tbl-wrap">
+    <table id="lib-table">
+      <thead><tr>
+        <th title="The artist tag on the file. Blank means the tag is missing, not that the artist is unknown.">Artist</th>
+        <th title="The album tag. A loose single legitimately has none.">Album</th>
+        <th title="The track title tag">Title</th>
+        <th title="Release year, from the date tag">Year</th>
+        <th title="Record label, from the label/publisher tag">Label</th>
+        <th title="Catalogue number — the label's own reference for the release. The most reliable thing to match a pressing on.">Cat#</th>
+        <th title="imported = filed by this app · indexed = found on disk, never imported · broken = a required tag is missing · duplicate = the same audio is already in the library">Status</th>
+      </tr></thead>
+      <tbody id="lib-tbody"></tbody>
+    </table>
+  </div>
+  <div class="pagination">
+    <button class="btn-xs ghost" onclick="libPage(-1)" title="Previous page">← Prev</button>
+    <span id="lib-page-info">page 1 of 1</span>
+    <button class="btn-xs ghost" onclick="libPage(1)" title="Next page">Next →</button>
+    <span id="lib-count" style="margin-left:auto;color:var(--dim)"></span>
+  </div>
+</div>
+</div><!-- /library -->
+
+<!-- ═══════════════ TOOLS TAB ═══════════════ -->
+<div id="tab-tools" class="tab-content">
+<div class="tools-left">
+
+  <div class="tool-card">
+    <h3>Database</h3>
+    <button class="tool-btn" onclick="runTool('rebuild')" title="Walk the Output folder and rebuild library.db from what's actually on disk">
+      <span class="tb-icon">⟳</span>
+      <span class="tb-text">Rebuild index<br><span class="tb-hint">re-scan output → library.db</span></span>
+    </button>
+    <button class="tool-btn" onclick="runTool('vacuum')" title="Reclaim disk space and rebuild query statistics on library.db">
+      <span class="tb-icon">◎</span>
+      <span class="tb-text">Compact DB<br><span class="tb-hint">VACUUM + ANALYZE library.db</span></span>
+    </button>
+    <button class="tool-btn commit-btn" onclick="commitSession()" title="Merge this session's files into the permanent library.db">
+      <span class="tb-icon">↑</span>
+      <span class="tb-text">Commit session → library<br><span class="tb-hint">merge session DB into library.db</span></span>
+    </button>
+  </div>
+
+  <div class="tool-card">
+    <h3>Fix &amp; Rescue</h3>
+    <button class="tool-btn" onclick="runTool('tags_from_names',{db:'session'})" title="&quot;Broken&quot; means missing artist/album/title tags — never damaged audio. This reads those names off the filename (01. Artist - Title) and writes them in.">
+      <span class="tb-icon">🏷</span>
+      <span class="tb-text">Tags from filenames<br><span class="tb-hint">fills artist/title where the name already says it</span></span>
+    </button>
+    <button class="tool-btn" onclick="runTool('tags_from_names',{db:'session',dry_run:true})" title="Show exactly what would be written, change nothing">
+      <span class="tb-icon">👁</span>
+      <span class="tb-text">Tags from filenames — preview<br><span class="tb-hint">dry run, writes nothing</span></span>
+    </button>
+    <button class="tool-btn" onclick="runTool('fetch_broken')" title="Retry metadata lookup for every file in the session, not just the broken ones">
+      <span class="tb-icon">↺</span>
+      <span class="tb-text">Re-fetch broken<br><span class="tb-hint">retry ALL tags for session files</span></span>
+    </button>
+    <button class="tool-btn" onclick="run('organise')" title="Re-run the Organise step so files land at their current (possibly updated) target paths">
+      <span class="tb-icon">⇄</span>
+      <span class="tb-text">Re-organise session<br><span class="tb-hint">move files to updated paths</span></span>
+    </button>
+  </div>
+
+  <div class="tool-card">
+    <h3>Audit library.db</h3>
+    <button class="tool-btn" onclick="runAudits()" title="Run all 13 data-quality checks against library.db">
+      <span class="tb-icon">✓</span>
+      <span class="tb-text">Run all checks<br><span class="tb-hint">13 quality checks on library.db</span></span>
+    </button>
+    <div id="audit-results" style="margin-top:4px"></div>
+  </div>
+
+</div><!-- /tools-left -->
+
+<div class="tools-right">
+  <div class="naming-area">
+    <div class="sql-header">
+      <h3>Naming &amp; filing</h3>
+      <span id="naming-msg" style="font-size:11px;color:var(--dim);margin-left:auto"></span>
+    </div>
+    <p class="naming-blurb">How Organise names the folders it moves your files into.
+      The examples are produced by the same code that does the moving, so what you
+      see here is what you get.</p>
+    <div id="naming-schemes"></div>
+    <div class="naming-switches">
+      <label title="COPY leaves the source untouched — safer, uses twice the space. MOVE takes the files out of the source folder. If the source is a torrent you are seeding, move will break the seed.">
+        <span>When importing</span>
+        <select id="set-import-mode" onchange="setSetting('import_mode',this.value)">
+          <option value="copy">copy (leave the originals)</option>
+          <option value="move">move (take the originals)</option>
+        </select>
+      </label>
+      <label title="Artwork, logs, cue sheets and nfos left behind once the audio has been filed. On = they are deleted; off = they are gathered into the orphan folder.">
+        <span>Delete leftover extras</span>
+        <input type="checkbox" id="set-del-orphans" onchange="setSetting('delete_orphaned_extras',this.checked)">
+      </label>
+    </div>
+  </div>
+  <div class="sql-area">
+    <div class="sql-header">
+      <h3>SQL Query</h3>
+      <select class="sql-db-sel" id="sql-db">
+        <option value="library">library.db</option>
+        <option value="session">session.db</option>
+      </select>
+      <button class="btn-xs" onclick="runSQL()" title="Run the SELECT/WITH query above against the chosen database">▶ Run</button>
+      <button class="btn-xs ghost" onclick="document.getElementById('sql-input').value='SELECT artist, album, year, label, status FROM files ORDER BY artist LIMIT 50'" title="Fill the box with a sample query">example</button>
+      <span id="sql-status" style="font-size:11px;color:var(--dim);margin-left:auto"></span>
+    </div>
+    <textarea class="sql-input" id="sql-input" rows="5"
+      placeholder="SELECT artist, album, year, label, status FROM files ORDER BY artist LIMIT 50"></textarea>
+    <div class="sql-results tbl-wrap" id="sql-results">
+      <div style="padding:20px;color:var(--dim);font-size:12px">Run a SELECT query above to see results here.</div>
+    </div>
+  </div>
+</div><!-- /tools-right -->
+
+</div><!-- /tools -->
+
+<!-- ═══════════════ SPEK-TRO TAB ═══════════════ -->
+<div id="tab-telegram" class="tab-content">
+
+  <div class="tg-grid">
+
+    <!-- ── OUTBOUND ───────────────────────────────────────────────── -->
+    <section class="tg-card">
+      <div class="tg-head">
+        <h3>Channel uploader</h3>
+        <span class="tg-dot" id="tg-up-dot"></span>
+        <span class="tg-state" id="tg-up-state">checking…</span>
+      </div>
+
+      <label class="tg-switch" title="Off writes the STOP latch; the run finishes its current release, then exits">
+        <input type="checkbox" id="tg-up-toggle" onchange="tgUploader(this.checked?'on':'off')">
+        <span class="tg-track"><span class="tg-knob"></span></span>
+        <span class="tg-switch-label">Posting to the channel</span>
+      </label>
+      <p class="tg-note" id="tg-up-note">Turning this off never kills a release mid-flight — state is only saved once every file lands.</p>
+
+      <div class="tg-bar"><div class="tg-bar-fill" id="tg-up-bar"></div></div>
+      <dl class="tg-stats">
+        <div><dt>Posted</dt><dd id="tg-up-posted">–</dd></div>
+        <div><dt>Files</dt><dd id="tg-up-files">–</dd></div>
+        <div><dt>Failed</dt><dd id="tg-up-failed">–</dd></div>
+        <div><dt>Held</dt><dd id="tg-up-held" title="Folders too big to be one release — a container or a whole series dumped flat. Not posted, not marked done.">–</dd></div>
+      </dl>
+      <details class="tg-held" id="tg-up-held-box" hidden>
+        <summary>Held back — needs a human <span id="tg-up-held-n"></span></summary>
+        <pre class="tg-log" id="tg-up-held-list"></pre>
+        <p class="tg-note">Each of these resolved to more tracks than one release can honestly hold. Split it into per-release folders (or per-CD ones) and it posts on the next pass — nothing here is lost, and nothing is marked done.</p>
+      </details>
+      <p class="tg-last" id="tg-up-last"></p>
+      <p class="tg-err" id="tg-up-err" hidden></p>
+      <div class="tg-row">
+        <button class="btn-xs" onclick="tgUploader('retry')" title="Clear the failed list so the next run retries those releases">Retry failed</button>
+        <button class="btn-xs ghost" onclick="tgOpenUploadDir()">↗ Open folder</button>
+      </div>
+      <pre class="tg-log" id="tg-up-log"></pre>
+    </section>
+
+    <!-- ── UPLOADER SETTINGS ──────────────────────────────────────── -->
+    <section class="tg-card">
+      <div class="tg-head"><h3>Uploader settings</h3>
+        <span class="tg-state" id="tg-set-msg"></span></div>
+      <p class="tg-note">Saved to <code>uploader_config.json</code>; the next
+        release picks them up. Nothing here interrupts a release in flight.</p>
+
+      <div class="tg-set-grid">
+        <label title="Parallel connections per file. Measured on this box with Premium: 1 conn 1.47 MB/s, 4 conns 4.35, 8 conns 4.80, 16 conns 4.87.">
+          <span>Upload connections</span>
+          <input type="number" id="set-conns" min="1" max="16" step="1" onchange="tgSet('conns',this.value)">
+        </label>
+        <label title="Send a FLAC instead of the WAV. Lossless, about a third smaller, ~1s of CPU. The library file is never touched.">
+          <span>Repack WAV → FLAC</span>
+          <input type="checkbox" id="set-repack" onchange="tgSet('repack_wav',this.checked)">
+        </label>
+        <label title="If the same audio was already sent, copy that message server-side instead of uploading the bytes again.">
+          <span>Reuse duplicate audio</span>
+          <input type="checkbox" id="set-reuse" onchange="tgSet('reuse_duplicates',this.checked)">
+        </label>
+        <label title="A folder resolving to more tracks than this is a container or a series dumped flat: held for review, never posted.">
+          <span>Max tracks per release</span>
+          <input type="number" id="set-max" min="5" max="300" step="1" onchange="tgSet('max_tracks',this.value)">
+        </label>
+        <label title="Share of a release's track titles that must carry a bases/vocal marker before it is filed under that tab.">
+          <span>Marker share</span>
+          <input type="number" id="set-mark" min="0" max="1" step="0.05" onchange="tgSet('mark_share',this.value)">
+        </label>
+        <label title="Releases from this year go to the NEW tab first, genre second. 0 turns it off.">
+          <span>NEW from year</span>
+          <input type="number" id="set-newyear" min="0" max="2100" step="1" onchange="tgSet('new_year',this.value)">
+        </label>
+        <label title="Messages per minute. ~20/min per group ran clean with zero flood waits.">
+          <span>Messages / minute</span>
+          <input type="number" id="set-mpm" min="1" max="30" step="1" onchange="tgSet('msg_per_min',this.value)">
+        </label>
+        <label title="Seconds between releases.">
+          <span>Pause between releases</span>
+          <input type="number" id="set-pause" min="0" max="120" step="1" onchange="tgSet('pause',this.value)">
+        </label>
+        <label title="Which library root to upload, by a substring of its folder name.">
+          <span>Root</span>
+          <input type="text" id="set-root" onchange="tgSet('root',this.value)">
+        </label>
+        <label title="Hours to stay off the line, as HH-HH (e.g. 09-17). Empty = upload any time.">
+          <span>Quiet hours</span>
+          <input type="text" id="set-quiet" placeholder="e.g. 09-17" onchange="tgSet('quiet_hours',this.value)">
+        </label>
+        <label title="Run the transcode detector before posting. A release whose audio is confidently an MP3 in a FLAC wrapper is held back and listed in lossy_review.txt. Nothing is moved or deleted.">
+          <span>Check authenticity</span>
+          <input type="checkbox" id="set-auth" onchange="tgSet('check_authenticity',this.checked)">
+        </label>
+        <label title="How sure the detector must be before a release is held. 0.90 = a hard cutoff below 16.5 kHz. Lower values also catch 160-256 kbps sources, at the cost of flagging vinyl rips and band-limited masters.">
+          <span>Lossy confidence</span>
+          <input type="number" id="set-lossy" min="0.3" max="1" step="0.05" onchange="tgSet('lossy_confidence',this.value)">
+        </label>
+      </div>
+    </section>
+
+    <!-- ── ACCOUNT, PERMISSIONS, ACTIONS ──────────────────────────── -->
+    <section class="tg-card">
+      <div class="tg-head"><h3>Telegram tools</h3>
+        <span class="tg-state" id="tg-tool-state"></span></div>
+
+      <p class="tg-note">Checks that otherwise only announce themselves by an
+        upload failing: am I still allowed to post, is the group still a forum,
+        does the topic exist, is the account flood-limited.</p>
+      <div class="tg-row">
+        <button class="btn-xs" onclick="tgTool('account')" title="Username, id, Premium, home DC and the per-file size limit">Account</button>
+        <button class="btn-xs" onclick="tgTool('permissions')" title="Admin rights, forum status, slow mode, content protection - and what would block an upload">Permissions</button>
+        <button class="btn-xs" onclick="tgTool('topics')" title="Every topic with its message count and last activity">Topics</button>
+        <button class="btn-xs" onclick="tgTool('spam')" title="Ask @SpamBot directly whether the account is limited">SpamBot</button>
+      </div>
+
+      <p class="tg-note" style="margin-top:10px">Jobs. The ones marked (stop
+        first) edit the state file or the session a running upload is holding.</p>
+      <div class="tg-row">
+        <button class="btn-xs" onclick="tgAct('report')" title="Count what would be posted per tab, post nothing">Report</button>
+        <button class="btn-xs" onclick="tgAct('decide_tabs')" title="Read every release's tags and settle its tab up front (about an hour)">Decide tabs</button>
+        <button class="btn-xs" onclick="tgAct('decide_posted')" title="(stop first) Decide tabs for the releases already posted - the short pass">Decide posted</button>
+      </div>
+      <div class="tg-row">
+        <button class="btn-xs" onclick="tgAct('rehome_dry')" title="(stop first) List already-posted releases sitting in the wrong tab. Changes nothing.">Re-home: check</button>
+        <button class="btn-xs danger" onclick="tgAct('rehome_apply',true)" title="(stop first) DELETE those posts and re-queue them for the right tab">Re-home: apply</button>
+        <button class="btn-xs" onclick="tgAct('seed_sent')" title="(stop first) Record what is already posted so a duplicate is copied, never re-uploaded">Seed dedupe map</button>
+        <button class="btn-xs" onclick="tgAct('verify')" title="(stop first) Reconcile the group against the state file: what is marked posted but is not there">Verify</button>
+      </div>
+      <pre class="tg-log" id="tg-tool-out"></pre>
+    </section>
+
+    <!-- ── INBOUND ────────────────────────────────────────────────── -->
+    <section class="tg-card">
+      <div class="tg-head">
+        <h3>Channel scraper</h3>
+        <span class="tg-dot" id="tg-job-dot"></span>
+        <span class="tg-state" id="tg-job-state">idle</span>
+      </div>
+
+      <div class="tg-field">
+        <label for="tg-channel">Channel</label>
+        <input id="tg-channel" type="text" placeholder="id, @username, or part of the name" spellcheck="false">
+      </div>
+      <p class="tg-note">Ambiguous names print the candidates instead of guessing — mining the wrong chat costs an evening.</p>
+
+      <div class="tg-opts">
+        <label title="List exactly what would be fetched, take nothing"><input type="checkbox" id="tg-dry" checked> Dry run</label>
+        <label title="Oldest messages first (default is newest first)"><input type="checkbox" id="tg-oldest"> Oldest first</label>
+        <label title="Also fetch archives whose NAME says lossless"><input type="checkbox" id="tg-arch"> Archives</label>
+      </div>
+      <div class="tg-opts">
+        <span class="tg-num"><label for="tg-limit">Limit</label><input id="tg-limit" type="number" min="1" placeholder="files"></span>
+        <span class="tg-num"><label for="tg-maxgb">Max GB</label><input id="tg-maxgb" type="number" min="0" step="0.5" placeholder="GB"></span>
+      </div>
+
+      <div class="tg-row">
+        <button class="btn-xs" onclick="tgRun('list')">List channels</button>
+        <button class="btn-xs" onclick="tgRun('scan')">Scan</button>
+        <button class="btn-xs accent" onclick="tgRun('download')">Download</button>
+        <button class="btn-xs ghost" id="tg-stop" onclick="tgStopJob()" disabled>Stop</button>
+      </div>
+      <pre class="tg-log tall" id="tg-job-log">Pick a channel and scan it.</pre>
+    </section>
+  </div>
+
+  <p class="tg-paths" id="tg-paths"></p>
+</div>
+
+<div id="tab-fakeflac" class="tab-content">
+<div class="page-panel">
+  <div class="path-row" style="padding:10px 14px 0">
+    <span class="path-label src">Folder</span>
+    <input class="path-input" id="ff-folder-in" readonly tabindex="-1" onfocus="setTimeout(()=>this.blur())" placeholder="not set — pick a folder to check it directly, no import needed" title="Click Browse, or pick from library.db/session.db below instead">
+    <button class="btn-xs" onclick="openBrowser('ff-folder')" title="Choose a folder to scan directly — bypasses the database entirely">📁 Browse</button>
+    <button class="btn-xs ghost" onclick="openInFileManager('ff-folder-in',this)" title="Opens this folder in the file manager so you can look at the files. Browse PICKS the folder; Open SHOWS you what is in the one already picked.">↗ Open</button>
+  </div>
+  <div class="toolbar">
+    <select class="sql-db-sel" id="ff-db" onchange="loadFakeflacSuspects(0)" title="Which set of files to scan/browse">
+      <option value="library">library.db</option>
+      <option value="session">session.db</option>
+      <option value="folder">picked folder</option>
+    </select>
+    <label style="font-size:11px;color:var(--dim);display:flex;align-items:center;gap:5px;margin-left:8px"
+           title="Re-check files that were already scanned, instead of skipping them">
+      <input type="checkbox" id="ff-force"> force re-check
+    </label>
+    <button class="btn" onclick="runFakeflacScan()" title="FFT spectral-cutoff scan — flags FLACs that look transcoded from a lossy source">▶ Scan for fake FLACs</button>
+    <button class="btn ghost" id="ff-vamp-btn" onclick="runFakeflacVamp()" disabled
+            title="checking availability…">⚛ Vamp-confirm suspects</button>
+    <button class="btn ghost" onclick="loadFakeflacSuspects(0)" style="margin-left:auto" title="Reload the suspects list">↺ Refresh</button>
+  </div>
+  <div class="toolbar ff-bulk">
+    <span id="ff-sel-count" class="ff-selinfo" title="How many rows are ticked">0 selected</span>
+    <button class="btn-xs sel-helper" onclick="ffSelectAll(true)" title="Tick every suspect on this page">Select all</button>
+    <button class="btn-xs sel-helper" onclick="ffSelectAll(false)" title="Untick everything">Clear</button>
+    <span class="ff-sep"></span>
+    <button class="btn-xs act-read" onclick="ffZipSelected()" title="Render the ticked files' spectrograms and download them as one .zip">⭳ Save spectrograms (.zip)</button>
+    <button class="btn-xs act-read" onclick="ffShareSelected()" title="Hand the spectrograms to another app — Signal, Telegram, mail. Falls back to a download where the browser has no share support.">↗ Share</button>
+    <span class="ff-sep"></span>
+    <button class="btn-xs act-db" onclick="ffBulk('dismiss')" title="False positives — clear the flag on the ticked files, leave them alone">✓ Dismiss</button>
+    <button class="btn-xs act-file" onclick="ffBulk('isolate')" title="Move the ticked files into the Suspected Transcodes folder">⇥ Isolate</button>
+    <button class="btn-xs danger" onclick="ffBulk('delete')" title="Permanently delete the ticked files — cannot be undone">✕ Delete</button>
+    <button class="btn-xs danger" onclick="ffDeleteAll()" title="Permanently delete EVERY suspect in this database, not just this page — cannot be undone">✕✕ Delete all suspects</button>
+  </div>
+  <div class="tbl-wrap">
+    <table id="ff-table">
+      <thead><tr>
+        <th class="ff-tick" title="Tick rows to act on several at once"><input type="checkbox" id="ff-all" onclick="ffSelectAll(this.checked)"></th>
+        <th title="The file on disk">File</th>
+        <th title="Tags read from the file">Artist / Album</th>
+        <th title="lossy = made from an MP3 · padded = 16-bit audio stored as 24-bit · upsampled = a low-rate master stretched to a high sample rate · suspect = one signal only, look at the picture · clean = nothing found">Verdict</th>
+        <th title="Where the sound stops. Real lossless runs close to Nyquist (about 22 kHz on a 44.1 kHz file); a wall well below that is an encoder's fingerprint.">Cutoff</th>
+        <th title="How sharply it stops — the dB drop across the cutoff. A mastering filter slopes; an encoder puts a brick wall there (20 dB or more).">Wall</th>
+        <th title="How much energy is left ABOVE the cutoff. Real 16-bit masters keep a dither floor up there; an encoder leaves it dead (-90 dB or lower).">Above</th>
+        <th title="How sure the detector is that this is LOSSY. 0% means it found nothing wrong.">Confidence</th>
+        <th title="Which numbers made the call">Why</th>
+      </tr></thead>
+      <tbody id="ff-tbody"></tbody>
+    </table>
+  </div>
+  <div class="pagination">
+    <button class="btn-xs ghost" onclick="ffPage(-1)" title="Previous page">← Prev</button>
+    <span id="ff-page-info">page 1 of 1</span>
+    <button class="btn-xs ghost" onclick="ffPage(1)" title="Next page">Next →</button>
+    <span id="ff-count" style="margin-left:auto;color:var(--dim)"></span>
+  </div>
+
+  <!-- The picture sits under the table, one click from every row: the numbers
+       are the argument, this is the thing you recognise at a glance. -->
+  <div id="ff-spec" class="ff-spec" hidden>
+    <div class="ff-spec-head">
+      <div class="ff-spec-id">
+        <b id="ff-spec-name"></b>
+        <p class="ff-spec-sub" id="ff-spec-sub"></p>
+        <p class="ff-spec-sub" id="ff-spec-nums"></p>
+      </div>
+      <div class="ff-spec-actions">
+        <a class="btn-xs" id="ff-spec-save" download title="Save this picture as a PNG">⭳ Save picture</a>
+        <button class="btn-xs ghost" onclick="ffShareOne()" title="Hand this picture to another app — Signal, Telegram, mail">↗ Share</button>
+        <button class="btn-xs ghost" onclick="openFakeflacFolder(this)" title="Opens the containing folder in the file manager, with this file in it.">↗ Open folder</button>
+        <button class="btn-xs ghost" onclick="ffAction('dismiss')" title="False positive — clear the flag, leave the file alone">✓ Dismiss</button>
+        <button class="btn-xs ghost" onclick="ffAction('isolate')" title="Move it into the Suspected Transcodes folder">⇥ Isolate</button>
+        <button class="btn-xs danger" onclick="ffAction('delete')" title="Permanently delete this file — cannot be undone">✕ Delete</button>
+        <button class="btn-xs ghost" onclick="ffSpecClose()" title="Close the picture">✕</button>
+      </div>
+    </div>
+    <p class="ff-spec-status" id="ff-spec-status">Rendering spectrogram…</p>
+    <img id="ff-spec-img" alt="" hidden>
+    <p class="ff-spec-hint">Time runs left to right, frequency bottom to top, brightness is energy.
+      <b>A lossy ancestor shows as a dead band with a razor-straight edge across the top.</b>
+      A genuine master fades out unevenly and keeps noise all the way to the top of the picture.
+      An old or deliberately dull master can look band-limited too — that is why a low confidence
+      is worth a look before you delete anything.</p>
+  </div>
+</div>
+</div><!-- /spektro -->
+
+<!-- ═══════════════ LABELS TAB ═══════════════ -->
+<!-- What we have of a record label, what we do not, and what is still missing
+     from the releases we only half-hold. The reference is the label's Discogs
+     catalogue; the evidence is the folders you add below. -->
+<div id="tab-labels" class="tab-content">
+<aside>
+  <div class="card">
+    <h3>Label</h3>
+    <div class="lb-label">
+      <span class="lb-name" id="lb-label-name" data-i18n-skip>—</span>
+      <span class="lb-id" id="lb-label-id" data-i18n-skip></span>
+    </div>
+    <div class="lb-cat" id="lb-cat-status" data-i18n-skip>no catalogue yet</div>
+    <div style="display:flex;gap:5px;margin-top:7px;flex-wrap:wrap">
+      <button class="btn-xs" onclick="lbChangeLabel()" title="Search Discogs for a different record label and make it the one this tab reports on">Change label…</button>
+      <button class="btn-xs" onclick="lbJob('label_catalogue')" title="Download this label's full release list from Discogs. Reuses the copy label2lossless already fetched when there is one, so it usually costs nothing.">Get catalogue</button>
+      <button class="btn-xs" onclick="lbJob('label_tracklists')" title="Fetch the track listings for releases that still lack one — that is what turns 'we have this' into 'we have 9 of its 12 tracks'. One Discogs call per release, so it runs in capped batches and can be run again.">Get tracklists</button>
+    </div>
+  </div>
+
+  <div class="card">
+    <h3>Folders to compare</h3>
+    <p class="lb-hint">Add the folders that hold this label. <b>Owned</b> is what you already have; <b>Incoming</b> is a share or download being judged against it.</p>
+    <div id="lb-roots" class="lb-roots" data-i18n-skip></div>
+    <div style="display:flex;gap:5px;margin-top:6px">
+      <button class="btn-xs" style="flex:1" onclick="lbAddRoot('owned')" title="Add a folder you already own. Nothing is written to it — it is read to work out what you hold.">+ Owned folder</button>
+      <button class="btn-xs" style="flex:1" onclick="lbAddRoot('incoming')" title="Add a folder you are judging: a shared folder, a download, a friend's drive. Each folder in it is reported as new, an upgrade, or a duplicate of what you own.">+ Incoming</button>
+    </div>
+  </div>
+
+  <div class="card">
+    <h3>Archive (where Move files things)</h3>
+    <div class="path-row">
+      <input class="path-input" id="lb-archive-in" readonly tabindex="-1" placeholder="not set" title="The folder Move puts releases into. Left unset on purpose — a path from another machine would move files somewhere you cannot see.">
+      <button class="btn-xs" onclick="lbPickArchive()" title="Choose the folder that Move files releases into">📁 Browse</button>
+    </div>
+  </div>
+
+  <div class="card">
+    <h3>Run</h3>
+    <button class="btn" id="lb-scan-btn" style="width:100%" onclick="lbJob('label_scan')" title="Read every folder you added, match each one to the catalogue, and work out what is complete, partial and missing. The first run reads tags off every file; after that only folders that changed are re-read.">Scan folders</button>
+    <button class="btn ghost" style="width:100%;margin-top:5px" onclick="stopJob(this)" title="Stop the running job at the next folder">■ Stop</button>
+    <button class="btn-xs ghost" style="width:100%;margin-top:8px" onclick="lbJob('label_authenticity')" title="Spectrally check every held release that has never been sampled — decodes audio, so this is slow (potentially hours across a big archive) and opt-in. Never runs on a plain Scan.">Run authenticity backfill</button>
+    <div class="lb-when" id="lb-when" data-i18n-skip></div>
+  </div>
+</aside>
+
+<main class="lb-main">
+  <div class="lb-overview" id="lb-overview" data-i18n-skip></div>
+  <div class="lb-stale" id="lb-stale" hidden>
+    <span class="lb-stale-ico">!</span><span id="lb-stale-text"></span>
+    <button class="btn-xs" onclick="lbJob('label_scan')" title="Read the folders again and refresh these numbers">Rescan</button>
+  </div>
+  <div class="lb-summary" id="lb-summary" data-i18n-skip></div>
+
+  <div class="lb-bar">
+    <div class="lb-views">
+      <button class="lb-view active" data-view="catalogue" title="Every release on this label, with what you hold of it">Catalogue</button>
+      <button class="lb-view" data-view="incoming" title="Folders from your Incoming roots, judged against what you own: new, an upgrade, or a duplicate">Incoming</button>
+      <button class="lb-view" data-view="orphans" title="Folders under your roots that this label's catalogue does not contain — usually a different label, or a folder named so the catalogue number cannot be read">Not in catalogue</button>
+      <button class="lb-view" data-view="series" title="Numbered series and volumes grouped together — 'Limite Vol I-XIII' as one line, not thirteen">Series</button>
+      <button class="lb-view" data-view="other-labels" title="Incoming folders that match a DIFFERENT tracked label's catalogue than the one active now">Other labels</button>
+      <button class="lb-view" data-view="moves" title="Every folder this tab has moved, newest first, each one with a button to put it back">Move log</button>
+    </div>
+    <div class="lb-filters" id="lb-filters">
+      <button class="lb-f active" data-status="" title="Show every release">All</button>
+      <button class="lb-f" data-status="missing" title="Releases on the label that you do not hold at all">Missing</button>
+      <button class="lb-f" data-status="partial" title="Releases you hold only part of — these are where the outstanding tracks come from">Incomplete</button>
+      <button class="lb-f" data-status="complete" title="Releases you hold in full">Complete</button>
+      <button class="lb-f" data-status="held" title="You have a folder for it, but Discogs has no track listing cached yet, so completeness is unknown">Unverified</button>
+    </div>
+    <input class="lb-search" id="lb-q" placeholder="search catalogue number, artist or title…" title="Filter the rows below">
+    <span class="lb-count" id="lb-count" data-i18n-skip></span>
+  </div>
+
+  <div class="lb-actions">
+    <button class="btn-xs" onclick="lbSelectAll(true)" title="Tick every row shown">Select all</button>
+    <button class="btn-xs" onclick="lbSelectAll(false)" title="Untick everything">Clear</button>
+    <button class="btn-xs warn" onclick="lbMove(true)" title="Show exactly what would move, and where, without touching a file">Preview move</button>
+    <button class="btn-xs warn" onclick="lbMove(false)" title="Move the ticked folders into the Archive folder. Every move is written to a log with a button to put it back.">Move to archive</button>
+    <button class="btn-xs" onclick="lbSearchSlsk()" title="Search Soulseek (via Nicotine+'s local API on 127.0.0.1:12339) for each ticked release — artist + title, same rule as Search terms. Nicotine+ must be running.">Search SLSK</button>
+    <span class="lb-sep"></span>
+    <span class="lb-exp-label">Export:</span>
+    <button class="btn-xs" onclick="lbExport('outstanding_tracks')" title="A readable list of every track still missing, grouped under its release — the list you actually hunt from">Outstanding tracks</button>
+    <button class="btn-xs" onclick="lbExport('missing_releases')" title="Spreadsheet of releases you do not hold at all">Missing releases (CSV)</button>
+    <button class="btn-xs" onclick="lbExport('partial')" title="Spreadsheet of the releases you hold only part of, with the missing track names">Incomplete (CSV)</button>
+    <button class="btn-xs" onclick="lbExport('search_terms')" title="One search line per thing to look for, as artist + title. Never title alone — a bare title matches the wrong release.">Search terms</button>
+    <button class="btn-xs" onclick="lbExport('have')" title="Spreadsheet of everything you hold on this label">What we have (CSV)</button>
+    <button class="btn-xs" onclick="lbExport('re_hunt_fake')" title="Spreadsheet of releases held in full but with a confidently-lossy spectral verdict — go get a genuine copy">Re-hunt (fake) (CSV)</button>
+  </div>
+
+  <div class="lb-table-wrap">
+    <table class="lb-table" id="lb-table"><tbody id="lb-rows"></tbody></table>
+    <div class="lb-empty" id="lb-empty">Nothing scanned yet. Add a folder on the left, then press <b>Scan folders</b>.</div>
+  </div>
+
+  <div class="lb-log-wrap">
+    <div class="lb-log-head"><span>Job log</span>
+      <button class="btn-xs ghost" onclick="document.getElementById('lb-log').innerHTML=''" title="Clear the log below">Clear</button></div>
+    <div class="log" id="lb-log" data-i18n-skip></div>
+  </div>
+</main>
+</div><!-- /labels -->
+
+<!-- ═══════════════ FILE BROWSER ═══════════════ -->
+<div class="fb-overlay hidden" id="fb-overlay">
+  <div class="fb">
+    <div class="fb-head">
+      <h2 id="fb-title">Choose a folder</h2>
+      <button class="popup-close" onclick="closeBrowser()" title="Close without choosing (Esc)">✕</button>
+    </div>
+
+    <div class="fb-bar">
+      <input id="fb-path" class="fb-path" spellcheck="false"
+             title="Type or paste a path and press Enter"
+             onkeydown="if(event.key==='Enter'){fbGo(this.value)}">
+      <button class="btn-xs" onclick="fbGo(document.getElementById('fb-path').value)" title="Go to the typed path">Go</button>
+      <button class="btn-xs ghost" onclick="fbUp()" title="Up one level">▲ Up</button>
+    </div>
+
+    <div class="fb-body">
+      <div class="fb-places" id="fb-places" title="Shortcuts on this machine"></div>
+      <div class="fb-list" id="fb-list"></div>
+    </div>
+
+    <div class="fb-foot">
+      <div class="fb-sel">
+        <span class="fb-sel-lbl">Selected</span>
+        <span id="fb-sel">—</span>
+      </div>
+      <span id="fb-note" class="fb-note"></span>
+      <button class="btn ghost" onclick="closeBrowser()">Cancel</button>
+      <button class="btn run-all" id="fb-use" onclick="fbUse()" title="Use the folder shown above">Use this folder</button>
+    </div>
+  </div>
+</div>
+
+<!-- ═══════════════ SPECTROGRAM POPUP ═══════════════ -->
+<div class="popup-overlay hidden" id="spec-overlay" onclick="closeSpec(event)">
+  <div class="popup" style="width:min(1280px,92vw)">
+    <div class="popup-hdr">
+      <h2 id="spec-title">Spectrogram</h2>
+      <button class="popup-close" onclick="closeSpecBtn()" title="Close">✕</button>
+    </div>
+    <div class="popup-body">
+      <div id="spec-meta" style="font-size:11px;color:var(--dim);margin-bottom:8px"></div>
+      <div id="spec-img-wrap" style="background:#000;border-radius:4px;min-height:120px;display:flex;align-items:center;justify-content:center">
+        <img id="spec-img" style="width:100%;display:block" src="" title="Time left→right, frequency bottom→top, brightness = energy. A hard ceiling well below the top means a lossy source.">
+      </div>
+      <div class="toolbar" style="margin-top:10px">
+        <a class="btn-xs" id="spec-save" download title="Download this spectrogram as a PNG file">⭳ Save PNG</a>
+        <button class="btn-xs ghost" onclick="copySpecLink()" title="Copy a direct link to this spectrogram image, for anyone else on the LAN">⎘ Copy link</button>
+        <span id="spec-copy-status" style="font-size:11px;color:var(--dim)"></span>
+        <span style="flex:1"></span>
+        <button class="btn-xs ghost" onclick="openFakeflacFolder(this)" title="Opens the containing folder in the file manager, with this file in it.">↗ Open</button>
+        <button class="btn-xs ghost" onclick="ffAction('dismiss')" title="False positive — clear the suspected flag, leave the file where it is">✓ Dismiss (false positive)</button>
+        <button class="btn-xs ghost" onclick="ffAction('isolate')" title="Move this file into the Suspected Transcodes folder under Output">⇥ Isolate</button>
+        <button class="btn-xs danger" onclick="ffAction('delete')" title="Permanently delete this file — cannot be undone">✕ Delete</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ═══════════════ DETAIL POPUP ═══════════════ -->
+<div class="popup-overlay hidden" id="detail-overlay" onclick="closeDetail(event)">
+  <div class="popup">
+    <div class="popup-hdr">
+      <h2 id="detail-title">File detail</h2>
+      <button class="popup-close" onclick="closeDetailBtn()" title="Close">✕</button>
+    </div>
+    <div class="popup-body" id="detail-body"></div>
+  </div>
+</div>
+
+<!-- ═══════════════ TOOL LOG OVERLAY ═══════════════ -->
+<div class="popup-overlay hidden" id="tool-log-overlay" onclick="closeToolLog(event)">
+  <div class="popup" style="width:800px;max-height:70vh">
+    <div class="popup-hdr">
+      <h2 id="tool-log-title">Running…</h2>
+      <button class="popup-close" onclick="closeToolLogBtn()" title="Close">✕</button>
+    </div>
+    <div class="popup-body" style="padding:0">
+      <div class="log" id="tool-log" style="padding:10px 14px;min-height:200px;max-height:55vh;overflow-y:auto"></div>
+    </div>
+  </div>
+</div>
+
+<script src="/static/i18n-lang.js?v=__ASSETV__"></script>
+<script src="/static/i18n.js?v=__ASSETV__"></script>
+<script src="/static/app.js?v=__ASSETV__"></script>
+</body>
+</html>

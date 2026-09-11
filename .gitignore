@@ -32,4 +32,12 @@ config.toml
 *.swo
 *.kate-swp
 
+# Labels tab runtime data — a machine's own state, not the program.
+# label-cache/ is the Discogs catalogue + tracklists + the last scan (megabytes,
+# and different per label); label_state.json holds the folders THIS box uses;
+# label_moves.tsv is this box's undo log.
+label-cache/
+label_state.json
+label_moves.tsv
+
 

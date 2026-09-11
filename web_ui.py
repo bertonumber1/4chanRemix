@@ -10,6 +10,7 @@ Open: http://127.0.0.1:8082 on the machine running it, or
 from __future__ import annotations
 
 import asyncio, json, logging, os, re, shutil, signal, socket, sqlite3, subprocess, sys, tempfile, threading, time
+import urllib.parse
 from pathlib import Path
 from queue import Empty, Queue
 from typing import Any
@@ -28,6 +29,7 @@ for _sub in ("zzzzScriptstuff", "scriptstuff"):
 try:
     from fastapi import FastAPI, Query, Request
     from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
+    from fastapi.staticfiles import StaticFiles
     import uvicorn
 except ImportError:
     sys.exit("pip install fastapi uvicorn")
@@ -40,13 +42,22 @@ _LIBRARY_DB = Path("~/.local/share/music-organiser/library.db").expanduser()
 _FOLDER_DB  = Path("~/.local/share/music-organiser/web_folder_scan.db").expanduser()
 _CFG_PATH   = Path("~/.config/music-organiser/config.toml").expanduser()
 _LOG_FILE   = Path("~/.local/share/music-organiser/web_ui.log").expanduser()
-_VERSION    = "1.8.0"
+_VERSION    = "1.10.0"
 
 try:
     import telegram_panel as tgp
 except Exception as _tg_err:            # a broken panel must not kill the app
     tgp = None
     _TG_ERR = repr(_tg_err)
+
+try:
+    import label_ref
+    import label_panel as lbl
+except Exception as _lbl_err:           # likewise: no tab is worth the whole app
+    lbl = None
+    _LBL_ERR = repr(_lbl_err)
+else:
+    _LBL_ERR = ""
 
 # ─── logging ──────────────────────────────────────────────────────────────────
 def _setup_logging(verbose: bool = False) -> None:
@@ -127,12 +138,100 @@ class _WebUI:
 
 
 # ─── config ───────────────────────────────────────────────────────────────────
+_CFG_ERROR = ""          # last config.toml parse failure, for the doctor
+
+
 def _load_cfg() -> dict:
+    """Load config.toml, remembering WHY it failed.
+
+    This used to swallow the exception and return {}. A malformed TOML then
+    looked exactly like "the UI ignores my paths": every setting silently fell
+    back to a default and nothing anywhere said so. The error is now kept and
+    surfaced by /api/doctor.
+    """
+    global _CFG_ERROR
     try:
         from config import load_config
-        return load_config()
-    except Exception:
+        cfg = load_config()
+        _CFG_ERROR = ""
+        return cfg
+    except Exception as exc:
+        _CFG_ERROR = "%s: %s" % (type(exc).__name__, exc)
         return {}
+
+
+def _doctor() -> dict:
+    """Check the things that fail SILENTLY, and say so out loud.
+
+    Every entry is something that has actually gone wrong here before: a
+    source folder that no longer exists scans nothing and reports success; a
+    destination on an unmounted drive gets created as an empty directory; a
+    read-only database makes every write vanish.
+    """
+    import os as _os
+    problems, checks = [], []
+    cfg = _load_cfg()
+    paths = (cfg or {}).get("paths") or {}
+
+    def add(ok, label, detail="", fatal=True):
+        checks.append({"ok": bool(ok), "label": label, "detail": detail})
+        if not ok and fatal:
+            problems.append("%s — %s" % (label, detail) if detail else label)
+
+    add(not _CFG_ERROR, "config.toml parses",
+        _CFG_ERROR or str(_CFG_PATH))
+    if _CFG_ERROR:
+        return {"ok": False, "problems": problems, "checks": checks}
+
+    # Config values come straight from the TOML file, so a "~/..." default
+    # (config.default.toml's database path, or anything a user types by hand)
+    # is still a literal tilde here. os.path.isdir("~/...") never expands it
+    # on any platform, and on Windows "~" isn't a shell convention at all — it
+    # just fails to exist, turning a correct default into a false "broken
+    # configuration" warning. Expand before every filesystem check.
+    def _exp(p):
+        return _os.path.expanduser(p) if p else p
+
+    srcs = [_exp(s) for s in (paths.get("sources") or [])]
+    if not srcs:
+        add(False, "a source folder is configured",
+            "nothing to import from", fatal=False)
+    for s in srcs:
+        ok = _os.path.isdir(s)
+        add(ok, "source exists", s if ok else "%s — does not exist, so a "
+            "scan finds nothing and reports no error" % s)
+        if ok and not _os.access(s, _os.R_OK):
+            add(False, "source readable", s)
+
+    dest = _exp(paths.get("destination_root") or "")
+    if dest:
+        ok = _os.path.isdir(dest)
+        add(ok, "destination exists", dest if ok else
+            "%s — missing; on a bind/mount this gets recreated empty and "
+            "owned by root" % dest)
+        if ok and not _os.access(dest, _os.W_OK):
+            add(False, "destination writable", dest)
+    else:
+        add(False, "a destination is configured", "", fatal=False)
+
+    db = _exp(paths.get("database")) or str(_LIBRARY_DB)
+    dbdir = _os.path.dirname(db) or "."
+    if _os.path.exists(db):
+        add(_os.access(db, _os.W_OK), "library.db writable", db)
+    else:
+        add(_os.path.isdir(dbdir) and _os.access(dbdir, _os.W_OK),
+            "library.db can be created", dbdir)
+
+    try:
+        import telegram_panel as _t
+        up = _exp((_t.settings(cfg) or {}).get("upload_dir") or "")
+        if up:
+            add(_os.path.isdir(up), "telegram upload dir exists", up)
+    except Exception:
+        pass
+
+    return {"ok": not problems, "problems": problems, "checks": checks}
+
 
 def _save_cfg(paths: dict | None = None, providers: dict | None = None) -> None:
     txt = _CFG_PATH.read_text()
@@ -250,7 +349,7 @@ def _do_organise(ui, dest, cfg, dry_run):
     organise_in_place(db, cfg=override, ui=ui, dry_run=dry_run)
 
 
-def _do_direct(ui, sources, dest, provider_ids, cfg, dry_run):
+def _do_direct(ui, sources, dest, provider_ids, cfg, dry_run, steps=("import", "fetch", "organise")):
     """Direct mode: import → fetch tags → organise, chained on a single
     throwaway in-memory DB (Database(":memory:") — see database.py). Nothing
     persists to a database file; sources+dest are the only inputs, output is
@@ -280,9 +379,15 @@ def _do_direct(ui, sources, dest, provider_ids, cfg, dry_run):
     ui.log("info", "DIRECT MODE — no database will be written, files only")
     if dry_run: ui.log("info", "DRY RUN — nothing will be moved or written")
 
+    if set(steps) != {"import", "fetch", "organise"}:
+        ui.log("info", "step(s): " + ", ".join(steps))
+
     db = Database(":memory:")
     try:
-        import_sources(sources, cfg=override, db=db, ui=ui, dry_run=dry_run)
+        # Every step needs the files indexed first — the in-memory DB is the
+        # only place they exist. Indexing is read-only, so it is never skipped.
+        import_sources(sources, cfg=override, db=db, ui=ui,
+                       dry_run=dry_run or "import" not in steps)
 
         provs = []
         for pid in provider_ids:
@@ -291,6 +396,9 @@ def _do_direct(ui, sources, dest, provider_ids, cfg, dry_run):
             try: pr.configure(cfg, lambda **kw: None)
             except Exception: pass
             provs.append(pr)
+        if provs and "fetch" not in steps:
+            ui.log("info", "skipping the tag lookup — this run is organise-only")
+            provs = []
         if provs:
             ui.log("info", f"providers: {[pr.id for pr in provs]}")
             fill_missing_metadata(
@@ -303,7 +411,10 @@ def _do_direct(ui, sources, dest, provider_ids, cfg, dry_run):
         else:
             ui.log("warning", "no providers configured — organising from existing tags only")
 
-        organise_in_place(db, cfg=override, ui=ui, dry_run=dry_run)
+        if "organise" in steps:
+            organise_in_place(db, cfg=override, ui=ui, dry_run=dry_run)
+        else:
+            ui.log("info", "not organising — tags only, files stay where they are")
     finally:
         db.close()
 
@@ -406,8 +517,156 @@ def _do_fake_flac_vamp(ui, db_path: Path):
         db.close()
 
 
+def _do_tags_from_names(ui, db_path: Path, dry_run: bool):
+    """Fill artist / title / album from the FILE NAME where tags are absent.
+
+    "Broken" in this app has only ever meant "artist, album or title is
+    missing" -- never damaged audio. A file called
+    `01. Baby's Gang - Challenger.flac` is carrying exactly the fields the
+    tags are missing, so this reads them off the path and writes them in,
+    which is what actually empties the Broken pile.
+
+    Only STRONG recovery is used: a real "Artist - Title" filename or an
+    "Artist - Album" folder. The bare folder name is refused -- treating it
+    as an album is what once stamped two unrelated tracks with one
+    MusicBrainz release.
+    """
+    from database import Database
+    from detection import recover_from_path, is_unknown_tag
+    from tag_writer import write_tags_to_file
+
+    if not db_path.exists():
+        ui.log("warning", f"{db_path.name} not found — run Import or Rebuild index first")
+        return
+
+    db = Database(str(db_path))
+    fixed = weak = skipped = errors = 0
+    try:
+        for row in db.iter_all():
+            path = row.get("path") or ""
+            have = {}
+            for f in ("artist", "album", "title"):
+                v = (row.get(f) or "").strip()
+                have[f] = bool(v) and not is_unknown_tag(v)
+            if all(have.values()):
+                continue
+            rec = recover_from_path(path, have_artist=have["artist"],
+                                    have_album=have["album"],
+                                    have_title=have["title"])
+            if rec.get("confidence") != "strong":
+                weak += 1
+                continue
+            tags = {f: rec[f].strip() for f in ("artist", "album", "title")
+                    if not have[f] and rec.get(f, "").strip()
+                    and not is_unknown_tag(rec[f])}
+            if not tags:
+                weak += 1
+                continue
+            res = write_tags_to_file(path, tags, only_missing=True, dry_run=dry_run)
+            if getattr(res, "error", None):
+                errors += 1
+                ui.log("warning", f"{Path(path).name}: {res.error}")
+                continue
+            if getattr(res, "skipped_entirely", False):
+                skipped += 1
+                continue
+            fixed += 1
+            ui.log("info", "%s  →  %s" % (
+                Path(path).name[:56],
+                "  ".join("%s='%s'" % (k, v) for k, v in tags.items())))
+            if not dry_run:
+                new_row = dict(row)
+                new_row.update(tags)
+                if all((new_row.get(f) or "").strip() for f in ("artist", "album", "title")) \
+                        and (new_row.get("status") or "") == "broken":
+                    new_row["status"] = "imported"
+                    new_row["comment"] = "tags recovered from filename"
+                db.upsert_file(new_row)
+    finally:
+        db.close()
+    ui.log("info", "tags from filenames%s — fixed=%d  nothing-usable=%d  "
+                    "skipped(verified rip)=%d  errors=%d"
+                    % (" (dry run)" if dry_run else "", fixed, weak, skipped, errors))
+    if weak:
+        ui.log("info", "the 'nothing usable' ones have neither tags nor an "
+                        "'Artist - Title' filename — their audio is fine, there "
+                        "is simply nothing to read the names from")
+
+
 # ─── job runner ───────────────────────────────────────────────────────────────
-def _run_job(kind, sources, dest, provider_ids, cfg, dry_run, db_target="library", force=False):
+def _do_label(ui, kind, cfg, dest="", force=False):
+    """Labels tab work, on the shared job thread.
+
+    Everything here is slow for an honest reason — a catalogue is hundreds of
+    paged API calls, and reading tags off 1,200 folders on a USB bridge that
+    manages 5-8 MB/s takes minutes — so it streams progress into the same log
+    the rest of the app uses instead of blocking a request.
+    """
+    if lbl is None:
+        ui.log("broken", "label panel unavailable: %s" % _LBL_ERR)
+        return
+    def log(m):
+        # ui.log() only feeds the SSE stream, so a job's progress exists solely
+        # in a browser that happens to be watching. A label scan can run for
+        # forty minutes over a network mount; mirror it to the log file too, so
+        # `music-organiser logs` shows what it is doing and a finished run
+        # leaves evidence behind. Only the label jobs do this — an import logs
+        # once per FILE, which would bury the log.
+        logging.info(m)
+        ui.log("info", m)
+    try:
+        if kind == "label_catalogue":
+            lbl.fetch_catalogue(cfg, log, force=bool(force))
+        elif kind == "label_tracklists":
+            lbl.fetch_tracklists(cfg, log, limit=int(dest) if dest else 2000,
+                                 should_stop=_stop_flag.is_set)
+        else:
+            # Stop must reach the folder loop itself. ui.log() only raises
+            # _StopRequested on the NEXT log line, and this job logs once every
+            # hundred folders — so without this, Stop could sit for minutes.
+            lbl.scan(cfg, log, should_stop=_stop_flag.is_set)
+    except Exception as exc:
+        ui.log("broken", "label job failed: %s" % exc)
+
+
+def _do_label_onboard(ui, cfg, path, role):
+    """"+ Owned folder" / "+ Incoming": add the root, then run the full
+    onboarding pass (index -> match -> completeness -> authenticity ->
+    cross-check) on it. See label_panel.onboard_root() for the real work.
+    """
+    if lbl is None:
+        ui.log("broken", "label panel unavailable: %s" % _LBL_ERR)
+        return
+    def log(m):
+        logging.info(m)
+        ui.log("info", m)
+    try:
+        res = lbl.onboard_root(cfg, path, role, log, should_stop=_stop_flag.is_set)
+        if not res.get("ok", True):
+            ui.log("warning", res.get("reason", "onboarding did not complete"))
+    except Exception as exc:
+        ui.log("broken", "onboarding failed: %s" % exc)
+
+
+def _do_label_authenticity(ui, cfg):
+    """Opt-in backfill: authenticity-check every already-held release the
+    last scan has never sampled. Potentially long — see
+    label_panel.authenticity_backfill().
+    """
+    if lbl is None:
+        ui.log("broken", "label panel unavailable: %s" % _LBL_ERR)
+        return
+    def log(m):
+        logging.info(m)
+        ui.log("info", m)
+    try:
+        lbl.authenticity_backfill(cfg, log, should_stop=_stop_flag.is_set)
+    except Exception as exc:
+        ui.log("broken", "authenticity backfill failed: %s" % exc)
+
+
+def _run_job(kind, sources, dest, provider_ids, cfg, dry_run, db_target="library",
+            force=False, role="owned"):
     ui = _WebUI()
     try:
         with ui:
@@ -433,10 +692,29 @@ def _run_job(kind, sources, dest, provider_ids, cfg, dry_run, db_target="library
                 _do_organise(ui, dest, cfg, dry_run)
             elif kind == "direct":
                 _do_direct(ui, sources, dest, provider_ids, cfg, dry_run)
+            elif kind == "direct_scan":
+                _do_direct(ui, sources, dest, provider_ids, cfg, True,
+                           steps=("import",))
+            elif kind == "direct_tags":
+                _do_direct(ui, sources, dest, provider_ids, cfg, dry_run,
+                           steps=("import", "fetch"))
+            elif kind == "direct_organise":
+                _do_direct(ui, sources, dest, provider_ids, cfg, dry_run,
+                           steps=("import", "organise"))
+            elif kind in ("label_scan", "label_catalogue", "label_tracklists"):
+                _do_label(ui, kind, cfg, dest, force)
+            elif kind == "label_onboard":
+                _do_label_onboard(ui, cfg, dest, role)
+            elif kind == "label_authenticity":
+                _do_label_authenticity(ui, cfg)
             elif kind == "rebuild":
                 _do_rebuild(ui, dest, cfg)
             elif kind == "vacuum":
                 _do_vacuum(ui)
+            elif kind == "tags_from_names":
+                db_p = _FOLDER_DB if db_target == "folder" else \
+                       (_SESSION_DB if db_target == "session" else _LIBRARY_DB)
+                _do_tags_from_names(ui, db_p, dry_run)
             elif kind == "fake_flac_scan":
                 if db_target == "folder":
                     _do_fake_flac_scan_folder(ui, Path(dest), cfg, force)
@@ -460,35 +738,70 @@ def _run_job(kind, sources, dest, provider_ids, cfg, dry_run, db_target="library
 # ─── app ──────────────────────────────────────────────────────────────────────
 app = FastAPI(title="music-organiser")
 
+# The page lives in templates/index.html, static/app.css and static/app.js
+# rather than inline in this file. StaticFiles handles ETag/If-None-Match, so
+# an unchanged asset is a 304 rather than a re-download.
+_TEMPLATES = _HERE / "templates"
+_STATIC    = _HERE / "static"
+app.mount("/static", StaticFiles(directory=str(_STATIC)), name="static")
+
+_index_cache = {"stamp": None, "html": ""}
+
+
+def _asset_version():
+    """Cache-buster: the newest mtime across the page's three files.
+
+    Without it a browser keeps last week's app.js after an upgrade and the
+    bug report is 'the button does nothing'.
+    """
+    newest = 0.0
+    # Every file under static/, not a hard-coded three. The list was written
+    # when there were exactly three; i18n.js and i18n-lang.js were then added
+    # and would have been cached across an upgrade while the page that uses
+    # them was not — the language menu would work for new visitors and appear
+    # broken for everyone who had loaded the page before.
+    paths = [_TEMPLATES / "index.html"]
+    try:
+        paths += [f for f in _STATIC.iterdir() if f.is_file()]
+    except OSError:
+        pass
+    for f in paths:
+        try:
+            newest = max(newest, f.stat().st_mtime)
+        except OSError:
+            pass
+    return str(int(newest))
+
+
+def _index_html():
+    """index.html with the cache-buster filled in, re-read when it changes."""
+    stamp = _asset_version()
+    if _index_cache["stamp"] != stamp:
+        raw = (_TEMPLATES / "index.html").read_text(encoding="utf-8")
+        _index_cache["html"] = raw.replace("__ASSETV__", stamp)
+        _index_cache["stamp"] = stamp
+    return _index_cache["html"]
+
 
 @app.get("/", response_class=HTMLResponse)
-def root(): return HTMLResponse(_HTML)
+def root(): return HTMLResponse(_index_html())
 
 
 @app.get("/wallpaper.jpg")
 def wallpaper():
+    """The faceted backdrop. Plain texture, no wordmark baked into it.
+
+    wallpaper-pirate.jpg (the original theme) stays in assets/, just unused by
+    default — swap the filename below to bring it back.
+
+    There is deliberately no /logo.png or /logo-icon.png any more: the header
+    wordmark is CSS + inline SVG in templates/index.html and the favicon is
+    static/favicon.svg, so the page carries no logo image at all.
+    """
     from fastapi.responses import FileResponse
     import os
-    # wallpaper-pirate.jpg (the original theme) stays in assets/, just unused
-    # by default — swap the filename below to bring it back.
     p = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets", "wallpaper-ice.jpg")
     return FileResponse(p, media_type="image/jpeg")
-
-
-@app.get("/logo.png")
-def logo():
-    from fastapi.responses import FileResponse
-    import os
-    p = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets", "logo-sas.png")
-    return FileResponse(p, media_type="image/png")
-
-
-@app.get("/logo-icon.png")
-def logo_icon():
-    from fastapi.responses import FileResponse
-    import os
-    p = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets", "logo-sas-icon.png")
-    return FileResponse(p, media_type="image/png")
 
 
 @app.get("/api/config")
@@ -764,6 +1077,259 @@ def _pick_macos(start_dir: Path | None) -> tuple[bool, str]:
     return True, (proc.stdout or "").strip()
 
 
+@app.post("/api/session/edit")
+async def session_edit(request: Request):
+    """Edit one file's tags — and optionally its NAME — from the Session tab.
+
+    Writes the tags into the file itself (not just the database row), because
+    a database that disagrees with the file is how this library got into
+    trouble in the first place. `only_missing=False`: an edit is an
+    instruction, not a suggestion.
+    """
+    body = await request.json()
+    path = (body.get("path") or "").strip()
+    fields = body.get("fields") or {}
+    rename = (body.get("rename") or "").strip()
+    write_tags = bool(body.get("write_tags", True))
+    which = body.get("db", "session")
+    db_path = _SESSION_DB if which == "session" else _LIBRARY_DB
+
+    p = Path(path)
+    if not p.is_file():
+        return JSONResponse({"ok": False, "reason": "file not found"}, status_code=404)
+
+    allowed = ("artist", "albumartist", "album", "title", "year", "label",
+               "catalog_number", "genre", "track_number", "disc_number")
+    clean = {k: v for k, v in fields.items() if k in allowed}
+    notes = []
+
+    if write_tags and clean:
+        try:
+            from tag_writer import write_tags_to_file
+            res = write_tags_to_file(p, clean, only_missing=False,
+                                     touch_verified_rips=False, dry_run=False)
+            if getattr(res, "error", None):
+                return JSONResponse({"ok": False, "reason": "tag write failed: %s"
+                                     % res.error}, status_code=500)
+            if getattr(res, "skipped_entirely", False):
+                notes.append("tags NOT written: %s" % res.skip_reason)
+        except Exception as exc:
+            return JSONResponse({"ok": False, "reason": str(exc)}, status_code=500)
+
+    final = p
+    if rename and rename != p.name:
+        bad = set('<>:"/\\|?*')
+        if any(c in bad for c in rename):
+            return JSONResponse({"ok": False,
+                                 "reason": "a filename cannot contain < > : \" / \\ | ? *"},
+                                status_code=400)
+        if not Path(rename).suffix:
+            rename += p.suffix
+        target = p.with_name(rename)
+        if target.exists():
+            return JSONResponse({"ok": False, "reason": "%s already exists" % rename},
+                                status_code=409)
+        try:
+            p.rename(target)
+            final = target
+        except Exception as exc:
+            return JSONResponse({"ok": False, "reason": "rename failed: %s" % exc},
+                                status_code=500)
+
+    if db_path.exists():
+        try:
+            with sqlite3.connect(str(db_path)) as conn:
+                sets = ["%s = ?" % k for k in clean]
+                vals = list(clean.values())
+                if final != p:
+                    sets.append("path = ?")
+                    vals.append(str(final))
+                    sets.append("filename = ?")
+                    vals.append(final.name)
+                if sets:
+                    vals.append(str(p))
+                    conn.execute("UPDATE files SET %s WHERE path = ?"
+                                 % ", ".join(sets), vals)
+                conn.commit()
+        except Exception as exc:
+            notes.append("file updated but the database was not: %s" % exc)
+
+    return JSONResponse({"ok": True, "path": str(final), "filename": final.name,
+                         "reason": "; ".join(notes) or "saved to the file and the database"})
+
+
+@app.post("/api/session/act")
+async def session_act(request: Request):
+    """Manual work on the session: move, copy, delete, re-read tags, forget.
+
+    Reports what happened to EACH file rather than one ok/failed — on a move
+    of forty files you need to know which three did not make it and why.
+    Nothing here touches library.db; the session is the scratch pad.
+    """
+    body = await request.json()
+    action = (body.get("action") or "").strip()
+    paths = [p for p in (body.get("paths") or []) if p]
+    dest = (body.get("dest") or "").strip()
+    which = body.get("db", "session")
+    db_path = _SESSION_DB if which == "session" else _LIBRARY_DB
+    if action not in ("move", "copy", "delete", "forget", "retag"):
+        return JSONResponse({"error": f"unknown action: {action}"}, status_code=400)
+    if not paths:
+        return JSONResponse({"error": "nothing selected"}, status_code=400)
+    if action in ("move", "copy"):
+        if not dest:
+            return JSONResponse({"error": "pick a destination folder first"},
+                                status_code=400)
+        try:
+            Path(dest).mkdir(parents=True, exist_ok=True)
+        except Exception as exc:
+            return JSONResponse({"error": f"cannot use {dest}: {exc}"}, status_code=400)
+
+    done, failed = [], []
+    conn = sqlite3.connect(str(db_path)) if db_path.exists() else None
+    try:
+        for raw in paths:
+            src = Path(raw)
+            try:
+                if action == "forget":
+                    if conn:
+                        conn.execute("DELETE FROM files WHERE path = ?", (str(src),))
+                elif action == "delete":
+                    if src.is_file():
+                        src.unlink()
+                    if conn:
+                        conn.execute("DELETE FROM files WHERE path = ?", (str(src),))
+                elif action == "retag":
+                    if not src.is_file():
+                        raise FileNotFoundError("file is gone")
+                    from metadata import extract_metadata
+                    meta = extract_metadata(str(src)) or {}
+                    if conn and meta:
+                        sets, vals = [], []
+                        for col in ("artist", "albumartist", "album", "title", "year",
+                                    "label", "catalog_number", "genre", "track_number",
+                                    "disc_number"):
+                            if col in meta:
+                                sets.append(f"{col} = ?")
+                                vals.append(meta[col])
+                        if sets:
+                            vals.append(str(src))
+                            conn.execute("UPDATE files SET %s WHERE path = ?"
+                                         % ", ".join(sets), vals)
+                else:                                   # move / copy
+                    if not src.is_file():
+                        raise FileNotFoundError("file is gone")
+                    target = Path(dest) / src.name
+                    n = 1
+                    while target.exists():
+                        target = Path(dest) / f"{src.stem} ({n}){src.suffix}"
+                        n += 1
+                    if action == "move":
+                        shutil.move(str(src), str(target))
+                        if conn:
+                            conn.execute("UPDATE files SET path = ? WHERE path = ?",
+                                         (str(target), str(src)))
+                    else:
+                        shutil.copy2(str(src), str(target))
+                done.append(str(src))
+            except Exception as exc:
+                failed.append({"path": str(src), "error": str(exc)})
+        if conn:
+            conn.commit()
+    finally:
+        if conn:
+            conn.close()
+    return JSONResponse({"ok": not failed, "action": action,
+                         "done": len(done), "failed": failed})
+
+
+@app.get("/api/fs")
+def fs_list(path: str = "", audio: bool = True):
+    """List one directory for the file browser.
+
+    Returns folders first, each with a count of the audio files directly
+    inside it — when you are choosing a source folder, "how much is in here"
+    is the only question you actually have, and the old tree could not answer
+    it. Never raises: an unreadable directory comes back with an `error` and
+    an empty list so the browser can say so instead of going blank.
+    """
+    import os as _os
+    exts = {".flac", ".mp3", ".m4a", ".ogg", ".opus", ".wav", ".aiff", ".aif",
+            ".ape", ".wv", ".alac", ".dsf", ".dff", ".wave"}
+    raw = (path or "").strip() or str(Path.home())
+    try:
+        p = Path(raw).expanduser()
+        if not p.is_absolute():
+            p = Path.home() / p
+        p = Path(_os.path.normpath(str(p)))
+    except Exception:
+        p = Path.home()
+
+    out = {"path": str(p), "parent": str(p.parent) if p.parent != p else "",
+           "dirs": [], "files": 0, "audio": 0, "error": ""}
+    if not p.is_dir():
+        out["error"] = "not a folder: %s" % p
+        return JSONResponse(out)
+    try:
+        entries = sorted(_os.scandir(p), key=lambda e: e.name.lower())
+    except PermissionError:
+        out["error"] = "no permission to read %s" % p
+        return JSONResponse(out)
+    except OSError as exc:
+        out["error"] = str(exc)
+        return JSONResponse(out)
+
+    for e in entries:
+        try:
+            if e.name.startswith("."):
+                continue
+            if e.is_dir(follow_symlinks=False):
+                n = 0
+                if audio:
+                    try:
+                        with _os.scandir(e.path) as it:
+                            for c in it:
+                                if (c.is_file(follow_symlinks=False)
+                                        and _os.path.splitext(c.name)[1].lower() in exts):
+                                    n += 1
+                    except OSError:
+                        n = -1                      # unreadable, say so
+                out["dirs"].append({"name": e.name, "path": e.path, "audio": n})
+            elif e.is_file(follow_symlinks=False):
+                out["files"] += 1
+                if _os.path.splitext(e.name)[1].lower() in exts:
+                    out["audio"] += 1
+        except OSError:
+            continue
+    return JSONResponse(out)
+
+
+@app.get("/api/fs/places")
+def fs_places():
+    """Shortcuts worth having, and only the ones that exist on this machine."""
+    import os as _os
+    out = []
+    home = Path.home()
+    out.append({"label": "Home", "path": str(home)})
+    for base in ("/mnt", "/media", "/media/" + _os.environ.get("USER", ""),
+                 "C:\\", "D:\\"):
+        b = Path(base)
+        try:
+            if b.is_dir():
+                out.append({"label": base, "path": str(b)})
+                for child in sorted(b.iterdir())[:12]:
+                    if child.is_dir():
+                        out.append({"label": "  " + child.name, "path": str(child)})
+        except OSError:
+            continue
+    seen, uniq = set(), []
+    for r in out:
+        if r["path"] not in seen:
+            seen.add(r["path"])
+            uniq.append(r)
+    return JSONResponse({"places": uniq[:24]})
+
+
 @app.get("/api/pick-folder")
 def pick_folder(start: str = ""):
     """Open the platform's own folder chooser and return the chosen directory.
@@ -883,6 +1449,229 @@ async def tg_uploader(req: Request):
         ok, msg = tgp.uploader_retry_failed(_load_cfg())
     else:
         ok, msg = False, "unknown action %r" % act
+    return JSONResponse({"ok": ok, "reason": msg})
+
+
+@app.post("/api/tg/settings")
+async def tg_settings(req: Request):
+    if tgp is None:
+        return JSONResponse({"ok": False, "reason": _TG_ERR or "no panel"})
+    body = await req.json()
+    ok, msg = tgp.uploader_config_set(_load_cfg(), body or {})
+    return JSONResponse({"ok": ok, "reason": msg,
+                         "settings": tgp.uploader_config(_load_cfg())})
+
+
+@app.post("/api/tg/tools")
+async def tg_tools(req: Request):
+    if tgp is None:
+        return JSONResponse({"ok": False, "reason": _TG_ERR or "no panel"})
+    body = await req.json()
+    ok, out = tgp.uploader_tools(_load_cfg(), (body or {}).get("what", "all"))
+    return JSONResponse({"ok": ok, "output": out})
+
+
+@app.post("/api/tg/action")
+async def tg_action(req: Request):
+    if tgp is None:
+        return JSONResponse({"ok": False, "reason": _TG_ERR or "no panel"})
+    body = await req.json()
+    ok, out = tgp.uploader_action(_load_cfg(), (body or {}).get("name", ""))
+    return JSONResponse({"ok": ok, "output": out})
+
+
+# ─── labels ───────────────────────────────────────────────────────────────────
+# The Labels tab answers three questions about a record label: what we have,
+# what we do not, and what is still missing from the releases we half-hold.
+# Heavy work (reading 1,200 folders of tags off a USB bridge) goes through the
+# ordinary job runner so it streams into the same log the other tabs use.
+
+def _lbl_guard():
+    if lbl is None:
+        return JSONResponse({"ok": False,
+                             "reason": "label_panel failed to load: %s" % _LBL_ERR})
+    return None
+
+
+@app.get("/api/label/status")
+def label_status():
+    g = _lbl_guard()
+    if g:
+        return g
+    return JSONResponse(lbl.status(_load_cfg()))
+
+
+@app.get("/api/label/overview")
+def label_overview():
+    g = _lbl_guard()
+    if g:
+        return g
+    return JSONResponse({"labels": lbl.overview()})
+
+
+@app.get("/api/label/cross-label")
+def label_cross_label(role: str = "incoming"):
+    g = _lbl_guard()
+    if g:
+        return g
+    return JSONResponse(lbl.cross_label_check(role))
+
+
+@app.post("/api/label/untrack")
+async def label_untrack(request: Request):
+    g = _lbl_guard()
+    if g:
+        return g
+    body = await request.json()
+    lbl.untrack_label(body.get("id"))
+    return JSONResponse({"ok": True})
+
+
+@app.get("/api/label/rows")
+def label_rows(status: str = "", q: str = "", verdict: str = "",
+               limit: int = 400, offset: int = 0):
+    """The last scan, filtered.  Paged: 2,952 rows is not a thing to send at once."""
+    g = _lbl_guard()
+    if g:
+        return g
+    scan = lbl.last_scan()
+    if not scan:
+        return JSONResponse({"ok": False, "reason": "nothing scanned yet",
+                             "rows": [], "total": 0})
+    rows = scan["rows"]
+    if status:
+        want = set(status.split(","))
+        rows = [r for r in rows if r["status"] in want]
+    if verdict:
+        want = set(verdict.split(","))
+        rows = [r for r in rows if r["verdict"] in want]
+    if q:
+        ql = q.lower()
+        rows = [r for r in rows
+                if ql in (r["title"] or "").lower()
+                or ql in (r["catno"] or "").lower()
+                or ql in (r["artist"] or "").lower()]
+    total = len(rows)
+    return JSONResponse({"ok": True, "total": total,
+                         "when": scan["when"], "summary": scan["summary"],
+                         "rows": rows[offset:offset + max(1, min(limit, 2000))]})
+
+
+@app.get("/api/label/orphans")
+def label_orphans(limit: int = 400):
+    """Folders under the added roots that this label's catalogue does not know.
+
+    Not a failure: it is how you find a folder filed under the wrong label, and
+    how an incoming share's non-label material shows itself.
+    """
+    g = _lbl_guard()
+    if g:
+        return g
+    scan = lbl.last_scan()
+    if not scan:
+        return JSONResponse({"ok": False, "reason": "nothing scanned yet",
+                             "rows": []})
+    return JSONResponse({"ok": True, "rows": scan["orphans"][:limit],
+                         "total": len(scan["orphans"])})
+
+
+@app.get("/api/label/series")
+def label_series():
+    """Numbered series/volumes grouped together, from the last scan —
+    "Limite — 9 of 13, missing 3, 7, 11" instead of 13 unrelated rows."""
+    g = _lbl_guard()
+    if g:
+        return g
+    scan = lbl.last_scan()
+    if not scan:
+        return JSONResponse({"ok": False, "reason": "nothing scanned yet",
+                             "rows": []})
+    return JSONResponse({"ok": True, "rows": scan.get("series") or []})
+
+
+@app.post("/api/label/set")
+async def label_set(req: Request):
+    g = _lbl_guard()
+    if g:
+        return g
+    body = await req.json()
+    what = body.get("what", "")
+    if what == "label":
+        st = lbl.set_label(int(body.get("id") or 0), body.get("name", ""))
+        return JSONResponse({"ok": True, "state": st})
+    if what == "add_root":
+        ok, msg = lbl.add_root(body.get("path", ""), body.get("role", "owned"))
+        return JSONResponse({"ok": ok, "reason": msg})
+    if what == "remove_root":
+        ok, msg = lbl.remove_root(body.get("path", ""))
+        return JSONResponse({"ok": ok, "reason": msg})
+    if what == "archive":
+        ok, msg = lbl.set_archive(body.get("path", ""))
+        return JSONResponse({"ok": ok, "reason": msg})
+    return JSONResponse({"ok": False, "reason": "unknown: %r" % what},
+                        status_code=400)
+
+
+@app.get("/api/label/search")
+def label_search(q: str = ""):
+    """Find a label on Discogs by name, so the id never has to be typed."""
+    g = _lbl_guard()
+    if g:
+        return g
+    if not q.strip():
+        return JSONResponse({"ok": False, "reason": "type a label name"})
+    try:
+        d = label_ref.Discogs(lbl._token(_load_cfg()))
+        return JSONResponse({"ok": True, "results": d.search_label(q)})
+    except Exception as exc:
+        return JSONResponse({"ok": False, "reason": str(exc)})
+
+
+@app.get("/api/label/export")
+def label_export(kind: str = "outstanding_tracks"):
+    """Hand back a list as a file.  The browser downloads it; nothing is written
+    on the server, so this works the same from the Windows box."""
+    g = _lbl_guard()
+    if g:
+        return g
+    try:
+        name, text = lbl.export(kind)
+    except Exception as exc:
+        return JSONResponse({"ok": False, "reason": str(exc)}, status_code=400)
+    from fastapi.responses import PlainTextResponse
+    quoted = urllib.parse.quote(name)
+    return PlainTextResponse(
+        text, media_type="text/plain; charset=utf-8",
+        headers={"Content-Disposition":
+                 "attachment; filename*=UTF-8''%s" % quoted})
+
+
+@app.post("/api/label/move")
+async def label_move(req: Request):
+    g = _lbl_guard()
+    if g:
+        return g
+    body = await req.json()
+    res = lbl.move_folders(body.get("paths") or [], body.get("dest", ""),
+                           bool(body.get("dry_run")))
+    return JSONResponse(res)
+
+
+@app.get("/api/label/moves")
+def label_moves(limit: int = 200):
+    g = _lbl_guard()
+    if g:
+        return g
+    return JSONResponse({"ok": True, "rows": lbl.move_log(limit)})
+
+
+@app.post("/api/label/undo")
+async def label_undo(req: Request):
+    g = _lbl_guard()
+    if g:
+        return g
+    body = await req.json()
+    ok, msg = lbl.undo_move(body.get("dest", ""))
     return JSONResponse({"ok": ok, "reason": msg})
 
 
@@ -1057,12 +1846,23 @@ def fakeflac_suspects(db: str = "library", page: int = 0, per_page: int = 50):
     total = _db_one(db_path,
         "SELECT COUNT(*) FROM files WHERE transcode_suspected = 1") or 0
     offset = page * per_page
-    rows = _db_rows(db_path,
-        "SELECT path, artist, albumartist, album, title, size_bytes, "
-        "transcode_cutoff_hz, transcode_confidence, transcode_notes "
-        "FROM files WHERE transcode_suspected = 1 "
-        "ORDER BY transcode_confidence DESC, path "
-        "LIMIT ? OFFSET ?", [per_page, offset])
+    # The verdict columns are newer than some databases, so ask for them and
+    # fall back rather than 500-ing on an older file.
+    cols = ("path, artist, albumartist, album, title, size_bytes, "
+            "transcode_cutoff_hz, transcode_confidence, transcode_notes, "
+            "transcode_verdict, transcode_wall_db, transcode_above_db")
+    try:
+        rows = _db_rows(db_path,
+            f"SELECT {cols} FROM files WHERE transcode_suspected = 1 "
+            "ORDER BY transcode_confidence DESC, path LIMIT ? OFFSET ?",
+            [per_page, offset])
+    except Exception:
+        rows = _db_rows(db_path,
+            "SELECT path, artist, albumartist, album, title, size_bytes, "
+            "transcode_cutoff_hz, transcode_confidence, transcode_notes "
+            "FROM files WHERE transcode_suspected = 1 "
+            "ORDER BY transcode_confidence DESC, path "
+            "LIMIT ? OFFSET ?", [per_page, offset])
     for r in rows:
         r["filename"] = Path(r["path"]).name
         r["mb"] = round((r.get("size_bytes") or 0) / 1048576, 1)
@@ -1143,6 +1943,119 @@ async def fakeflac_dismiss(request: Request):
         return JSONResponse({"error": str(e)}, status_code=500)
 
 
+@app.post("/api/fakeflac/bulk")
+async def fakeflac_bulk(request: Request):
+    """Apply one action to many files at once.
+
+    Deliberately reports per-file outcomes rather than a single ok/failed: on
+    a delete of forty files you need to know WHICH four were already gone.
+    """
+    body = await request.json()
+    action = (body.get("action") or "").strip()
+    paths = [p for p in (body.get("paths") or []) if p]
+    db_path = _fakeflac_db(body.get("db", "library"))
+    if action not in ("delete", "isolate", "dismiss"):
+        return JSONResponse({"error": f"unknown action: {action}"}, status_code=400)
+    if not paths:
+        return JSONResponse({"error": "nothing selected"}, status_code=400)
+
+    cfg = _load_cfg()
+    paths_cfg = cfg.get("paths", {})
+    target_dir = None
+    if action == "isolate":
+        dest_root = paths_cfg.get("destination_root", "")
+        if not dest_root:
+            return JSONResponse({"error": "no destination_root configured"},
+                                status_code=400)
+        target_dir = Path(dest_root) / paths_cfg.get(
+            "suspected_transcode_folder", "Suspected Transcodes")
+        target_dir.mkdir(parents=True, exist_ok=True)
+
+    done, failed = [], []
+    conn = sqlite3.connect(str(db_path)) if db_path.exists() else None
+    try:
+        for raw in paths:
+            p = Path(raw)
+            try:
+                if action == "dismiss":
+                    if conn:
+                        conn.execute("UPDATE files SET transcode_suspected = 0 "
+                                     "WHERE path = ?", (str(p),))
+                elif action == "delete":
+                    if not p.is_file():
+                        raise FileNotFoundError("already gone")
+                    p.unlink()
+                    if conn:
+                        conn.execute("DELETE FROM files WHERE path = ?", (str(p),))
+                else:                                   # isolate
+                    if not p.is_file():
+                        raise FileNotFoundError("already gone")
+                    target = target_dir / p.name
+                    n = 1
+                    while target.exists():
+                        target = target_dir / f"{p.stem} ({n}){p.suffix}"
+                        n += 1
+                    shutil.move(str(p), str(target))
+                    if conn:
+                        conn.execute("UPDATE files SET path = ? WHERE path = ?",
+                                     (str(target), str(p)))
+                done.append(str(p))
+            except Exception as exc:
+                failed.append({"path": str(p), "error": str(exc)})
+        if conn:
+            conn.commit()
+    finally:
+        if conn:
+            conn.close()
+    return JSONResponse({"ok": not failed, "action": action,
+                         "done": len(done), "failed": failed})
+
+
+@app.post("/api/spectrogram/zip")
+async def spectrogram_zip(request: Request):
+    """Render the selected files' spectrograms and hand back one .zip.
+
+    Saving forty PNGs one browser download at a time is not a workflow.
+    """
+    import io
+    import zipfile
+    from spectrogram import get_or_render, dependencies_available, missing_dependencies
+    if not dependencies_available():
+        return JSONResponse(
+            {"error": "spectrograms need: " + ", ".join(missing_dependencies())},
+            status_code=503)
+    body = await request.json()
+    paths = [p for p in (body.get("paths") or []) if p][:200]
+    if not paths:
+        return JSONResponse({"error": "nothing selected"}, status_code=400)
+    buf = io.BytesIO()
+    made, failed = 0, []
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+        for raw in paths:
+            try:
+                png = get_or_render(raw)
+                if not png or not Path(png).is_file():
+                    raise RuntimeError("render failed")
+                name = Path(raw).stem[:110] + ".png"
+                n, base = 1, name
+                while name in z.namelist():
+                    name = "%s (%d).png" % (base[:-4], n)
+                    n += 1
+                z.write(png, name)
+                made += 1
+            except Exception as exc:
+                failed.append("%s: %s" % (Path(raw).name, exc))
+        if failed:
+            z.writestr("_failed.txt", "\n".join(failed))
+    buf.seek(0)
+    from fastapi.responses import Response
+    stamp = time.strftime("%Y-%m-%d_%H%M")
+    return Response(
+        content=buf.getvalue(), media_type="application/zip",
+        headers={"Content-Disposition":
+                 'attachment; filename="spektro-%s_%d-images.zip"' % (stamp, made)})
+
+
 @app.get("/api/spectrogram")
 def spectrogram_api(path: str = "", force: bool = False):
     from spectrogram import get_or_render, dependencies_available, missing_dependencies
@@ -1210,11 +2123,19 @@ async def job_stream():
 async def start_job(kind: str, request: Request):
     global _job_thread
     valid = {"import","fetch","fetch_broken","organise","pipeline","direct",
-             "rebuild","vacuum","fake_flac_scan","fake_flac_vamp","stop"}
+             "direct_scan","direct_tags","direct_organise",
+             "rebuild","vacuum","fake_flac_scan","fake_flac_vamp",
+             "tags_from_names","label_scan","label_catalogue",
+             "label_tracklists","label_onboard","label_authenticity","stop"}
     if kind not in valid:
         return JSONResponse({"error": f"unknown job: {kind}"}, status_code=400)
     if kind == "stop":
         _stop_flag.set()
+        try:
+            from metadata_providers import Provider as _Prov
+            _Prov.CANCEL = _stop_flag
+        except Exception:
+            pass
         return JSONResponse({"ok": True})
     if _job_thread and _job_thread.is_alive():
         return JSONResponse({"error": "job already running"}, status_code=409)
@@ -1223,17 +2144,160 @@ async def start_job(kind: str, request: Request):
         try: _msg_q.get_nowait()
         except Empty: break
     _stop_flag.clear()
+    try:                       # let provider backoffs abort the moment Stop lands
+        from metadata_providers import Provider as _Prov
+        _Prov.CANCEL = _stop_flag
+    except Exception:
+        pass
     cfg = _load_cfg()
     _job_thread = threading.Thread(
         target=_run_job,
         args=(kind, body.get("sources",[]), body.get("dest",""),
               body.get("providers",["discogs","musicbrainz"]),
               cfg, bool(body.get("dry_run")),
-              body.get("db","library"), bool(body.get("force"))),
+              body.get("db","library"), bool(body.get("force")),
+              body.get("role","owned")),
         daemon=True,
     )
     _job_thread.start()
     return JSONResponse({"ok": True, "kind": kind})
+
+
+# A sample release, run through the REAL path builder — so the example shown
+# in the UI is produced by the same code that will move the files, not by a
+# hand-written string that can drift away from it.
+_NAMING_SAMPLE = {
+    "path": "/incoming/01 - Bjorn Akesson - Paper Dreams (Original Mix).flac",
+    "artist": "Bjorn Akesson", "albumartist": "Bjorn Akesson",
+    "album": "Paper Dreams", "title": "Paper Dreams (Original Mix)",
+    "track_number": 1, "disc_number": 1, "year": "2015",
+    "label": "Coldharbour Recordings", "catalog_number": "CLHR215",
+    "genre": "Trance", "extension": ".flac",
+}
+_NAMING_SAMPLE_VA = {
+    "path": "/incoming/04 - Chasis - Volando (Radio Edit).flac",
+    "artist": "Chasis", "albumartist": "Various Artists",
+    "album": "Esto es... Makina", "title": "Volando (Radio Edit)",
+    "track_number": 4, "disc_number": 2, "year": "1997",
+    "label": "Bit Music", "catalog_number": "12-414",
+    "genre": "Makina", "extension": ".flac",
+}
+
+
+@app.get("/api/naming")
+def naming_preview(scheme: str = ""):
+    """What a file will actually be called, under each layout.
+
+    Beatport and bpdl-web both show you the pattern with a worked example
+    beside it; guessing what "artist_release_track_mix_year" produces is not
+    a reasonable thing to ask of anyone.
+    """
+    from pathlib import Path as _P
+    cfg = _load_cfg()
+    current = str(((cfg or {}).get("organise") or {}).get(
+        "folder_scheme") or "artist_release_track_mix_year")
+    dest = ((cfg or {}).get("paths") or {}).get("destination_root") or "/Output"
+
+    out = {"current": current, "destination": dest, "schemes": []}
+    try:
+        from organiser_core import build_destination_path
+    except Exception as exc:
+        out["error"] = "path builder unavailable: %s" % exc
+        return JSONResponse(out)
+
+    for key, label, blurb in (
+        ("artist_release_track_mix_year", "One folder per TRACK",
+         "Every track gets its own folder: Artist - Release - Track - Mix - Year. "
+         "Empty slots are dropped, never padded. Best when you file singles and "
+         "want each mix to stand on its own."),
+        ("release", "One folder per RELEASE",
+         "The classic album layout: (catalogue number) Title (Year), with the "
+         "tracks inside it. Best when you keep albums and compilations whole."),
+    ):
+        override = dict(cfg or {})
+        org = dict(override.get("organise") or {})
+        org["folder_scheme"] = key
+        override["organise"] = org
+        examples = []
+        for sample, note, atype in ((_NAMING_SAMPLE, "a single", "solo"),
+                                    (_NAMING_SAMPLE_VA, "a compilation track", "mix")):
+            try:
+                pth = build_destination_path(
+                    dict(sample), atype, destination_root=dest,
+                    organise_cfg=org)
+                shown = str(pth)
+                if shown.startswith(str(dest)):
+                    shown = str(_P(shown).relative_to(dest))
+                examples.append({"note": note, "path": shown})
+            except Exception as exc:
+                examples.append({"note": note, "path": "(could not build: %s)" % exc})
+        out["schemes"].append({"key": key, "label": label, "blurb": blurb,
+                               "examples": examples, "active": key == current})
+    return JSONResponse(out)
+
+
+# The handful of settings that change what actually happens to your files.
+# Deliberately small: everything here has a consequence you would notice.
+_SETTABLE = {
+    "folder_scheme":  ("organise", "str"),
+    "import_mode":    ("import",   "str"),
+    "delete_orphaned_extras": ("organise", "bool"),
+}
+
+
+@app.post("/api/settings")
+async def settings_set(request: Request):
+    """Edit config.toml in place, keeping its comments.
+
+    A rewrite-from-parsed-values would throw away the explanations in that
+    file, which are most of its value — so each key is substituted textually,
+    exactly as the existing paths/providers writer does.
+    """
+    body = await request.json()
+    key = (body.get("key") or "").strip()
+    val = body.get("value")
+    if key not in _SETTABLE:
+        return JSONResponse({"ok": False, "reason": f"not settable: {key}"},
+                            status_code=400)
+    section, kind = _SETTABLE[key]
+    name = "mode" if key == "import_mode" else key
+    if kind == "bool":
+        text = "true" if (val is True or str(val).lower() in ("1", "true", "on", "yes")) else "false"
+    else:
+        text = '"%s"' % str(val).replace('"', "")
+    try:
+        txt = _CFG_PATH.read_text(encoding="utf-8")
+        pat = re.compile(r"^(\s*%s\s*=\s*).*$" % re.escape(name), re.M)
+        # only inside the right [section]
+        start = txt.find("[%s]" % section)
+        if start == -1:
+            txt = txt.rstrip() + "\n\n[%s]\n%s = %s\n" % (section, name, text)
+        else:
+            nxt = txt.find("\n[", start + 1)
+            end = len(txt) if nxt == -1 else nxt
+            block = txt[start:end]
+            if pat.search(block):
+                block = pat.sub(lambda m: m.group(1) + text, block, count=1)
+            else:
+                block = block.rstrip() + "\n%s = %s\n" % (name, text)
+            txt = txt[:start] + block + txt[end:]
+        tmp = str(_CFG_PATH) + ".tmp"
+        Path(tmp).write_text(txt, encoding="utf-8")
+        os.replace(tmp, _CFG_PATH)
+    except Exception as exc:
+        return JSONResponse({"ok": False, "reason": str(exc)}, status_code=500)
+
+    cfg = _load_cfg()
+    if _CFG_ERROR:                       # we just broke it — say so loudly
+        return JSONResponse({"ok": False,
+                             "reason": "config.toml no longer parses: " + _CFG_ERROR})
+    return JSONResponse({"ok": True, "reason": "saved",
+                         "value": ((cfg.get(section) or {}).get(name))})
+
+
+@app.get("/api/doctor")
+def doctor():
+    return JSONResponse(_doctor())
 
 
 # ─── health ───────────────────────────────────────────────────────────────────
@@ -1333,1680 +2397,6 @@ async def restart_service(request: Request):
 
 
 # ─── HTML ─────────────────────────────────────────────────────────────────────
-_HTML = r"""<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>music-organiser</title>
-<link rel="icon" type="image/png" href="/logo-icon.png">
-<style>
-:root{
-  --bg:#070a0e;--panel:#0e141bee;--card:#141c2688;--border:#25384a;
-  --acc:#2f9fe0;--acc2:#8fe0f0;--text:#dce8f0;--dim:#5f7688;
-  --ok:#4ecb71;--warn:#f0c040;--err:#ff5566;--info:#60b8ff;--dup:#c060f0;
-}
-*{box-sizing:border-box;margin:0;padding:0}
-body{color:var(--text);background:var(--bg);
-     font-family:'JetBrains Mono','Fira Code','Cascadia Code',monospace;
-     font-size:13px;height:100vh;display:flex;flex-direction:column;overflow:hidden}
-/* fixed ice-cool faceted backdrop, heavily darkened so the dense UI stays readable */
-body::before{content:"";position:fixed;inset:0;z-index:-1;pointer-events:none;
-     background:
-       radial-gradient(ellipse at top,rgba(20,35,48,.15) 0%,transparent 60%),
-       linear-gradient(rgba(5,8,11,.42),rgba(4,6,9,.55)),
-       url("/wallpaper.jpg") center/cover no-repeat fixed}
-
-/* HEADER */
-header{background:var(--panel);border-bottom:1px solid var(--border);
-       padding:7px 16px;display:flex;align-items:center;gap:14px;flex-shrink:0}
-.brand-logo{height:52px;display:block}
-.tabs{display:flex;gap:8px;margin-left:18px;align-items:stretch}
-.tab-btn{background:#181420;border:1px solid var(--border);border-bottom:2px solid transparent;
-         color:var(--dim);padding:9px 20px;border-radius:6px 6px 0 0;cursor:pointer;font:inherit;
-         font-size:12px;font-weight:800;letter-spacing:.07em;text-transform:uppercase;
-         transition:all .15s}
-.tab-btn:hover{color:var(--text);background:#201a2c}
-.tab-btn.active{background:#242038;border-color:var(--acc);border-bottom-color:var(--acc);color:var(--acc)}
-#hdr-status{font-size:11px;color:var(--dim);flex:1;white-space:nowrap}
-.hdr-btn{background:none;border:1px solid var(--border);color:var(--text);
-         padding:7px 14px;border-radius:4px;cursor:pointer;font:inherit;font-size:11px}
-.hdr-btn:hover{border-color:var(--acc);color:var(--acc)}
-.hdr-btn.ok{border-color:var(--ok);color:var(--ok)}
-.hdr-btn.err{border-color:var(--err);color:var(--err)}
-
-/* TAB CONTENT */
-.tab-content{display:none;flex:1;overflow:hidden}
-.tab-content.active{display:flex}
-
-/* ═══ PIPELINE TAB ═══ */
-#tab-pipeline{flex-direction:row}
-#tab-direct{flex-direction:row}
-aside{width:310px;min-width:240px;border-right:1px solid var(--border);
-      background:rgba(7,11,16,.72);
-      display:flex;flex-direction:column;overflow:hidden;flex-shrink:0}
-.card{border-bottom:1px solid var(--border);padding:10px 12px;flex-shrink:0}
-.card h3{font-size:9px;text-transform:uppercase;letter-spacing:.12em;
-         color:var(--dim);margin-bottom:8px}
-.path-row{display:flex;gap:8px;margin-bottom:10px;align-items:center}
-.path-label{font-size:9px;font-weight:800;text-transform:uppercase;letter-spacing:.09em;
-            min-width:54px;padding:6px 6px;border-radius:4px;text-align:center;color:#120c04}
-.path-label.src{background:var(--acc2)}
-.path-label.out{background:var(--acc);color:#fff}
-/* readonly — Browse is the only way to set these, so they read as plain
-   text next to the button rather than an editable box */
-.path-input{flex:1;background:transparent;border:1px solid transparent;
-            color:var(--text);padding:7px 9px;border-radius:4px;cursor:default;
-            caret-color:transparent;user-select:text;
-            white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
-            font:inherit;font-size:12px;min-width:0;transition:border-color .15s,box-shadow .15s,background .15s}
-.path-input::placeholder{color:var(--dim)}
-.path-input:focus{outline:none;border-color:var(--acc2);box-shadow:0 0 0 2px rgba(224,165,58,.18);background:#1c1710}
-.path-input.active-target{border-color:var(--acc2)!important;box-shadow:0 0 0 2px rgba(224,165,58,.22);background:#1c1710}
-.btn-xs{background:var(--acc);border:none;color:#fff;padding:8px 14px;
-        border-radius:4px;cursor:pointer;font:inherit;font-size:11px;font-weight:700;white-space:nowrap}
-.btn-xs:hover{opacity:.82}
-.btn-xs.ghost{background:#1e1e30;color:var(--dim)}
-.btn-xs.ghost:hover{color:var(--text)}
-.btn-xs.ghost.active{background:#2a2a48;color:var(--acc)}
-.btn-xs.danger{background:var(--err)}
-.ff-conf{display:inline-block;padding:2px 7px;border-radius:3px;font-size:10px;font-weight:700}
-.ff-conf.hi{background:#2a0a0a;color:var(--err)}
-.ff-conf.mid{background:#2a2000;color:var(--warn)}
-.ff-conf.lo{background:#1e1e30;color:var(--dim)}
-.browser-target{display:flex;gap:5px;margin-bottom:6px}
-.bpath{font-size:10px;color:var(--dim);padding:0 0 5px;word-break:break-all}
-.browser-wrap{flex:1;overflow-y:auto}
-.be{display:flex;align-items:center;gap:5px;padding:3px 12px;cursor:pointer;user-select:none}
-.be:hover{background:#1a1a28}
-.be .ico{font-size:10px;color:var(--acc);width:14px;text-align:center}
-.be .nm{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:12px}
-.be .bbtns{display:none;gap:3px}
-.be:hover .bbtns{display:flex}
-.bbtn{font-size:9px;border:1px solid var(--border);background:none;color:var(--dim);
-      border-radius:2px;padding:1px 5px;cursor:pointer;white-space:nowrap}
-.bbtn:hover{border-color:var(--acc);color:var(--acc)}
-.bbtn.dest:hover{border-color:var(--acc2);color:var(--acc2)}
-.be-file .ico{color:var(--dim)}
-.be-up{color:var(--dim);font-size:11px}
-.be-up:hover{color:var(--text)}
-.prov-row{display:flex;align-items:center;gap:6px;margin-bottom:6px}
-.prov-row label{cursor:pointer;flex:1;font-size:12px}
-.prov-row input[type=checkbox]{accent-color:var(--acc);cursor:pointer}
-.prov-key{flex:2;background:#181824;border:1px solid var(--border);color:var(--text);
-          padding:3px 7px;border-radius:3px;font:inherit;font-size:11px}
-.prov-key:focus{outline:none;border-color:var(--acc)}
-.prov-key::placeholder{color:var(--dim)}
-.key-eye{background:none;border:none;color:var(--dim);cursor:pointer;padding:0 3px;font-size:12px}
-.key-eye:hover{color:var(--text)}
-.badge{font-size:9px;padding:1px 5px;border-radius:10px}
-.badge.set{background:#004020;color:var(--ok)}
-.badge.unset{background:#302000;color:var(--warn)}
-.log-area{flex:1;display:flex;flex-direction:column;overflow:hidden}
-.pipeline{padding:10px 14px 0;display:flex;align-items:center;gap:6px;flex-shrink:0;flex-wrap:wrap}
-.phase{display:flex;align-items:center;gap:6px;padding:5px 12px;
-       border:1px solid var(--border);border-radius:5px;font-size:11px;
-       color:var(--dim);transition:all .2s}
-.phase .dot{width:7px;height:7px;border-radius:50%;background:var(--dim)}
-.phase.running{border-color:var(--acc);color:var(--acc)}
-.phase.running .dot{background:var(--acc);animation:pulse 1s infinite}
-.phase.done{border-color:var(--ok);color:var(--ok)}
-.phase.done .dot{background:var(--ok)}
-.phase.stopped{border-color:var(--warn);color:var(--warn)}
-.phase.stopped .dot{background:var(--warn)}
-.phase-arrow{color:var(--dim);font-size:10px}
-@keyframes pulse{0%,100%{opacity:1}50%{opacity:.3}}
-.action-bar{padding:10px 14px;border-bottom:1px solid var(--border);
-            display:flex;align-items:center;gap:9px;flex-wrap:wrap;flex-shrink:0;margin-top:8px}
-.btn{background:var(--acc);border:none;color:#fff;padding:9px 18px;border-radius:4px;
-     cursor:pointer;font:inherit;font-size:13px;font-weight:600}
-.btn:hover:not(:disabled){opacity:.82}
-.btn:disabled{opacity:.35;cursor:not-allowed}
-.btn.run-all{background:linear-gradient(90deg,var(--acc),var(--acc2))}
-.btn.ghost{background:#1e1e30;color:var(--text);font-weight:400}
-.btn.danger{background:var(--err)}
-.btn.ok{background:#1a3a22;border:1px solid var(--ok);color:var(--ok)}
-.btn.warn{background:#2a2000;border:1px solid var(--warn);color:var(--warn)}
-.dry-label{display:flex;align-items:center;gap:5px;cursor:pointer;
-           font-size:11px;color:var(--warn);margin-left:4px;user-select:none}
-.dry-label input{accent-color:var(--warn);cursor:pointer}
-.progress-bar{height:2px;background:var(--border);flex-shrink:0}
-.progress-fill{height:100%;background:linear-gradient(90deg,var(--acc),var(--acc2));transition:width .25s}
-/* transparent while empty (wallpaper shows through, like the idle Pipeline
-   log), opaque as soon as there's actual output to keep it readable */
-.log{flex:1;overflow-y:auto;padding:7px 14px;font-size:12px;line-height:1.65}
-.log:not(:empty){background:rgba(7,11,16,.82)}
-.ll{display:flex;gap:8px}
-.ll .ts{color:var(--dim);min-width:56px}
-.ll .lv{min-width:60px;font-size:10px;text-align:right;opacity:.7}
-.ll .tx{word-break:break-all;flex:1}
-.ll.info .lv,.ll.info .tx{color:var(--info)}
-.ll.imported .lv,.ll.imported .tx{color:var(--ok)}
-.ll.warning .lv,.ll.warning .tx{color:var(--warn)}
-.ll.broken .lv,.ll.broken .tx{color:var(--err)}
-.ll.duplicate .lv,.ll.duplicate .tx{color:var(--dup)}
-.ll.debug .lv,.ll.debug .tx{color:var(--dim)}
-.ll.phase-hdr .tx{color:var(--acc2);font-weight:600;letter-spacing:.05em}
-.stat-bar{padding:4px 14px;border-top:1px solid var(--border);
-          font-size:11px;color:var(--dim);display:flex;gap:14px;flex-shrink:0}
-
-/* ═══ SHARED TABLE STYLES ═══ */
-.page-panel{flex:1;display:flex;flex-direction:column;overflow:hidden}
-.toolbar{padding:10px 14px;border-bottom:1px solid var(--border);
-         display:flex;align-items:center;gap:10px;flex-shrink:0;flex-wrap:wrap}
-.search-input{background:#181824;border:1px solid var(--border);color:var(--text);
-              padding:5px 10px;border-radius:3px;font:inherit;font-size:12px;width:220px}
-.search-input:focus{outline:none;border-color:var(--acc)}
-.filter-chips{display:flex;gap:4px}
-.chip{background:none;border:1px solid var(--border);color:var(--dim);
-      padding:3px 10px;border-radius:12px;cursor:pointer;font:inherit;font-size:11px}
-.chip:hover{border-color:var(--text);color:var(--text)}
-.chip.active{background:#1e1e30;border-color:var(--acc);color:var(--acc)}
-.stats-ribbon{padding:6px 14px;background:#0e0e1a;border-bottom:1px solid var(--border);
-              display:flex;gap:16px;flex-shrink:0;font-size:11px;flex-wrap:wrap}
-.stat-pill{display:flex;gap:5px;align-items:center}
-.stat-pill .val{color:var(--text);font-weight:600}
-.stat-pill .lbl{color:var(--dim)}
-.stat-pill.imp .val{color:var(--ok)}
-.stat-pill.brk .val{color:var(--err)}
-.stat-pill.dup .val{color:var(--dup)}
-.tbl-wrap{flex:1;overflow:auto;background:rgba(7,11,16,.72)}
-table{width:100%;border-collapse:collapse;font-size:12px}
-th{position:sticky;top:0;background:#0e0e1a;border-bottom:1px solid var(--border);
-   padding:6px 10px;text-align:left;font-size:10px;text-transform:uppercase;
-   letter-spacing:.08em;color:var(--dim);white-space:nowrap;cursor:pointer;user-select:none}
-th:hover{color:var(--text)}
-td{padding:5px 10px;border-bottom:1px solid #1a1a26;white-space:nowrap;
-   overflow:hidden;text-overflow:ellipsis;max-width:260px}
-tr:hover td{background:#16162200}
-tr:hover{background:#161622}
-.status-badge{font-size:10px;padding:1px 7px;border-radius:10px;font-weight:600}
-.status-badge.imported{background:#003818;color:var(--ok)}
-.status-badge.broken{background:#2a0a0a;color:var(--err)}
-.status-badge.duplicate{background:#1a0a2a;color:var(--dup)}
-.status-badge.indexed{background:#0a1a2a;color:var(--info)}
-.status-badge.unknown{background:#1a1a1a;color:var(--dim)}
-.pagination{padding:6px 14px;border-top:1px solid var(--border);
-            display:flex;align-items:center;gap:8px;flex-shrink:0;font-size:11px}
-.pagination span{color:var(--dim)}
-
-/* ═══ SESSION TAB ═══ */
-#tab-session{flex-direction:column}
-
-/* ═══ LIBRARY TAB ═══ */
-#tab-library{flex-direction:column}
-
-/* ═══ TOOLS TAB ═══ */
-#tab-tools{flex-direction:row;overflow:hidden}
-.tools-left{width:330px;min-width:240px;border-right:1px solid var(--border);
-            background:rgba(7,11,16,.72);
-            display:flex;flex-direction:column;overflow-y:auto;flex-shrink:0}
-.tool-card{padding:18px 18px 14px}
-.tool-card + .tool-card{border-top:1px solid var(--border)}
-.tool-card h3{font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.1em;
-              color:var(--acc2);margin-bottom:14px}
-.tool-btn{width:100%;background:#1e1e30;border:1px solid var(--border);
-          color:var(--text);padding:13px 16px;border-radius:5px;cursor:pointer;
-          font:inherit;font-size:13px;font-weight:600;text-align:left;margin-bottom:11px;
-          display:flex;align-items:center;gap:13px;transition:all .15s}
-.tool-btn:last-child{margin-bottom:0}
-.tool-btn:hover{border-color:var(--acc);color:var(--acc)}
-.tool-btn .tb-icon{font-size:17px;width:22px;text-align:center;flex-shrink:0}
-.tool-btn .tb-text{flex:1;line-height:1.5}
-.tool-btn .tb-hint{display:block;margin-top:2px;font-size:11px;font-weight:400;color:var(--dim)}
-.tool-btn:hover .tb-hint{color:var(--acc)}
-.tool-btn.danger:hover{border-color:var(--err);color:var(--err)}
-.tool-btn.commit-btn:hover{border-color:var(--ok);color:var(--ok)}
-.tools-right{flex:1;display:flex;flex-direction:column;overflow:hidden}
-.sql-area{flex:1;display:flex;flex-direction:column;padding:14px;gap:10px;overflow:hidden}
-.sql-area h3{font-size:10px;text-transform:uppercase;letter-spacing:.1em;color:var(--dim)}
-.sql-header{display:flex;align-items:center;gap:8px}
-.sql-db-sel{background:#181824;border:1px solid var(--border);color:var(--text);
-            padding:4px 8px;border-radius:3px;font:inherit;font-size:11px}
-textarea.sql-input{flex:0 0 100px;background:#181824;border:1px solid var(--border);
-                   color:var(--text);padding:8px;border-radius:3px;
-                   font:'JetBrains Mono',monospace;font-size:12px;resize:vertical}
-textarea.sql-input:focus{outline:none;border-color:var(--acc)}
-.sql-results{flex:1;overflow:auto;border:1px solid var(--border);border-radius:3px;
-             background:rgba(7,11,16,.72)}
-.sql-results table td,.sql-results table th{max-width:300px}
-.audit-panel{border-top:1px solid var(--border);flex-shrink:0;max-height:280px;overflow-y:auto}
-.audit-row{display:flex;align-items:center;gap:8px;padding:5px 14px;
-           border-bottom:1px solid #1a1a26;font-size:11px}
-.audit-row .ac{min-width:36px;text-align:right;font-weight:600;color:var(--warn)}
-.audit-row .ac.ok{color:var(--ok)}
-.audit-row .al{flex:1;color:var(--dim)}
-.audit-row.has-issues .al{color:var(--text)}
-
-/* ═══ DETAIL POPUP ═══ */
-.popup-overlay{position:fixed;inset:0;background:#00000088;z-index:100;
-               display:flex;align-items:center;justify-content:center}
-.popup-overlay.hidden{display:none}
-.popup{background:var(--panel);border:1px solid var(--border);border-radius:6px;
-       width:700px;max-width:95vw;max-height:80vh;display:flex;flex-direction:column}
-.popup-hdr{padding:12px 16px;border-bottom:1px solid var(--border);
-           display:flex;align-items:center;gap:8px}
-.popup-hdr h2{flex:1;font-size:13px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.popup-close{background:none;border:none;color:var(--dim);cursor:pointer;font-size:18px;
-             line-height:1;padding:0 4px}
-.popup-close:hover{color:var(--text)}
-.popup-body{overflow-y:auto;padding:12px 16px}
-.meta-grid{display:grid;grid-template-columns:140px 1fr;gap:4px 12px;font-size:12px}
-.meta-grid .mk{color:var(--dim);text-align:right;padding:2px 0}
-.meta-grid .mv{color:var(--text);word-break:break-all;padding:2px 0}
-.meta-grid .mv.ok{color:var(--ok)}
-.meta-grid .mv.err{color:var(--err)}
-.meta-grid .mv.warn{color:var(--warn)}
-
-/* ── telegram control panel ───────────────────────────────────────────── */
-/* .tab-content.active is display:flex, so this tab's children would sit in a
-   ROW and the grid would be squeezed to its minimum. Make it a column. */
-#tab-telegram.active{flex-direction:column;overflow:auto;padding:14px 16px 22px;gap:12px}
-.tg-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(400px,1fr));
-         gap:14px;align-items:start;width:100%}
-.tg-card{background:var(--card);border:1px solid var(--border);border-radius:8px;
-         padding:16px 16px 14px;display:flex;flex-direction:column;gap:10px}
-.tg-head{display:flex;align-items:center;gap:9px;border-bottom:1px solid var(--border);
-         padding-bottom:9px;margin-bottom:2px}
-.tg-head h3{margin:0;font-size:14px;font-weight:600;letter-spacing:.02em;flex:1}
-.tg-dot{width:8px;height:8px;border-radius:50%;background:var(--dim);flex:none}
-.tg-dot.on{background:#3fd07a;box-shadow:0 0 7px #3fd07a99}
-.tg-dot.off{background:#e0703f}
-.tg-state{font-size:10.5px;color:var(--dim);text-transform:uppercase;letter-spacing:.07em}
-
-.tg-switch{display:flex;align-items:center;gap:10px;cursor:pointer;user-select:none}
-.tg-switch input{position:absolute;opacity:0;width:0;height:0}
-.tg-track{width:42px;height:23px;border-radius:12px;background:#1b2733;
-          border:1px solid var(--border);position:relative;transition:background .18s;flex:none}
-.tg-knob{position:absolute;top:2px;left:2px;width:17px;height:17px;border-radius:50%;
-         background:var(--dim);transition:transform .18s,background .18s}
-.tg-switch input:checked + .tg-track{background:#12405c;border-color:var(--acc)}
-.tg-switch input:checked + .tg-track .tg-knob{transform:translateX(19px);background:var(--acc2)}
-.tg-switch input:focus-visible + .tg-track{outline:2px solid var(--acc);outline-offset:2px}
-.tg-switch-label{font-size:12.5px}
-
-.tg-note{font-size:10.5px;color:var(--dim);margin:0;line-height:1.5}
-.tg-bar{height:5px;background:#111a22;border-radius:3px;overflow:hidden}
-.tg-bar-fill{height:100%;width:0;background:linear-gradient(90deg,var(--acc),var(--acc2));
-             transition:width .4s}
-.tg-stats{display:grid;grid-template-columns:repeat(4,1fr);gap:1px;margin:0;
-          background:var(--border);border:1px solid var(--border);border-radius:5px;overflow:hidden}
-.tg-stats div{background:#0d141b;padding:7px 9px}
-.tg-stats dt{font-size:9.5px;color:var(--dim);text-transform:uppercase;letter-spacing:.06em;margin:0 0 2px}
-.tg-stats dd{margin:0;font-size:13px;font-weight:600;font-variant-numeric:tabular-nums}
-.tg-last{font-size:11px;color:var(--dim);margin:0;word-break:break-word}
-.tg-err{font-size:11px;color:#e0703f;margin:0;word-break:break-word}
-
-.tg-field{display:flex;flex-direction:column;gap:4px}
-.tg-field label{font-size:9.5px;color:var(--dim);text-transform:uppercase;letter-spacing:.07em}
-.tg-field input{background:#0b1118;border:1px solid var(--border);color:var(--text);
-                border-radius:5px;padding:8px 10px;font:inherit;font-size:12.5px}
-.tg-field input:focus{outline:none;border-color:var(--acc)}
-.tg-opts{display:flex;flex-wrap:wrap;gap:8px 16px;align-items:center;font-size:11.5px;color:var(--dim)}
-.tg-opts label{display:flex;align-items:center;gap:5px;cursor:pointer}
-.tg-num{display:flex;align-items:center;gap:5px}
-.tg-num input{width:74px;background:#0b1118;border:1px solid var(--border);color:var(--text);
-              border-radius:4px;padding:4px 7px;font:inherit;font-size:11.5px}
-.tg-row{display:flex;flex-wrap:wrap;gap:7px}
-.btn-xs.accent{background:#12405c;color:var(--acc2);border-color:var(--acc)}
-
-.tg-log{background:#070c11;border:1px solid var(--border);border-radius:5px;
-        padding:10px 11px;margin:0;font-size:11px;line-height:1.55;color:var(--dim);
-        max-height:190px;overflow:auto;white-space:pre;
-        font-family:ui-monospace,"Cascadia Mono","Consolas",monospace}
-/* tg-scraper prints aligned columns; wrapping them destroys the alignment, so
-   the box scrolls sideways instead. */
-.tg-log.tall{max-height:340px;min-height:170px}
-.tg-log:empty{display:none}
-.tg-paths{font-size:10px;color:var(--dim);margin:12px 2px 0;word-break:break-all}
-</style>
-</head>
-<body>
-<header>
-  <img class="brand-logo" src="/logo.png" alt="SeriousAboutSound" title="music-organiser">
-  <nav class="tabs">
-    <button class="tab-btn active" onclick="switchTab('pipeline')" title="Full pipeline — import, fetch tags, and organise into the library">Pipeline</button>
-    <button class="tab-btn" onclick="switchTab('direct')" title="Organise straight through, no database">Direct</button>
-    <button class="tab-btn" onclick="switchTab('session')" title="Browse the current import batch before committing it">Session</button>
-    <button class="tab-btn" onclick="switchTab('library')" title="Search and browse the full permanent library">Library</button>
-    <button class="tab-btn" onclick="switchTab('tools')" title="Database maintenance, audits, and ad-hoc SQL">Tools</button>
-    <button class="tab-btn" onclick="switchTab('telegram')" title="Control the Telegram scraper and the channel uploader">Telegram</button>
-    <button class="tab-btn" onclick="switchTab('fakeflac')" title="Scan for lossy-transcoded-into-FLAC files and inspect spectrograms">Fake-FLAC</button>
-  </nav>
-  <span id="hdr-status">idle</span>
-  <button class="hdr-btn" id="save-btn" onclick="saveConfig()" title="Write Source/Output paths and API keys to config.toml">Save config</button>
-  <button class="hdr-btn" id="restart-btn" onclick="restartService()" title="Restart the web_ui.py process">Restart service</button>
-</header>
-
-<!-- ═══════════════ PIPELINE TAB ═══════════════ -->
-<div id="tab-pipeline" class="tab-content active">
-<aside>
-  <div class="card">
-    <h3>Input / Output</h3>
-    <div class="path-row">
-      <span class="path-label src">Source</span>
-      <input class="path-input" id="src-in" readonly tabindex="-1" onfocus="setTimeout(()=>this.blur())" placeholder="not set" onclick="setActiveTarget('src')" title="Click to make this the active target for the filesystem browser below">
-      <button class="btn-xs" onclick="nativePick('src',this)" title="Choose the source folder with the system folder picker">📁 Browse</button>
-      <button class="btn-xs ghost" onclick="openInFileManager('src-in',this)" title="Show this folder in the file manager">↗ Open</button>
-    </div>
-    <div class="path-row">
-      <span class="path-label out">Output</span>
-      <input class="path-input" id="dest-in" readonly tabindex="-1" onfocus="setTimeout(()=>this.blur())" placeholder="not set" onclick="setActiveTarget('dest')" title="Click to make this the active target for the filesystem browser below">
-      <button class="btn-xs" onclick="nativePick('dest',this)" title="Choose the output folder with the system folder picker">📁 Browse</button>
-      <button class="btn-xs ghost" onclick="openInFileManager('dest-in',this)" title="Show this folder in the file manager">↗ Open</button>
-    </div>
-    <div style="display:flex;gap:5px;margin-top:4px">
-      <button class="btn-xs" style="flex:1" onclick="scanSource()" title="Count audio files in the source folder without importing anything">Scan source</button>
-      <span id="scan-result" style="font-size:10px;color:var(--dim);line-height:22px"></span>
-    </div>
-  </div>
-  <div class="card">
-    <h3>Providers &amp; API keys</h3>
-    <div id="prov-list"></div>
-  </div>
-  <div class="card" style="padding-bottom:5px;flex-shrink:0">
-    <h3>Filesystem browser</h3>
-    <div class="browser-target">
-      <button class="btn-xs ghost active" id="bt-src" onclick="activateBrowser('src')" title="Browse folders to fill in Source">▸ Source</button>
-      <button class="btn-xs ghost" id="bt-dest" onclick="activateBrowser('dest')" title="Browse folders to fill in Output">▸ Output</button>
-    </div>
-    <div class="bpath" id="b-path">/</div>
-  </div>
-  <div class="browser-wrap" id="browser"></div>
-</aside>
-
-<div class="log-area">
-  <div class="pipeline">
-    <div class="phase" id="ph-import"><span class="dot"></span>Import</div>
-    <span class="phase-arrow">→</span>
-    <div class="phase" id="ph-fetch"><span class="dot"></span>Fetch Tags</div>
-    <span class="phase-arrow">→</span>
-    <div class="phase" id="ph-organise"><span class="dot"></span>Organise</div>
-  </div>
-  <div class="action-bar">
-    <button class="btn run-all" id="btn-all"      onclick="run('pipeline')" title="Import → Fetch Tags → Organise, one after another">▶ Run All</button>
-    <button class="btn ghost"   id="btn-import"   onclick="run('import')" title="Copy/move files from Source into the session database">Import</button>
-    <button class="btn ghost"   id="btn-fetch"    onclick="run('fetch')" title="Look up missing metadata from the enabled providers">Fetch Tags</button>
-    <button class="btn ghost"   id="btn-organise" onclick="run('organise')" title="Move session files into their final Output location">Organise</button>
-    <button class="btn ghost"   onclick="clearLog()" title="Clear the log panel below">Clear log</button>
-    <button class="btn danger"  id="btn-stop" onclick="stopJob()" hidden title="Stop the running job">■ Stop</button>
-    <label class="dry-label" title="Preview what would happen without writing or moving anything"><input type="checkbox" id="dry-run"> dry run</label>
-  </div>
-  <div class="progress-bar"><div class="progress-fill" id="prog" style="width:0%"></div></div>
-  <div class="log" id="log"></div>
-  <div class="stat-bar">
-    <span id="s-imp">imported: —</span>
-    <span id="s-dup">duplicate: —</span>
-    <span id="s-bad">broken: —</span>
-    <span id="s-prog">0 / 0</span>
-    <span id="s-el">elapsed: —</span>
-  </div>
-</div>
-</div><!-- /pipeline -->
-
-<!-- ═══════════════ DIRECT TAB ═══════════════ -->
-<div id="tab-direct" class="tab-content">
-<aside>
-  <div class="card">
-    <h3>Direct mode — input / output, no database</h3>
-    <div class="path-row">
-      <span class="path-label src">Source</span>
-      <input class="path-input" id="direct-src-in" readonly tabindex="-1" onfocus="setTimeout(()=>this.blur())" placeholder="not set" onclick="setActiveTargetDirect('src')" title="Click to make this the active target for the filesystem browser below">
-      <button class="btn-xs" onclick="nativePickDirect('src',this)" title="Choose the source folder with the system folder picker">📁 Browse</button>
-      <button class="btn-xs ghost" onclick="openInFileManager('direct-src-in',this)" title="Show this folder in the file manager">↗ Open</button>
-    </div>
-    <div class="path-row">
-      <span class="path-label out">Output</span>
-      <input class="path-input" id="direct-dest-in" readonly tabindex="-1" onfocus="setTimeout(()=>this.blur())" placeholder="not set" onclick="setActiveTargetDirect('dest')" title="Click to make this the active target for the filesystem browser below">
-      <button class="btn-xs" onclick="nativePickDirect('dest',this)" title="Choose the output folder with the system folder picker">📁 Browse</button>
-      <button class="btn-xs ghost" onclick="openInFileManager('direct-dest-in',this)" title="Show this folder in the file manager">↗ Open</button>
-    </div>
-    <div style="display:flex;gap:5px;margin-top:4px">
-      <button class="btn-xs" style="flex:1" onclick="scanSourceDirect()" title="Count audio files in the source folder without organising anything">Scan source</button>
-      <span id="direct-scan-result" style="font-size:10px;color:var(--dim);line-height:22px"></span>
-    </div>
-    <p style="font-size:10px;color:var(--dim);margin-top:8px;line-height:1.4">
-      Fix + organise straight to disk — no session/library DB involved.
-      One shot: reads tags, looks up Discogs/MusicBrainz/etc for whatever's
-      missing, writes tags back to the files, then moves everything into
-      <code>(catalog#) Artist - Album (Year)/NN - Title.ext</code>.
-    </p>
-  </div>
-  <div class="card">
-    <h3>Providers &amp; API keys</h3>
-    <div id="direct-prov-list"></div>
-  </div>
-  <div class="card" style="padding-bottom:5px;flex-shrink:0">
-    <h3>Filesystem browser</h3>
-    <div class="browser-target">
-      <button class="btn-xs ghost active" id="direct-bt-src" onclick="activateBrowserDirect('src')" title="Browse folders to fill in Source">▸ Source</button>
-      <button class="btn-xs ghost" id="direct-bt-dest" onclick="activateBrowserDirect('dest')" title="Browse folders to fill in Output">▸ Output</button>
-    </div>
-    <div class="bpath" id="direct-b-path">/</div>
-  </div>
-  <div class="browser-wrap" id="direct-browser"></div>
-</aside>
-
-<div class="log-area">
-  <div class="action-bar">
-    <button class="btn run-all" id="direct-btn-all" onclick="runDirect()" title="Fetch tags and organise Source straight into Output, no database">▶ Run All</button>
-    <button class="btn ghost"   onclick="clearLogDirect()" title="Clear the log panel below">Clear log</button>
-    <button class="btn danger"  id="direct-btn-stop" onclick="stopJob()" hidden title="Stop the running job">■ Stop</button>
-    <label class="dry-label" title="Preview what would happen without writing or moving anything"><input type="checkbox" id="direct-dry-run"> dry run</label>
-  </div>
-  <div class="progress-bar"><div class="progress-fill" id="direct-prog" style="width:0%"></div></div>
-  <div class="log" id="direct-log"></div>
-  <div class="stat-bar">
-    <span id="direct-s-imp">imported: —</span>
-    <span id="direct-s-dup">duplicate: —</span>
-    <span id="direct-s-bad">broken: —</span>
-    <span id="direct-s-prog">0 / 0</span>
-    <span id="direct-s-el">elapsed: —</span>
-  </div>
-</div>
-</div><!-- /direct -->
-
-<!-- ═══════════════ SESSION TAB ═══════════════ -->
-<div id="tab-session" class="tab-content">
-<div class="page-panel">
-  <div class="stats-ribbon" id="sess-ribbon">
-    <span class="stat-pill"><span class="val" id="ss-total">—</span><span class="lbl">total</span></span>
-    <span class="stat-pill imp"><span class="val" id="ss-imp">—</span><span class="lbl">imported</span></span>
-    <span class="stat-pill brk"><span class="val" id="ss-brk">—</span><span class="lbl">broken</span></span>
-    <span class="stat-pill dup"><span class="val" id="ss-dup">—</span><span class="lbl">duplicate</span></span>
-  </div>
-  <div class="toolbar">
-    <input class="search-input" id="sess-search" placeholder="filter artist / album / title…" oninput="filterSession()">
-    <div class="filter-chips">
-      <button class="chip active" onclick="setSessFilter('all',this)" title="Show every file in this session">All</button>
-      <button class="chip" onclick="setSessFilter('imported',this)" title="Show only successfully imported files">Imported</button>
-      <button class="chip" onclick="setSessFilter('broken',this)" title="Show files that failed to process">Broken</button>
-      <button class="chip" onclick="setSessFilter('duplicate',this)" title="Show files skipped as duplicates">Duplicate</button>
-    </div>
-    <button class="btn ghost" onclick="loadSession()" style="margin-left:auto" title="Reload from the session database">↺ Refresh</button>
-    <button class="btn warn"  id="btn-refetch" onclick="refetchBroken()" hidden title="Retry ALL tags for files that came back broken">↺ Re-fetch broken</button>
-    <button class="btn ok"    id="btn-commit"  onclick="commitSession()" title="Merge this session's files into the permanent library.db">↑ Commit to library</button>
-  </div>
-  <div class="tbl-wrap">
-    <table id="sess-table">
-      <thead><tr>
-        <th onclick="sortSess('filename')">File</th>
-        <th onclick="sortSess('artist')">Artist</th>
-        <th onclick="sortSess('album')">Album</th>
-        <th onclick="sortSess('year')">Year</th>
-        <th onclick="sortSess('label')">Label</th>
-        <th onclick="sortSess('catalog_number')">Cat#</th>
-        <th onclick="sortSess('dur')">Dur</th>
-        <th onclick="sortSess('status')">Status</th>
-      </tr></thead>
-      <tbody id="sess-tbody"></tbody>
-    </table>
-  </div>
-</div>
-</div><!-- /session -->
-
-<!-- ═══════════════ LIBRARY TAB ═══════════════ -->
-<div id="tab-library" class="tab-content">
-<div class="page-panel">
-  <div class="stats-ribbon" id="lib-ribbon">
-    <span class="stat-pill"><span class="val" id="ls-total">—</span><span class="lbl">files</span></span>
-    <span class="stat-pill"><span class="val" id="ls-artists">—</span><span class="lbl">artists</span></span>
-    <span class="stat-pill"><span class="val" id="ls-labels">—</span><span class="lbl">labels</span></span>
-    <span class="stat-pill"><span class="val" id="ls-size">—</span><span class="lbl">GB</span></span>
-  </div>
-  <div class="toolbar">
-    <input class="search-input" id="lib-search" placeholder="search artist / album / title / label…"
-           oninput="debounceLibSearch()" style="width:300px">
-    <div class="filter-chips">
-      <button class="chip active" onclick="setLibFilter('',this)" title="Show every file">All</button>
-      <button class="chip" onclick="setLibFilter('imported',this)" title="Show only successfully imported files">Imported</button>
-      <button class="chip" onclick="setLibFilter('indexed',this)" title="Show files found by Rebuild index but not run through Import">Indexed</button>
-      <button class="chip" onclick="setLibFilter('broken',this)" title="Show files that failed to process">Broken</button>
-    </div>
-    <button class="btn ghost" onclick="loadLibrary(0)" style="margin-left:auto" title="Reload from library.db">↺ Refresh</button>
-  </div>
-  <div class="tbl-wrap">
-    <table id="lib-table">
-      <thead><tr>
-        <th>Artist</th>
-        <th>Album</th>
-        <th>Title</th>
-        <th>Year</th>
-        <th>Label</th>
-        <th>Cat#</th>
-        <th>Status</th>
-      </tr></thead>
-      <tbody id="lib-tbody"></tbody>
-    </table>
-  </div>
-  <div class="pagination">
-    <button class="btn-xs ghost" onclick="libPage(-1)" title="Previous page">← Prev</button>
-    <span id="lib-page-info">page 1 of 1</span>
-    <button class="btn-xs ghost" onclick="libPage(1)" title="Next page">Next →</button>
-    <span id="lib-count" style="margin-left:auto;color:var(--dim)"></span>
-  </div>
-</div>
-</div><!-- /library -->
-
-<!-- ═══════════════ TOOLS TAB ═══════════════ -->
-<div id="tab-tools" class="tab-content">
-<div class="tools-left">
-
-  <div class="tool-card">
-    <h3>Database</h3>
-    <button class="tool-btn" onclick="runTool('rebuild')" title="Walk the Output folder and rebuild library.db from what's actually on disk">
-      <span class="tb-icon">⟳</span>
-      <span class="tb-text">Rebuild index<br><span class="tb-hint">re-scan output → library.db</span></span>
-    </button>
-    <button class="tool-btn" onclick="runTool('vacuum')" title="Reclaim disk space and rebuild query statistics on library.db">
-      <span class="tb-icon">◎</span>
-      <span class="tb-text">Compact DB<br><span class="tb-hint">VACUUM + ANALYZE library.db</span></span>
-    </button>
-    <button class="tool-btn commit-btn" onclick="commitSession()" title="Merge this session's files into the permanent library.db">
-      <span class="tb-icon">↑</span>
-      <span class="tb-text">Commit session → library<br><span class="tb-hint">merge session DB into library.db</span></span>
-    </button>
-  </div>
-
-  <div class="tool-card">
-    <h3>Fix &amp; Rescue</h3>
-    <button class="tool-btn" onclick="runTool('fetch_broken')" title="Retry metadata lookup for every file in the session, not just the broken ones">
-      <span class="tb-icon">↺</span>
-      <span class="tb-text">Re-fetch broken<br><span class="tb-hint">retry ALL tags for session files</span></span>
-    </button>
-    <button class="tool-btn" onclick="run('organise')" title="Re-run the Organise step so files land at their current (possibly updated) target paths">
-      <span class="tb-icon">⇄</span>
-      <span class="tb-text">Re-organise session<br><span class="tb-hint">move files to updated paths</span></span>
-    </button>
-  </div>
-
-  <div class="tool-card">
-    <h3>Audit library.db</h3>
-    <button class="tool-btn" onclick="runAudits()" title="Run all 13 data-quality checks against library.db">
-      <span class="tb-icon">✓</span>
-      <span class="tb-text">Run all checks<br><span class="tb-hint">13 quality checks on library.db</span></span>
-    </button>
-    <div id="audit-results" style="margin-top:4px"></div>
-  </div>
-
-</div><!-- /tools-left -->
-
-<div class="tools-right">
-  <div class="sql-area">
-    <div class="sql-header">
-      <h3>SQL Query</h3>
-      <select class="sql-db-sel" id="sql-db">
-        <option value="library">library.db</option>
-        <option value="session">session.db</option>
-      </select>
-      <button class="btn-xs" onclick="runSQL()" title="Run the SELECT/WITH query above against the chosen database">▶ Run</button>
-      <button class="btn-xs ghost" onclick="document.getElementById('sql-input').value='SELECT artist, album, year, label, status FROM files ORDER BY artist LIMIT 50'" title="Fill the box with a sample query">example</button>
-      <span id="sql-status" style="font-size:11px;color:var(--dim);margin-left:auto"></span>
-    </div>
-    <textarea class="sql-input" id="sql-input" rows="5"
-      placeholder="SELECT artist, album, year, label, status FROM files ORDER BY artist LIMIT 50"></textarea>
-    <div class="sql-results tbl-wrap" id="sql-results">
-      <div style="padding:20px;color:var(--dim);font-size:12px">Run a SELECT query above to see results here.</div>
-    </div>
-  </div>
-</div><!-- /tools-right -->
-
-</div><!-- /tools -->
-
-<!-- ═══════════════ FAKE-FLAC TAB ═══════════════ -->
-<div id="tab-telegram" class="tab-content">
-
-  <div class="tg-grid">
-
-    <!-- ── OUTBOUND ───────────────────────────────────────────────── -->
-    <section class="tg-card">
-      <div class="tg-head">
-        <h3>Channel uploader</h3>
-        <span class="tg-dot" id="tg-up-dot"></span>
-        <span class="tg-state" id="tg-up-state">checking…</span>
-      </div>
-
-      <label class="tg-switch" title="Off writes the STOP latch; the run finishes its current release, then exits">
-        <input type="checkbox" id="tg-up-toggle" onchange="tgUploader(this.checked?'on':'off')">
-        <span class="tg-track"><span class="tg-knob"></span></span>
-        <span class="tg-switch-label">Posting to the channel</span>
-      </label>
-      <p class="tg-note" id="tg-up-note">Turning this off never kills a release mid-flight — state is only saved once every file lands.</p>
-
-      <div class="tg-bar"><div class="tg-bar-fill" id="tg-up-bar"></div></div>
-      <dl class="tg-stats">
-        <div><dt>Posted</dt><dd id="tg-up-posted">–</dd></div>
-        <div><dt>Files</dt><dd id="tg-up-files">–</dd></div>
-        <div><dt>Failed</dt><dd id="tg-up-failed">–</dd></div>
-        <div><dt>Drip task</dt><dd id="tg-up-task">–</dd></div>
-      </dl>
-      <p class="tg-last" id="tg-up-last"></p>
-      <p class="tg-err" id="tg-up-err" hidden></p>
-      <div class="tg-row">
-        <button class="btn-xs" onclick="tgUploader('retry')" title="Clear the failed list so the next run retries those releases">Retry failed</button>
-        <button class="btn-xs ghost" onclick="tgOpenUploadDir()">↗ Open folder</button>
-      </div>
-      <pre class="tg-log" id="tg-up-log"></pre>
-    </section>
-
-    <!-- ── INBOUND ────────────────────────────────────────────────── -->
-    <section class="tg-card">
-      <div class="tg-head">
-        <h3>Channel scraper</h3>
-        <span class="tg-dot" id="tg-job-dot"></span>
-        <span class="tg-state" id="tg-job-state">idle</span>
-      </div>
-
-      <div class="tg-field">
-        <label for="tg-channel">Channel</label>
-        <input id="tg-channel" type="text" placeholder="id, @username, or part of the name" spellcheck="false">
-      </div>
-      <p class="tg-note">Ambiguous names print the candidates instead of guessing — mining the wrong chat costs an evening.</p>
-
-      <div class="tg-opts">
-        <label title="List exactly what would be fetched, take nothing"><input type="checkbox" id="tg-dry" checked> Dry run</label>
-        <label title="Oldest messages first (default is newest first)"><input type="checkbox" id="tg-oldest"> Oldest first</label>
-        <label title="Also fetch archives whose NAME says lossless"><input type="checkbox" id="tg-arch"> Archives</label>
-      </div>
-      <div class="tg-opts">
-        <span class="tg-num"><label for="tg-limit">Limit</label><input id="tg-limit" type="number" min="1" placeholder="files"></span>
-        <span class="tg-num"><label for="tg-maxgb">Max GB</label><input id="tg-maxgb" type="number" min="0" step="0.5" placeholder="GB"></span>
-      </div>
-
-      <div class="tg-row">
-        <button class="btn-xs" onclick="tgRun('list')">List channels</button>
-        <button class="btn-xs" onclick="tgRun('scan')">Scan</button>
-        <button class="btn-xs accent" onclick="tgRun('download')">Download</button>
-        <button class="btn-xs ghost" id="tg-stop" onclick="tgStopJob()" disabled>Stop</button>
-      </div>
-      <pre class="tg-log tall" id="tg-job-log">Pick a channel and scan it.</pre>
-    </section>
-  </div>
-
-  <p class="tg-paths" id="tg-paths"></p>
-</div>
-
-<div id="tab-fakeflac" class="tab-content">
-<div class="page-panel">
-  <div class="path-row" style="padding:10px 14px 0">
-    <span class="path-label src">Folder</span>
-    <input class="path-input" id="ff-folder-in" readonly tabindex="-1" onfocus="setTimeout(()=>this.blur())" placeholder="not set — pick a folder to check it directly, no import needed" title="Click Browse, or pick from library.db/session.db below instead">
-    <button class="btn-xs" onclick="nativePickFakeflacFolder(this)" title="Choose a folder to scan directly — bypasses the database entirely">📁 Browse</button>
-    <button class="btn-xs ghost" onclick="openInFileManager('ff-folder-in',this)" title="Show this folder in the file manager">↗ Open</button>
-  </div>
-  <div class="toolbar">
-    <select class="sql-db-sel" id="ff-db" onchange="loadFakeflacSuspects(0)" title="Which set of files to scan/browse">
-      <option value="library">library.db</option>
-      <option value="session">session.db</option>
-      <option value="folder">picked folder</option>
-    </select>
-    <label style="font-size:11px;color:var(--dim);display:flex;align-items:center;gap:5px;margin-left:8px"
-           title="Re-check files that were already scanned, instead of skipping them">
-      <input type="checkbox" id="ff-force"> force re-check
-    </label>
-    <button class="btn" onclick="runFakeflacScan()" title="FFT spectral-cutoff scan — flags FLACs that look transcoded from a lossy source">▶ Scan for fake FLACs</button>
-    <button class="btn ghost" id="ff-vamp-btn" onclick="runFakeflacVamp()" disabled
-            title="checking availability…">⚛ Vamp-confirm suspects</button>
-    <button class="btn ghost" onclick="loadFakeflacSuspects(0)" style="margin-left:auto" title="Reload the suspects list">↺ Refresh</button>
-  </div>
-  <div class="tbl-wrap">
-    <table id="ff-table">
-      <thead><tr>
-        <th>File</th><th>Artist / Album</th><th>Cutoff</th><th>Confidence</th><th>Notes</th>
-      </tr></thead>
-      <tbody id="ff-tbody"></tbody>
-    </table>
-  </div>
-  <div class="pagination">
-    <button class="btn-xs ghost" onclick="ffPage(-1)" title="Previous page">← Prev</button>
-    <span id="ff-page-info">page 1 of 1</span>
-    <button class="btn-xs ghost" onclick="ffPage(1)" title="Next page">Next →</button>
-    <span id="ff-count" style="margin-left:auto;color:var(--dim)"></span>
-  </div>
-</div>
-</div><!-- /fakeflac -->
-
-<!-- ═══════════════ SPECTROGRAM POPUP ═══════════════ -->
-<div class="popup-overlay hidden" id="spec-overlay" onclick="closeSpec(event)">
-  <div class="popup" style="width:min(1280px,92vw)">
-    <div class="popup-hdr">
-      <h2 id="spec-title">Spectrogram</h2>
-      <button class="popup-close" onclick="closeSpecBtn()" title="Close">✕</button>
-    </div>
-    <div class="popup-body">
-      <div id="spec-meta" style="font-size:11px;color:var(--dim);margin-bottom:8px"></div>
-      <div id="spec-img-wrap" style="background:#000;border-radius:4px;min-height:120px;display:flex;align-items:center;justify-content:center">
-        <img id="spec-img" style="width:100%;display:block" src="" title="Time left→right, frequency bottom→top, brightness = energy. A hard ceiling well below the top means a lossy source.">
-      </div>
-      <div class="toolbar" style="margin-top:10px">
-        <a class="btn-xs" id="spec-save" download title="Download this spectrogram as a PNG file">⭳ Save PNG</a>
-        <button class="btn-xs ghost" onclick="copySpecLink()" title="Copy a direct link to this spectrogram image, for anyone else on the LAN">⎘ Copy link</button>
-        <span id="spec-copy-status" style="font-size:11px;color:var(--dim)"></span>
-        <span style="flex:1"></span>
-        <button class="btn-xs ghost" onclick="openFakeflacFolder(this)" title="Show this file in the file manager">↗ Open</button>
-        <button class="btn-xs ghost" onclick="ffAction('dismiss')" title="False positive — clear the suspected flag, leave the file where it is">✓ Dismiss (false positive)</button>
-        <button class="btn-xs ghost" onclick="ffAction('isolate')" title="Move this file into the Suspected Transcodes folder under Output">⇥ Isolate</button>
-        <button class="btn-xs danger" onclick="ffAction('delete')" title="Permanently delete this file — cannot be undone">✕ Delete</button>
-      </div>
-    </div>
-  </div>
-</div>
-
-<!-- ═══════════════ DETAIL POPUP ═══════════════ -->
-<div class="popup-overlay hidden" id="detail-overlay" onclick="closeDetail(event)">
-  <div class="popup">
-    <div class="popup-hdr">
-      <h2 id="detail-title">File detail</h2>
-      <button class="popup-close" onclick="closeDetailBtn()" title="Close">✕</button>
-    </div>
-    <div class="popup-body" id="detail-body"></div>
-  </div>
-</div>
-
-<!-- ═══════════════ TOOL LOG OVERLAY ═══════════════ -->
-<div class="popup-overlay hidden" id="tool-log-overlay" onclick="closeToolLog(event)">
-  <div class="popup" style="width:800px;max-height:70vh">
-    <div class="popup-hdr">
-      <h2 id="tool-log-title">Running…</h2>
-      <button class="popup-close" onclick="closeToolLogBtn()" title="Close">✕</button>
-    </div>
-    <div class="popup-body" style="padding:0">
-      <div class="log" id="tool-log" style="padding:10px 14px;min-height:200px;max-height:55vh;overflow-y:auto"></div>
-    </div>
-  </div>
-</div>
-
-<script>
-"use strict";
-
-// ── state ─────────────────────────────────────────────────────────────────────
-let provs=[], es=null, jobStart=0;
-let sessData=[], sessFilt='all', sessSort='status', sessSortAsc=true;
-let libPage_=0, libStatus_='', libQ_='', libDebounce=null;
-let toolLogES=null;
-
-// ── tab switching ─────────────────────────────────────────────────────────────
-
-// ── telegram control panel ───────────────────────────────────────────────────
-let tgSeq_=0, tgTimer_=null, tgBusy_=false;
-
-function tgOpts(){
-  const n=id=>{const v=document.getElementById(id).value.trim();return v?Number(v):0;};
-  return {dry_run:document.getElementById('tg-dry').checked,
-          oldest:document.getElementById('tg-oldest').checked,
-          archives:document.getElementById('tg-arch').checked,
-          limit:n('tg-limit'), max_gb:n('tg-maxgb')};
-}
-
-async function tgRun(mode){
-  const ch=document.getElementById('tg-channel').value.trim();
-  const body={mode:mode, channel:ch, opts:tgOpts()};
-  const log=document.getElementById('tg-job-log');
-  log.textContent='starting…';
-  try{
-    const r=await fetch('/api/tg/scraper',{method:'POST',headers:{'Content-Type':'application/json'},
-                                          body:JSON.stringify(body)});
-    const d=await r.json();
-    if(!d.ok){ log.textContent=d.reason||'could not start'; return; }
-    tgSeq_=0; tgPoll(true);
-  }catch(e){ log.textContent='request failed: '+e; }
-}
-
-async function tgStopJob(){
-  await fetch('/api/tg/scraper/stop',{method:'POST'});
-  tgPoll(true);
-}
-
-async function tgUploader(action){
-  const note=document.getElementById('tg-up-note');
-  try{
-    const r=await fetch('/api/tg/uploader',{method:'POST',headers:{'Content-Type':'application/json'},
-                                            body:JSON.stringify({action})});
-    const d=await r.json();
-    note.textContent=d.reason||'';
-    if(!d.ok) note.style.color='#e0703f'; else note.style.color='';
-  }catch(e){ note.textContent='request failed: '+e; }
-  tgPoll(true);
-}
-
-function tgOpenUploadDir(){
-  const p=(window.__tgUploadDir||'');
-  if(!p){ alert('The uploader folder is not configured on this machine.'); return; }
-  fetch('/api/open-folder?path='+encodeURIComponent(p))
-    .then(r=>r.json()).then(d=>{ if(!d.ok) alert('Cannot open: '+(d.reason||'failed')); });
-}
-
-function tgPaint(d){
-  // ---- uploader ----
-  const u=d.uploader||{}, dot=document.getElementById('tg-up-dot'),
-        st=document.getElementById('tg-up-state'), tog=document.getElementById('tg-up-toggle');
-  window.__tgUploadDir=u.dir||'';
-  dot.className='tg-dot '+(u.running?'on':(u.configured?'off':''));
-  if(!u.configured){ st.textContent='not on this machine'; tog.disabled=true; }
-  else{ st.textContent=u.running?'posting':(u.stopped_by_latch?'stopped':'idle'); tog.disabled=false; }
-  // reflect reality, but never fight the user mid-click
-  if(!tgBusy_) tog.checked = u.configured && !u.stopped_by_latch;
-
-  document.getElementById('tg-up-posted').textContent=(u.posted||0).toLocaleString();
-  document.getElementById('tg-up-files').textContent=(u.files||0).toLocaleString();
-  document.getElementById('tg-up-failed').textContent=(u.failed||0).toLocaleString();
-  document.getElementById('tg-up-task').textContent=u.task||'–';
-  const pct=(u.total&&u.posted)?Math.min(100,u.posted/(u.posted+u.total)*100):0;
-  document.getElementById('tg-up-bar').style.width=pct.toFixed(1)+'%';
-  document.getElementById('tg-up-last').textContent=u.last?('last: '+u.last):'';
-  const err=document.getElementById('tg-up-err');
-  err.hidden=!u.last_error; err.textContent=u.last_error||'';
-  const ul=document.getElementById('tg-up-log');
-  ul.textContent=(u.log_tail&&u.log_tail.length)?u.log_tail.join('\n'):'';
-
-  // ---- scraper job ----
-  const j=d.job||{};
-  document.getElementById('tg-job-dot').className='tg-dot '+(j.running?'on':'');
-  document.getElementById('tg-job-state').textContent=
-      j.running?(j.label||'running')+' · '+j.elapsed+'s'
-               :(j.rc===null||j.rc===undefined?'idle':'exit '+j.rc);
-  document.getElementById('tg-stop').disabled=!j.running;
-  if(j.lines&&j.lines.length){
-    const box=document.getElementById('tg-job-log');
-    const stick=box.scrollTop+box.clientHeight>=box.scrollHeight-24;
-    if(tgSeq_===0) box.textContent='';
-    box.textContent+=(box.textContent?'\n':'')+j.lines.join('\n');
-    if(stick) box.scrollTop=box.scrollHeight;
-  }
-  if(typeof j.seq==='number') tgSeq_=j.seq;
-
-  const pa=d.paths||{};
-  document.getElementById('tg-paths').textContent=
-    'scraper: '+(pa.scraper||'—')+(pa.scraper_ok?'':'  (NOT FOUND)')+
-    '   ·   uploader: '+(pa.upload_dir||'—')+
-    '   ·   host: '+(d.platform||'?');
-}
-
-async function tgPoll(force){
-  if(document.getElementById('tab-telegram')===null) return;
-  const visible=document.getElementById('tab-telegram').classList.contains('active');
-  if(!visible&&!force) return;
-  try{
-    const r=await fetch('/api/tg/status?since='+tgSeq_);
-    const d=await r.json();
-    if(d.ok===false){ document.getElementById('tg-paths').textContent=d.reason||''; return; }
-    tgPaint(d);
-  }catch(e){ /* transient; next tick retries */ }
-}
-
-function tgStartPolling(){
-  if(tgTimer_) return;
-  tgTimer_=setInterval(tgPoll,2000);
-  tgPoll(true);
-}
-document.addEventListener('DOMContentLoaded',tgStartPolling);
-// don't let the toggle flicker back while a click is in flight
-document.addEventListener('DOMContentLoaded',()=>{
-  const t=document.getElementById('tg-up-toggle');
-  if(t){ t.addEventListener('mousedown',()=>{tgBusy_=true;
-         setTimeout(()=>{tgBusy_=false;},1500);}); }
-});
-
-function switchTab(name){
-  document.querySelectorAll('.tab-content').forEach(el=>el.classList.remove('active'));
-  document.querySelectorAll('.tab-btn').forEach(el=>el.classList.remove('active'));
-  document.getElementById('tab-'+name).classList.add('active');
-  const btns=[...document.querySelectorAll('.tab-btn')];
-  const labels={pipeline:'Pipeline',direct:'Direct',session:'Session',library:'Library',
-                tools:'Tools',fakeflac:'Fake-FLAC'};
-  btns.forEach(b=>{ if(b.textContent===labels[name]) b.classList.add('active'); });
-  if(name==='session') loadSession();
-  if(name==='library'){ loadLibraryStats(); loadLibrary(0); }
-  if(name==='tools'){ loadLibraryStats(); }
-  if(name==='fakeflac'){ loadFakeflacSuspects(0); checkVampAvailable(); }
-}
-
-// ── init ─────────────────────────────────────────────────────────────────────
-async function init(){
-  const r=await fetch('/api/config'); const c=await r.json();
-  document.getElementById('src-in').value  = (c.sources||[])[0]||'';
-  document.getElementById('dest-in').value = c.destination_root||'';
-  document.getElementById('direct-src-in').value  = (c.sources||[])[0]||'';
-  document.getElementById('direct-dest-in').value = c.destination_root||'';
-  provs = c.providers||[];
-  renderProviders();
-  renderProvidersDirect();
-  browse(c.browse_root||'/');
-  browseDirect(c.browse_root||'/');
-}
-
-// ── providers ─────────────────────────────────────────────────────────────────
-function renderProviders(){
-  document.getElementById('prov-list').innerHTML = provs.map(p=>{
-    const badge = p.requires_auth
-      ? (p.has_key ? `<span class="badge set" title="${p.key_hint}">key ✓</span>`
-                   : `<span class="badge unset">no key</span>`) : '';
-    const keyInput = p.key_field ? `
-      <input class="prov-key" id="key-${p.id}" type="password"
-             placeholder="${p.has_key ? '(keep existing)' : 'paste key…'}">
-      <button class="key-eye" onclick="toggleKey('${p.id}')" title="Show/hide the key">👁</button>` : '';
-    return `<div class="prov-row">
-      <input type="checkbox" id="p-${p.id}" ${p.enabled?'checked':''}
-             onchange="setProv('${p.id}',this.checked)" title="Enable/disable this metadata provider">
-      <label for="p-${p.id}">${p.name||p.id}</label>
-      ${badge}${keyInput}
-    </div>`;
-  }).join('');
-}
-function toggleKey(id){ const el=document.getElementById('key-'+id); if(el) el.type=el.type==='password'?'text':'password'; }
-function setProv(id,on){
-  const p=provs.find(x=>x.id===id); if(p) p.enabled=on;
-  const dp=document.getElementById('dp-'+id); if(dp) dp.checked=on;
-  const pp=document.getElementById('p-'+id); if(pp) pp.checked=on;
-}
-function renderProvidersDirect(){
-  document.getElementById('direct-prov-list').innerHTML = provs.map(p=>`
-    <div class="prov-row">
-      <input type="checkbox" id="dp-${p.id}" ${p.enabled?'checked':''}
-             onchange="setProv('${p.id}',this.checked)">
-      <label for="dp-${p.id}">${p.name||p.id}</label>
-      ${p.requires_auth ? (p.has_key ? `<span class="badge set">key ✓</span>` : `<span class="badge unset">no key</span>`) : ''}
-    </div>`).join('');
-}
-
-// ── save config ───────────────────────────────────────────────────────────────
-async function saveConfig(){
-  const src=document.getElementById('src-in').value.trim();
-  const dest=document.getElementById('dest-in').value.trim();
-  const providerUpdates={};
-  for(const p of provs){
-    if(!p.key_field) continue;
-    const val=(document.getElementById('key-'+p.id)?.value||'').trim();
-    if(val) providerUpdates[p.id]={[p.key_field]:val};
-  }
-  const btn=document.getElementById('save-btn');
-  btn.textContent='Saving…';
-  const r=await fetch('/api/config/save',{method:'POST',
-    headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({paths:{sources:src?[src]:[],destination_root:dest},providers:providerUpdates})});
-  const j=await r.json();
-  if(j.ok){
-    btn.textContent='Saved ✓'; btn.className='hdr-btn ok';
-    setTimeout(()=>{btn.textContent='Save config';btn.className='hdr-btn';},2500);
-    const cr=await fetch('/api/config'); const cc=await cr.json();
-    provs=cc.providers||[]; renderProviders();
-    provs.forEach(p=>{ const el=document.getElementById('key-'+p.id); if(el) el.value=''; });
-  } else {
-    btn.textContent='Error'; btn.className='hdr-btn err';
-    setTimeout(()=>{btn.textContent='Save config';btn.className='hdr-btn';},3000);
-    appendLog('broken','config save: '+(j.error||'unknown'));
-  }
-}
-
-async function restartService(force){
-  const btn=document.getElementById('restart-btn');
-  if(!force && !confirm('Restart the music-organiser service now?'+
-      ' This drops your connection for a few seconds while it comes back up.')) return;
-  btn.textContent='Restarting…'; btn.disabled=true;
-  const r=await fetch('/api/restart',{method:'POST',
-    headers:{'Content-Type':'application/json'}, body:JSON.stringify({force:!!force})});
-  if(r.status===409){
-    btn.textContent='Restart service'; btn.disabled=false;
-    if(confirm('A job is currently running — restarting will interrupt it. Restart anyway?'))
-      return restartService(true);
-    return;
-  }
-  const j=await r.json().catch(()=>({}));
-  if(!r.ok || !j.ok){
-    btn.textContent='Error'; btn.className='hdr-btn err';
-    appendLog('broken','restart failed: '+(j.error||r.status));
-    setTimeout(()=>{btn.textContent='Restart service';btn.className='hdr-btn';btn.disabled=false;},3000);
-    return;
-  }
-  // Service is about to go down — poll /api/health until it's back, then reload the page.
-  let tries=0;
-  const poll=setInterval(async ()=>{
-    tries++;
-    try{
-      const hr=await fetch('/api/health',{cache:'no-store'});
-      if(hr.ok){ clearInterval(poll); location.reload(); return; }
-    }catch(e){ /* still down, keep polling */ }
-    btn.textContent='Restarting… ('+tries+'s)';
-    if(tries>60){ clearInterval(poll); btn.textContent='Still down?'; btn.className='hdr-btn err'; }
-  },1000);
-}
-
-// ── filesystem browser ────────────────────────────────────────────────────────
-let browserTarget_='src';
-function activateBrowser(t){
-  browserTarget_=t;
-  document.getElementById('src-in').classList.toggle('active-target',t==='src');
-  document.getElementById('dest-in').classList.toggle('active-target',t==='dest');
-  document.getElementById('bt-src').classList.toggle('active',t==='src');
-  document.getElementById('bt-dest').classList.toggle('active',t==='dest');
-}
-function setActiveTarget(t){ browserTarget_=t; activateBrowser(t); }
-async function browse(path){
-  document.getElementById('b-path').textContent=path;
-  const r=await fetch('/api/browse?path='+encodeURIComponent(path));
-  const d=await r.json();
-  let html='';
-  if(d.parent)
-    html+=`<div class="be be-up" onclick="browse(${J(d.parent)})"><span class="ico">▲</span><span class="nm">..</span></div>`;
-  for(const e of d.entries){
-    if(e.is_dir){
-      html+=`<div class="be"><span class="ico">▶</span>
-        <span class="nm" onclick="browse(${J(e.path)})">${e.name}</span>
-        <span class="bbtns">
-          <button class="bbtn" onclick="pickFolder(${J(e.path)},'src')">src</button>
-          <button class="bbtn dest" onclick="pickFolder(${J(e.path)},'dest')">dest</button>
-        </span></div>`;
-    } else {
-      html+=`<div class="be be-file"><span class="ico">·</span><span class="nm">${e.name}</span></div>`;
-    }
-  }
-  document.getElementById('browser').innerHTML=html||'<div style="padding:8px 12px;color:var(--dim);font-size:11px">(empty)</div>';
-}
-function pickFolder(path,target){
-  document.getElementById(target==='src'?'src-in':'dest-in').value=path;
-  activateBrowser(target);
-  if(target==='src') scanSource();
-}
-// ── show a folder in the desktop file manager ────────────────────────────────
-// Explorer on Windows, Finder on macOS, xdg-open on Linux. Same desktop caveat
-// as the picker: it draws on the SERVER's desktop, so from another machine the
-// button just reports that and does nothing.
-async function openInFileManager(inputId,btn){
-  const inp=document.getElementById(inputId);
-  const path=(inp&&inp.value||'').trim();
-  if(!path){ alert('Pick a folder first'); return; }
-  const label=btn?btn.textContent:'';
-  if(btn){ btn.disabled=true; btn.textContent='…'; }
-  try{
-    const r=await fetch('/api/open-folder?path='+encodeURIComponent(path));
-    const d=await r.json();
-    if(!d.ok) alert('Cannot open folder: '+(d.reason||'failed'));
-  }catch(e){ alert('Cannot open folder'); }
-  finally{ if(btn){ btn.disabled=false; btn.textContent=label; } }
-}
-// ── native folder picker ──────────────────────────────────────────────────────
-// Opens a real GTK folder chooser on this machine's own desktop. If there's no
-// display to draw on (you're on another machine), fall back to the in-page tree.
-async function nativePick(target,btn){
-  const inp=document.getElementById(target==='src'?'src-in':'dest-in');
-  if(btn) btn.disabled=true;
-  try{
-    const r=await fetch('/api/pick-folder?start='+encodeURIComponent(inp.value||''));
-    const d=await r.json();
-    if(d.ok&&d.path){
-      inp.value=d.path; activateBrowser(target);
-      if(target==='src') scanSource();
-    } else if(d.reason!=='cancelled'){
-      activateBrowser(target); browse(inp.value||'/');
-    }
-  }catch(e){ activateBrowser(target); }
-  finally{ if(btn) btn.disabled=false; }
-}
-async function nativePickDirect(target,btn){
-  const inp=document.getElementById(target==='src'?'direct-src-in':'direct-dest-in');
-  if(btn) btn.disabled=true;
-  try{
-    const r=await fetch('/api/pick-folder?start='+encodeURIComponent(inp.value||''));
-    const d=await r.json();
-    if(d.ok&&d.path){
-      inp.value=d.path; activateBrowserDirect(target);
-      if(target==='src') scanSourceDirect();
-    } else if(d.reason!=='cancelled'){
-      activateBrowserDirect(target); browseDirect(inp.value||'/');
-    }
-  }catch(e){ activateBrowserDirect(target); }
-  finally{ if(btn) btn.disabled=false; }
-}
-async function scanSource(){
-  const p=document.getElementById('src-in').value.trim(); if(!p)return;
-  document.getElementById('scan-result').textContent='scanning…';
-  const r=await fetch('/api/scan?path='+encodeURIComponent(p));
-  const d=await r.json();
-  document.getElementById('scan-result').textContent=
-    d.error?d.error:d.count.toLocaleString()+' files';
-}
-function J(s){ return JSON.stringify(s); }
-
-// ── pipeline jobs ─────────────────────────────────────────────────────────────
-function getJobBody(){
-  return {
-    sources:[document.getElementById('src-in').value.trim()].filter(Boolean),
-    dest:document.getElementById('dest-in').value.trim(),
-    providers:provs.filter(p=>p.enabled).map(p=>p.id),
-    dry_run:document.getElementById('dry-run').checked,
-  };
-}
-async function run(kind){
-  const body=getJobBody();
-  if(body.dry_run) appendLog('warning','DRY RUN — '+kind+': nothing will be written');
-  const r=await fetch('/api/job/'+kind,{method:'POST',
-    headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
-  const j=await r.json();
-  if(j.error){ appendLog('broken',j.error); return; }
-  setRunning(true,kind); jobStart=Date.now();
-  if(es) es.close();
-  es=new EventSource('/api/job/stream');
-  es.onmessage=e=>{
-    const m=JSON.parse(e.data);
-    if(m.type==='log')      appendLog(m.level,m.text);
-    else if(m.type==='progress') onProgress(m);
-    else if(m.type==='phase')    onPhase(m);
-    else if(m.type==='done'){
-      setRunning(false,kind); es.close(); es=null;
-      if(kind==='import'||kind==='pipeline'||kind==='fetch'||kind==='organise')
-        setTimeout(loadSession,500);
-    }
-  };
-  es.onerror=()=>{ setRunning(false,kind); if(es){es.close();es=null;} };
-}
-async function stopJob(){ await fetch('/api/job/stop',{method:'POST'}); }
-
-const ACTION_BTNS=['btn-all','btn-import','btn-fetch','btn-organise'];
-function setRunning(on,kind){
-  ACTION_BTNS.forEach(id=>{ document.getElementById(id).disabled=on; });
-  document.getElementById('btn-stop').hidden=!on;
-  const s=document.getElementById('hdr-status');
-  s.textContent=on?'● '+kind:'idle'; s.style.color=on?'var(--ok)':'var(--dim)';
-  if(!on){
-    document.getElementById('prog').style.width='0%';
-    ['import','fetch','organise'].forEach(p=>{
-      const el=document.getElementById('ph-'+p);
-      if(el&&el.classList.contains('running')) el.className='phase';
-    });
-  }
-}
-function onProgress(m){
-  const pct=m.total>0?(m.done/m.total*100).toFixed(1):0;
-  document.getElementById('prog').style.width=pct+'%';
-  if(m.imported!==undefined) document.getElementById('s-imp').textContent='imported: '+m.imported.toLocaleString();
-  if(m.duplicate!==undefined) document.getElementById('s-dup').textContent='duplicate: '+m.duplicate.toLocaleString();
-  if(m.broken!==undefined) document.getElementById('s-bad').textContent='broken: '+m.broken.toLocaleString();
-  document.getElementById('s-prog').textContent=m.done.toLocaleString()+' / '+m.total.toLocaleString();
-  document.getElementById('s-el').textContent='elapsed: '+Math.round((Date.now()-jobStart)/1000)+'s';
-}
-function onPhase(m){
-  const el=document.getElementById('ph-'+m.phase); if(!el) return;
-  el.className='phase '+(m.status||'');
-  if(m.status==='running')
-    appendLog('phase-hdr','── '+m.phase.toUpperCase()+' ──────────────────────');
-}
-function appendLog(level,text){
-  const el=document.getElementById('log');
-  const ts=new Date().toTimeString().slice(0,8);
-  const div=document.createElement('div');
-  div.className='ll '+(level||'info');
-  div.innerHTML=`<span class="ts">${ts}</span><span class="lv">${level}</span><span class="tx">${esc(text)}</span>`;
-  el.appendChild(div); el.scrollTop=el.scrollHeight;
-}
-function clearLog(){ document.getElementById('log').innerHTML=''; }
-function esc(s){ return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
-
-// ── direct mode (no database — folder in, folder out) ──────────────────────────
-let browserTargetDirect_='src';
-let esDirect=null, jobStartDirect=0;
-function activateBrowserDirect(t){
-  browserTargetDirect_=t;
-  document.getElementById('direct-src-in').classList.toggle('active-target',t==='src');
-  document.getElementById('direct-dest-in').classList.toggle('active-target',t==='dest');
-  document.getElementById('direct-bt-src').classList.toggle('active',t==='src');
-  document.getElementById('direct-bt-dest').classList.toggle('active',t==='dest');
-}
-function setActiveTargetDirect(t){ browserTargetDirect_=t; activateBrowserDirect(t); }
-async function browseDirect(path){
-  document.getElementById('direct-b-path').textContent=path;
-  const r=await fetch('/api/browse?path='+encodeURIComponent(path));
-  const d=await r.json();
-  let html='';
-  if(d.parent)
-    html+=`<div class="be be-up" onclick="browseDirect(${J(d.parent)})"><span class="ico">▲</span><span class="nm">..</span></div>`;
-  for(const e of d.entries){
-    if(e.is_dir){
-      html+=`<div class="be"><span class="ico">▶</span>
-        <span class="nm" onclick="browseDirect(${J(e.path)})">${e.name}</span>
-        <span class="bbtns">
-          <button class="bbtn" onclick="pickFolderDirect(${J(e.path)},'src')">src</button>
-          <button class="bbtn dest" onclick="pickFolderDirect(${J(e.path)},'dest')">dest</button>
-        </span></div>`;
-    } else {
-      html+=`<div class="be be-file"><span class="ico">·</span><span class="nm">${e.name}</span></div>`;
-    }
-  }
-  document.getElementById('direct-browser').innerHTML=html||'<div style="padding:8px 12px;color:var(--dim);font-size:11px">(empty)</div>';
-}
-function pickFolderDirect(path,target){
-  document.getElementById(target==='src'?'direct-src-in':'direct-dest-in').value=path;
-  activateBrowserDirect(target);
-  if(target==='src') scanSourceDirect();
-}
-async function scanSourceDirect(){
-  const p=document.getElementById('direct-src-in').value.trim(); if(!p)return;
-  document.getElementById('direct-scan-result').textContent='scanning…';
-  const r=await fetch('/api/scan?path='+encodeURIComponent(p));
-  const d=await r.json();
-  document.getElementById('direct-scan-result').textContent=
-    d.error?d.error:d.count.toLocaleString()+' files';
-}
-async function runDirect(){
-  const body={
-    sources:[document.getElementById('direct-src-in').value.trim()].filter(Boolean),
-    dest:document.getElementById('direct-dest-in').value.trim(),
-    providers:provs.filter(p=>p.enabled).map(p=>p.id),
-    dry_run:document.getElementById('direct-dry-run').checked,
-  };
-  if(!body.sources.length){ appendLogDirect('broken','set a source folder first'); return; }
-  if(!body.dest){ appendLogDirect('broken','set an output folder first'); return; }
-  if(body.dry_run) appendLogDirect('warning','DRY RUN — nothing will be written');
-  const r=await fetch('/api/job/direct',{method:'POST',
-    headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
-  const j=await r.json();
-  if(j.error){ appendLogDirect('broken',j.error); return; }
-  setRunningDirect(true); jobStartDirect=Date.now();
-  if(esDirect) esDirect.close();
-  esDirect=new EventSource('/api/job/stream');
-  esDirect.onmessage=e=>{
-    const m=JSON.parse(e.data);
-    if(m.type==='log')      appendLogDirect(m.level,m.text);
-    else if(m.type==='progress') onProgressDirect(m);
-    else if(m.type==='done'){ setRunningDirect(false); esDirect.close(); esDirect=null; }
-  };
-  esDirect.onerror=()=>{ setRunningDirect(false); if(esDirect){esDirect.close();esDirect=null;} };
-}
-function setRunningDirect(on){
-  document.getElementById('direct-btn-all').disabled=on;
-  document.getElementById('direct-btn-stop').hidden=!on;
-  if(!on) document.getElementById('direct-prog').style.width='0%';
-}
-function onProgressDirect(m){
-  const pct=m.total>0?(m.done/m.total*100).toFixed(1):0;
-  document.getElementById('direct-prog').style.width=pct+'%';
-  if(m.imported!==undefined) document.getElementById('direct-s-imp').textContent='imported: '+m.imported.toLocaleString();
-  if(m.duplicate!==undefined) document.getElementById('direct-s-dup').textContent='duplicate: '+m.duplicate.toLocaleString();
-  if(m.broken!==undefined) document.getElementById('direct-s-bad').textContent='broken: '+m.broken.toLocaleString();
-  document.getElementById('direct-s-prog').textContent=m.done.toLocaleString()+' / '+m.total.toLocaleString();
-  document.getElementById('direct-s-el').textContent='elapsed: '+Math.round((Date.now()-jobStartDirect)/1000)+'s';
-}
-function appendLogDirect(level,text){
-  const el=document.getElementById('direct-log');
-  const ts=new Date().toTimeString().slice(0,8);
-  const div=document.createElement('div');
-  div.className='ll '+(level||'info');
-  div.innerHTML=`<span class="ts">${ts}</span><span class="lv">${level}</span><span class="tx">${esc(text)}</span>`;
-  el.appendChild(div); el.scrollTop=el.scrollHeight;
-}
-function clearLogDirect(){ document.getElementById('direct-log').innerHTML=''; }
-
-// ── session tab ───────────────────────────────────────────────────────────────
-async function loadSession(){
-  const r=await fetch('/api/session/files');
-  const d=await r.json();
-  sessData=d.files||[];
-  const st=d.stats||{};
-  document.getElementById('ss-total').textContent=(st.total||0).toLocaleString();
-  document.getElementById('ss-imp').textContent=(st.imported||0).toLocaleString();
-  document.getElementById('ss-brk').textContent=(st.broken||0).toLocaleString();
-  document.getElementById('ss-dup').textContent=(st.duplicate||0).toLocaleString();
-  const nb=document.getElementById('btn-refetch');
-  nb.hidden=!(st.broken>0);
-  nb.textContent='↺ Re-fetch broken ('+st.broken+')';
-  renderSession();
-}
-function setSessFilter(f,btn){
-  sessFilt=f;
-  document.querySelectorAll('#tab-session .chip').forEach(c=>c.classList.remove('active'));
-  btn.classList.add('active');
-  renderSession();
-}
-function sortSess(col){
-  if(sessSort===col) sessSortAsc=!sessSortAsc;
-  else { sessSort=col; sessSortAsc=true; }
-  renderSession();
-}
-function filterSession(){ renderSession(); }
-function renderSession(){
-  const q=(document.getElementById('sess-search').value||'').toLowerCase();
-  let rows=sessData.filter(r=>{
-    if(sessFilt!=='all'&&r.status!==sessFilt) return false;
-    if(!q) return true;
-    return (r.artist||'').toLowerCase().includes(q)||
-           (r.album||'').toLowerCase().includes(q)||
-           (r.title||'').toLowerCase().includes(q)||
-           (r.filename||'').toLowerCase().includes(q);
-  });
-  rows.sort((a,b)=>{
-    let av=a[sessSort]||'', bv=b[sessSort]||'';
-    return sessSortAsc?(av<bv?-1:av>bv?1:0):(av<bv?1:av>bv?-1:0);
-  });
-  const COLS=['filename','artist','album','year','label','catalog_number','dur','status'];
-  document.getElementById('sess-tbody').innerHTML=rows.map((r,i)=>`
-    <tr onclick="showDetail(sessData,${sessData.indexOf(r)})" style="cursor:pointer">
-      <td title="${esc(r.path||'')}">${esc(r.filename||'')}</td>
-      <td>${esc(r.artist||'')}</td>
-      <td>${esc(r.album||'')}</td>
-      <td>${esc(r.year||'')}</td>
-      <td>${esc(r.label||'')}</td>
-      <td>${esc(r.catalog_number||'')}</td>
-      <td>${esc(r.dur||'')}</td>
-      <td><span class="status-badge ${r.status||'unknown'}">${r.status||'?'}</span></td>
-    </tr>`).join('');
-}
-async function refetchBroken(){
-  const body={
-    sources:[document.getElementById('src-in').value.trim()].filter(Boolean),
-    dest:document.getElementById('dest-in').value.trim(),
-    providers:provs.filter(p=>p.enabled).map(p=>p.id),
-    dry_run:false,
-  };
-  openToolLog('Re-fetching broken files…');
-  const r=await fetch('/api/job/fetch_broken',{method:'POST',
-    headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
-  const j=await r.json();
-  if(j.error){ appendToolLog('broken',j.error); return; }
-  startToolStream(()=>{ loadSession(); });
-}
-async function commitSession(){
-  const r=await fetch('/api/commit',{method:'POST'});
-  const j=await r.json();
-  if(j.error){ alert('Commit failed: '+j.error); return; }
-  alert(`✓ Committed — library.db: ${j.before.toLocaleString()} → ${j.after.toLocaleString()} files (+${j.delta})`);
-}
-
-// ── library tab ───────────────────────────────────────────────────────────────
-async function loadLibraryStats(){
-  const r=await fetch('/api/library/stats');
-  const d=await r.json();
-  const lib=d.library||{};
-  document.getElementById('ls-total').textContent=(lib.total||0).toLocaleString();
-  document.getElementById('ls-artists').textContent=(lib.artists||0).toLocaleString();
-  document.getElementById('ls-labels').textContent=(lib.labels||0).toLocaleString();
-  document.getElementById('ls-size').textContent=(lib.size_gb||0).toFixed(1);
-}
-function setLibFilter(s,btn){
-  libStatus_=s; libPage_=0;
-  document.querySelectorAll('#tab-library .chip').forEach(c=>c.classList.remove('active'));
-  btn.classList.add('active');
-  loadLibrary(0);
-}
-function debounceLibSearch(){
-  clearTimeout(libDebounce);
-  libDebounce=setTimeout(()=>{ libQ_=document.getElementById('lib-search').value.trim(); libPage_=0; loadLibrary(0); },300);
-}
-function libPage(dir){
-  const newPage=libPage_+dir;
-  if(newPage<0) return;
-  loadLibrary(newPage);
-}
-async function loadLibrary(page){
-  libPage_=page;
-  const params=new URLSearchParams({db:'library',q:libQ_,status:libStatus_,page,per_page:50});
-  const r=await fetch('/api/library/files?'+params);
-  const d=await r.json();
-  document.getElementById('lib-page-info').textContent=`page ${(d.page||0)+1} of ${d.pages||1}`;
-  document.getElementById('lib-count').textContent=`${(d.total||0).toLocaleString()} total`;
-  document.getElementById('lib-tbody').innerHTML=(d.files||[]).map((r,i)=>`
-    <tr onclick="showDetail(null,null,${J(r)})" style="cursor:pointer">
-      <td>${esc(r.artist||'')}</td>
-      <td>${esc(r.album||'')}</td>
-      <td>${esc(r.title||'')}</td>
-      <td>${esc(r.year||'')}</td>
-      <td>${esc(r.label||'')}</td>
-      <td>${esc(r.catalog_number||'')}</td>
-      <td><span class="status-badge ${r.status||'unknown'}">${r.status||'?'}</span></td>
-    </tr>`).join('');
-}
-
-// ── tools tab ─────────────────────────────────────────────────────────────────
-async function runTool(kind){
-  const body={
-    sources:[document.getElementById('src-in').value.trim()].filter(Boolean),
-    dest:document.getElementById('dest-in').value.trim(),
-    providers:provs.filter(p=>p.enabled).map(p=>p.id),
-    dry_run:false,
-  };
-  const labels={rebuild:'Rebuilding library index…',vacuum:'Compacting library DB…',
-                fetch_broken:'Re-fetching broken files…'};
-  openToolLog(labels[kind]||kind+'…');
-  const r=await fetch('/api/job/'+kind,{method:'POST',
-    headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
-  const j=await r.json();
-  if(j.error){ appendToolLog('broken',j.error); return; }
-  startToolStream(()=>{
-    if(kind==='rebuild') loadLibraryStats();
-    if(kind==='fetch_broken') loadSession();
-  });
-}
-
-async function runAudits(){
-  const resultEl=document.getElementById('audit-results');
-  resultEl.innerHTML='<div style="color:var(--dim);font-size:11px;padding:4px 0">running…</div>';
-  const r=await fetch('/api/library/audits');
-  const d=await r.json();
-  if(d.error){ resultEl.innerHTML=`<div style="color:var(--err);font-size:11px">${esc(d.error)}</div>`; return; }
-  const rows=(d.audits||[]).map(a=>`
-    <div class="audit-row ${a.count>0?'has-issues':''}">
-      <span class="ac ${a.count===0?'ok':''}">${a.count}</span>
-      <span class="al">${esc(a.label)}</span>
-    </div>`).join('');
-  resultEl.innerHTML=`<div style="font-size:10px;color:var(--dim);padding:4px 0">
-    ${d.total_issues} total issues</div>${rows}`;
-}
-
-async function runSQL(){
-  const sql=document.getElementById('sql-input').value.trim();
-  const db=document.getElementById('sql-db').value;
-  const stat=document.getElementById('sql-status');
-  const results=document.getElementById('sql-results');
-  if(!sql){ stat.textContent='empty'; return; }
-  stat.textContent='running…'; results.innerHTML='';
-  const r=await fetch('/api/library/sql',{method:'POST',
-    headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({sql,db})});
-  const d=await r.json();
-  if(d.error){ stat.textContent='error'; results.innerHTML=`<div style="padding:12px;color:var(--err);font-size:12px">${esc(d.error)}</div>`; return; }
-  stat.textContent=`${d.count} rows`;
-  if(!d.rows||!d.rows.length){ results.innerHTML='<div style="padding:12px;color:var(--dim);font-size:12px">no rows</div>'; return; }
-  const cols=d.cols||Object.keys(d.rows[0]);
-  results.innerHTML=`<table>
-    <thead><tr>${cols.map(c=>`<th>${esc(c)}</th>`).join('')}</tr></thead>
-    <tbody>${d.rows.map(row=>`<tr>${cols.map(c=>`<td title="${esc(String(row[c]||''))}">${esc(String(row[c]||''))}</td>`).join('')}</tr>`).join('')}</tbody>
-  </table>`;
-}
-
-// ── tool log overlay ──────────────────────────────────────────────────────────
-function openToolLog(title){
-  document.getElementById('tool-log-title').textContent=title;
-  document.getElementById('tool-log').innerHTML='';
-  document.getElementById('tool-log-overlay').classList.remove('hidden');
-}
-function closeToolLog(e){ if(e.target.id==='tool-log-overlay') closeToolLogBtn(); }
-function closeToolLogBtn(){
-  document.getElementById('tool-log-overlay').classList.add('hidden');
-  if(toolLogES){ toolLogES.close(); toolLogES=null; }
-}
-function appendToolLog(level,text){
-  const el=document.getElementById('tool-log');
-  const div=document.createElement('div');
-  div.className='ll '+(level||'info');
-  const ts=new Date().toTimeString().slice(0,8);
-  div.innerHTML=`<span class="ts">${ts}</span><span class="lv">${level}</span><span class="tx">${esc(text)}</span>`;
-  el.appendChild(div); el.scrollTop=el.scrollHeight;
-}
-function startToolStream(onDone){
-  if(toolLogES) toolLogES.close();
-  toolLogES=new EventSource('/api/job/stream');
-  toolLogES.onmessage=e=>{
-    const m=JSON.parse(e.data);
-    if(m.type==='log') appendToolLog(m.level,m.text);
-    else if(m.type==='done'){
-      toolLogES.close(); toolLogES=null;
-      document.getElementById('tool-log-title').textContent='Done';
-      if(onDone) onDone();
-    }
-  };
-  toolLogES.onerror=()=>{ if(toolLogES){toolLogES.close();toolLogES=null;} };
-}
-
-// ── fake-flac tab ────────────────────────────────────────────────────────────
-let ffPage_=0, ffRows_=[], ffCurrent_=null;
-
-async function checkVampAvailable(){
-  const btn=document.getElementById('ff-vamp-btn');
-  try{
-    const r=await fetch('/api/fakeflac/vamp-available');
-    const d=await r.json();
-    btn.disabled=!d.available;
-    btn.title=d.available
-      ? 'run sonic-annotator + the Vamp CNN plugin on all suspects'
-      : 'sonic-annotator not found on this machine';
-  }catch(e){ btn.disabled=true; }
-}
-
-async function loadFakeflacSuspects(page){
-  ffPage_=page;
-  const db=document.getElementById('ff-db').value;
-  const params=new URLSearchParams({db,page,per_page:50});
-  const r=await fetch('/api/fakeflac/suspects?'+params);
-  const d=await r.json();
-  ffRows_=d.files||[];
-  document.getElementById('ff-page-info').textContent=`page ${(d.page||0)+1} of ${d.pages||1}`;
-  document.getElementById('ff-count').textContent=`${(d.total||0).toLocaleString()} suspects`;
-  document.getElementById('ff-tbody').innerHTML=ffRows_.map((row,i)=>{
-    const conf=row.transcode_confidence||0;
-    const cls=conf>=0.6?'hi':conf>=0.3?'mid':'lo';
-    const who=[row.artist||row.albumartist,row.album].filter(Boolean).join(' — ');
-    return `<tr onclick="openFakeflacDetail(${i})" style="cursor:pointer">
-      <td>${esc(row.filename||'')}</td>
-      <td>${esc(who)}</td>
-      <td>${row.transcode_cutoff_hz?Math.round(row.transcode_cutoff_hz)+' Hz':'—'}</td>
-      <td><span class="ff-conf ${cls}">${Math.round(conf*100)}%</span></td>
-      <td title="${esc(row.transcode_notes||'')}">${esc(row.transcode_notes||'')}</td>
-    </tr>`;
-  }).join('') || '<tr><td colspan="5" style="padding:20px;color:var(--dim)">no suspects — run a scan above</td></tr>';
-}
-function ffPage(delta){ loadFakeflacSuspects(Math.max(0,ffPage_+delta)); }
-
-async function runFakeflacScan(){
-  const db=document.getElementById('ff-db').value;
-  const force=document.getElementById('ff-force').checked;
-  const folder=document.getElementById('ff-folder-in').value.trim();
-  if(db==='folder' && !folder){ alert('Click Browse and pick a folder first'); return; }
-  openToolLog(db==='folder' ? `Checking ${folder}…` : 'Scanning for fake FLACs…');
-  const r=await fetch('/api/job/fake_flac_scan',{method:'POST',
-    headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({db,force,dest:folder})});
-  const j=await r.json();
-  if(j.error){ appendToolLog('broken',j.error); return; }
-  startToolStream(()=>loadFakeflacSuspects(0));
-}
-
-async function nativePickFakeflacFolder(btn){
-  const inp=document.getElementById('ff-folder-in');
-  if(btn) btn.disabled=true;
-  try{
-    const r=await fetch('/api/pick-folder?start='+encodeURIComponent(inp.value||''));
-    const d=await r.json();
-    if(d.ok&&d.path){
-      inp.value=d.path;
-      document.getElementById('ff-db').value='folder';
-      loadFakeflacSuspects(0);
-    } else if(d.reason!=='cancelled'){
-      alert('Cannot open the folder picker: '+(d.reason||'unknown reason'));
-    }
-  }catch(e){ alert('Cannot open the folder picker'); }
-  finally{ if(btn) btn.disabled=false; }
-}
-
-async function runFakeflacVamp(){
-  const db=document.getElementById('ff-db').value;
-  openToolLog('Vamp-confirming suspects (slow)…');
-  const r=await fetch('/api/job/fake_flac_vamp',{method:'POST',
-    headers:{'Content-Type':'application/json'},body:JSON.stringify({db})});
-  const j=await r.json();
-  if(j.error){ appendToolLog('broken',j.error); return; }
-  startToolStream(()=>loadFakeflacSuspects(ffPage_));
-}
-
-function openFakeflacDetail(i){
-  const row=ffRows_[i];
-  if(!row) return;
-  ffCurrent_=row;
-  document.getElementById('spec-title').textContent=row.filename||row.path;
-  const who=[row.artist||row.albumartist,row.album].filter(Boolean).join(' — ');
-  document.getElementById('spec-meta').innerHTML=
-    `${esc(who)} &nbsp;•&nbsp; cutoff ${row.transcode_cutoff_hz?Math.round(row.transcode_cutoff_hz)+' Hz':'—'}
-     &nbsp;•&nbsp; confidence ${Math.round((row.transcode_confidence||0)*100)}%
-     &nbsp;•&nbsp; ${esc(row.transcode_notes||'')}`;
-  const url='/api/spectrogram?path='+encodeURIComponent(row.path);
-  document.getElementById('spec-img').src=url;
-  const saveLink=document.getElementById('spec-save');
-  saveLink.href=url;
-  saveLink.download=(row.filename||'spectrogram')+'.png';
-  document.getElementById('spec-copy-status').textContent='';
-  document.getElementById('spec-overlay').classList.remove('hidden');
-}
-function closeSpec(e){ if(e.target.id==='spec-overlay') closeSpecBtn(); }
-function closeSpecBtn(){ document.getElementById('spec-overlay').classList.add('hidden'); }
-
-function copySpecLink(){
-  const url=location.origin+document.getElementById('spec-img').getAttribute('src');
-  const status=document.getElementById('spec-copy-status');
-  navigator.clipboard.writeText(url)
-    .then(()=>{ status.textContent='copied'; })
-    .catch(()=>{ status.textContent=url; });
-}
-
-async function openFakeflacFolder(btn){
-  if(!ffCurrent_) return;
-  const label=btn?btn.textContent:'';
-  if(btn){ btn.disabled=true; btn.textContent='…'; }
-  try{
-    const r=await fetch('/api/open-folder?path='+encodeURIComponent(ffCurrent_.path));
-    const d=await r.json();
-    if(!d.ok) alert('Cannot open folder: '+(d.reason||'failed'));
-  }catch(e){ alert('Cannot open folder'); }
-  finally{ if(btn){ btn.disabled=false; btn.textContent=label; } }
-}
-
-async function ffAction(kind){
-  if(!ffCurrent_) return;
-  if(kind==='delete' && !confirm(`Permanently delete ${ffCurrent_.filename}? This cannot be undone.`)) return;
-  if(kind==='isolate' && !confirm(`Move ${ffCurrent_.filename} to the Suspected Transcodes folder?`)) return;
-  const db=document.getElementById('ff-db').value;
-  const r=await fetch('/api/fakeflac/'+kind,{method:'POST',
-    headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({path:ffCurrent_.path,db})});
-  const j=await r.json();
-  if(j.error){ alert(j.error); return; }
-  closeSpecBtn();
-  loadFakeflacSuspects(ffPage_);
-}
-
-// ── detail popup ──────────────────────────────────────────────────────────────
-function showDetail(arr,idx,rowObj){
-  const r=rowObj||(arr&&arr[idx]);
-  if(!r) return;
-  document.getElementById('detail-title').textContent=r.filename||r.path||'File detail';
-  const FIELDS=[
-    ['Path','path'],['Status','status'],['Artist','artist'],['Album artist','albumartist'],
-    ['Album','album'],['Title','title'],['Year','year'],['Label','label'],
-    ['Cat#','catalog_number'],['Genre','genre'],['Duration','dur'],['Size MB','mb'],
-  ];
-  const cls=f=>f==='status'?(r[f]==='imported'?'ok':r[f]==='broken'?'err':r[f]==='duplicate'?'warn':''):'';
-  document.getElementById('detail-body').innerHTML=
-    `<div class="meta-grid">${FIELDS.map(([k,f])=>`
-      <span class="mk">${k}</span>
-      <span class="mv ${cls(f)}">${esc(String(r[f]||'—'))}</span>`).join('')}
-    </div>`;
-  document.getElementById('detail-overlay').classList.remove('hidden');
-}
-function closeDetail(e){ if(e.target.id==='detail-overlay') closeDetailBtn(); }
-function closeDetailBtn(){ document.getElementById('detail-overlay').classList.add('hidden'); }
-
-init();
-</script>
-</body>
-</html>
-"""
-
 if __name__ == "__main__":
     import argparse
     ap = argparse.ArgumentParser(description="music-organiser web UI")
