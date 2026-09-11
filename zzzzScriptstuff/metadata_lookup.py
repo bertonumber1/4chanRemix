@@ -738,6 +738,8 @@ def fill_missing_metadata(
     from pathlib import Path as _Path
 
     stats_recovered_from_path = 0
+
+    stats_recovery_too_weak = 0
     stats_recovered_from_siblings = 0
     stats_skipped_unknown = 0
 
@@ -812,6 +814,16 @@ def fill_missing_metadata(
                 have_artist=not artist_unknown,
                 have_album=not album_unknown,
             )
+            # WEAK recovery is the bare folder name used as an album (and its
+            # parent as the artist). It is not evidence: every file in a
+            # folder collapses onto the same fake (artist, album), so they
+            # group into one release and ONE provider match gets written into
+            # all of them. That is exactly how two unrelated tracks in the
+            # quarantine folder both ended up stamped with the same
+            # MusicBrainz release, label "Sony Music", country Indonesia.
+            if recovered.get("confidence") == "weak":
+                recovered = {}
+                stats_recovery_too_weak += 1
             used_anything = False
             r_artist = recovered.get("artist", "").strip()
             r_album = recovered.get("album", "").strip()
@@ -867,6 +879,12 @@ def fill_missing_metadata(
         by_release.setdefault((artist, album), []).append(d)
 
     # Recovery-stats logging
+    if stats_recovery_too_weak:
+        emit("info",
+             f"{stats_recovery_too_weak:,} file(s) had nothing usable in their "
+             f"path -- only the folder name, which is not a release name. "
+             f"They were left alone rather than queried under a made-up "
+             f"artist/album (they need tags, not a lookup)")
     if stats_recovered_from_path:
         emit("info",
              f"path recovery: filled in artist/album for "

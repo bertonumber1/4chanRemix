@@ -585,9 +585,50 @@ _FILENAME_PATTERNS = [
     re.compile(
         r"^\d{1,3}\s*[\.\-]?\s+(?P<artist>.+?)\s+[-–—]\s+(?P<title>.+?)\s*$"
     ),
+    # "A1. Artist - Title" / "B2 Artist - Title" -- a VINYL SIDE MARKER, not
+    # part of the artist's name. Without this the artist came out as
+    # "A1. Baby's Gang".
+    re.compile(
+        r"^[A-Fa-f]\d{1,2}\s*[\.\-]?\s+(?P<artist>.+?)\s+[-–—]\s+(?P<title>.+?)\s*$"
+    ),
     # "Artist - Title" (no track number)
     re.compile(r"^(?P<artist>.+?)\s+[-–—]\s+(?P<title>.+?)\s*$"),
 ]
+
+
+# Folder names that are NOT release names, and must never become an artist or
+# an album. This list exists because of a real incident: two unrelated tracks
+# sitting in the app's own quarantine folder were recovered as
+# artist="-label-releases" (the parent directory) / album="Broken" (the
+# quarantine folder), which made them look like ONE release, so one provider
+# match was stamped into both files -- same MusicBrainz release id, label
+# "Sony Music", country Indonesia -- while artist/album/title stayed empty.
+_NOT_A_RELEASE_NAME = {
+    "broken", "high quality", "shit quality", "low quality", "quarantine",
+    "duplicates", "duplicate", "orphans", "orphan", "sorted", "unsorted",
+    "incoming", "inbox", "new", "new folder", "temp", "tmp", "misc",
+    "music", "musica", "audio", "flac", "mp3", "wav", "lossless", "lossy",
+    "downloads", "download", "media", "library", "albums", "singles",
+    "various", "various artists", "va", "unknown", "untitled", "tracks",
+    "cd", "cd1", "cd2", "disc", "disc1", "disc2", "files", "folder",
+}
+
+
+def _plausible_release_name(name: str) -> bool:
+    """Would a human accept this folder name as an artist or an album?
+
+    Rejects the app's own control folders, generic container names, and the
+    shapes a directory has but a release does not -- a leading "-" or "_",
+    or a name that is only digits.
+    """
+    n = (name or "").strip()
+    if len(n) < 2:
+        return False
+    if n[0] in "-_.":
+        return False
+    if n.isdigit():
+        return False
+    return n.strip().lower() not in _NOT_A_RELEASE_NAME
 
 
 def recover_from_path(
@@ -616,6 +657,33 @@ def recover_from_path(
     grandparent = p.parent.parent.name if p.parent and p.parent.parent else ""
     notes: list[str] = []
 
+    # "confidence" says how much the caller may trust this. Only 'strong'
+    # should ever be sent to a metadata provider or written to a file:
+    #   strong -- "Artist - Title" in the filename, or "Artist - Album" as the
+    #             folder, i.e. someone actually wrote the names down
+    #   weak   -- the bare folder name used as an album, parent as artist.
+    #             Fine as a display hint, useless as a query, and dangerous as
+    #             a grouping key: every file in one folder collapses into a
+    #             single fake release.
+    confidence = ""
+
+    # Filename FIRST. "A1. Baby's Gang - Challenger" says the artist and the
+    # title out loud; the folder it happens to sit in does not.
+    if not have_artist or not have_title:
+        for pat in _FILENAME_PATTERNS:
+            m = pat.match(stem)
+            if not m:
+                continue
+            gd = m.groupdict()
+            if not have_artist and gd.get("artist"):
+                out["artist"] = gd["artist"].strip()
+            if not have_title and gd.get("title"):
+                out["title"] = gd["title"].strip()
+            if "artist" in out or "title" in out:
+                notes.append(f"filename='{stem}'")
+                confidence = "strong"
+            break
+
     # Folder-name parsing for artist + album
     if not have_artist or not have_album:
         for pat in _FOLDER_PATTERNS:
@@ -623,46 +691,33 @@ def recover_from_path(
             if not m:
                 continue
             gd = m.groupdict()
-            if not have_artist and gd.get("artist"):
+            if not have_artist and "artist" not in out and gd.get("artist"):
                 out["artist"] = gd["artist"].strip()
             if not have_album and gd.get("album"):
                 out["album"] = gd["album"].strip()
             if "artist" in out or "album" in out:
                 notes.append(f"folder='{folder}'")
+                confidence = "strong"
             break
 
     # Folder-name didn't match a pattern but is a bare string —
     # use it as the album if we need one, and grandparent as artist.
     if (not have_album and "album" not in out
-            and folder and " - " not in folder and " – " not in folder):
+            and folder and " - " not in folder and " – " not in folder
+            and _plausible_release_name(folder)):
         out["album"] = folder
         notes.append(f"folder-as-album='{folder}'")
+        confidence = confidence or "weak"
         if (not have_artist and "artist" not in out
-                and grandparent and grandparent not in ("", "/")):
-            # Avoid using filesystem roots as artist
-            if grandparent.lower() not in ("music", "flac", "mp3", "audio",
-                                            "downloads", "media", "library"):
-                out["artist"] = grandparent
-                notes.append(f"grandparent-as-artist='{grandparent}'")
-
-    # Filename-stem parsing for artist + title
-    if (not have_artist and "artist" not in out) or (not have_title):
-        for pat in _FILENAME_PATTERNS:
-            m = pat.match(stem)
-            if not m:
-                continue
-            gd = m.groupdict()
-            if not have_artist and "artist" not in out and gd.get("artist"):
-                out["artist"] = gd["artist"].strip()
-                notes.append(f"filename='{stem}'")
-            if not have_title and gd.get("title"):
-                out["title"] = gd["title"].strip()
-                if "filename" not in (notes[-1] if notes else ""):
-                    notes.append(f"filename='{stem}'")
-            break
+                and _plausible_release_name(grandparent)):
+            out["artist"] = grandparent
+            notes.append(f"grandparent-as-artist='{grandparent}'")
+            confidence = "weak"
 
     if notes:
         out["note"] = "; ".join(notes)
+    if confidence:
+        out["confidence"] = confidence
     return out
 
 
