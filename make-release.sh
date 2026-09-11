@@ -47,15 +47,45 @@ cp "${PROJ_DIR}/requirements.txt" "${STAGE}/"
 cp "${PROJ_DIR}/README.md"        "${STAGE}/"
 cp "${PROJ_DIR}/make-release.sh"  "${STAGE}/"
 
-for f in acoustid_helper.py detection.py; do
+# telegram_panel.py backs the whole Telegram tab; without it web_ui.py still
+# starts and every Telegram endpoint answers "telegram_panel failed to load".
+# smoke_test.py ships too, so an install can be checked on the box it landed on.
+for f in acoustid_helper.py detection.py telegram_panel.py \
+         label_panel.py label_ref.py smoke_test.py; do
     [ -f "${PROJ_DIR}/${f}" ] && cp "${PROJ_DIR}/${f}" "${STAGE}/"
+done
+
+# Staging BY NAME is how the Telegram tab shipped broken in every fresh install
+# for weeks: the file existed here and was simply never copied. Fail loudly when
+# a module a tab depends on is missing, rather than shipping a release whose tab
+# answers "panel failed to load".
+for f in telegram_panel.py label_panel.py label_ref.py; do
+    if [ ! -f "${STAGE}/${f}" ]; then
+        printf '\033[0;31m  ✗  %s did not get staged — that tab would be dead\033[0m\n' "${f}"
+        exit 1
+    fi
 done
 
 cp -r "${PROJ_DIR}/zzzzScriptstuff" "${STAGE}/"
 
-# web_ui.py serves these at fixed routes (/logo.png, /logo-icon.png,
-# /wallpaper.jpg) — without them those routes 404 and the header
-# logo/favicon/background just don't load.
+# The page itself. web_ui.py reads templates/index.html and serves static/ —
+# leave these out and the app boots fine and then 500s on "/". Hard failure,
+# not a warning, because a release without them is useless.
+# tests/ ships too: an install that cannot be checked on the box it landed on
+# is an install you have to trust blindly.
+[ -d "${PROJ_DIR}/tests" ] && cp -r "${PROJ_DIR}/tests" "${STAGE}/"
+
+for d in templates static; do
+    if [ ! -d "${PROJ_DIR}/${d}" ]; then
+        printf '\033[0;31m  ✗  %s/ is missing — cannot build a release\033[0m\n' "${d}"
+        exit 1
+    fi
+    cp -r "${PROJ_DIR}/${d}" "${STAGE}/"
+done
+
+# web_ui.py serves the backdrop from here at /wallpaper.jpg — without it that
+# route 404s and the page loses its background. The header wordmark and the
+# favicon are not images, so there is nothing else to stage.
 [ -d "${PROJ_DIR}/assets" ] && \
     cp -r "${PROJ_DIR}/assets" "${STAGE}/"
 
