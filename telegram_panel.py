@@ -33,16 +33,28 @@ from pathlib import Path
 # `scraper_ssh` lets the Windows UI run the scraper over ssh on the Linux box,
 # so either panel is a full control surface.
 _WIN_DEFAULTS = {
+    # RETIRED 2026-09-10 -- kept only so an old config still resolves. The live
+    # uploader is the Linux one; running this copy would re-post its releases.
     "upload_dir":  r"D:\TG-UPLOAD",
     "scraper":     "/home/media/music-tools/telegram-post/tg-scraper",
     "scraper_ssh": "server",
     "drip_task":   "TG Upload Drip",
 }
 _NIX_DEFAULTS = {
-    "upload_dir":  "",                       # the uploader is Windows-side
+    # 2026-09-10: the uploader MOVED here from the Windows box -- same account,
+    # same files (over CIFS), 7x the speed (1.45 MB/s vs 0.21). The Windows
+    # copy is retired; its state file still holds D:\ keys and must not run.
+    "upload_dir":  "/home/media/music-tools/tg-upload",
     "scraper":     "/home/media/music-tools/telegram-post/tg-scraper",
     "scraper_ssh": "",                       # it is already local here
+    # Windows drips the uploader from a scheduled task; here it is a systemd
+    # USER unit. It must NOT be a plain child of this web UI: a process the
+    # panel spawns lives in the web UI's cgroup, so restarting music-organiser
+    # killed the upload mid-run (it did, on 2026-09-10). Its own unit also
+    # gives it Restart=always and RequiresMountsFor= on the library mount.
     "drip_task":   "",
+    "drip_script": "run.sh",
+    "drip_unit":   "tg-upload.service",
 }
 
 # A scraper run can be long; keep a bounded tail rather than growing forever.
@@ -233,7 +245,31 @@ def _upload_paths(st: dict) -> dict:
         "stop":  (d / "STOP") if d else None,
         "state": (d / "uploader_state.json") if d else None,
         "log":   (d / "uploader.log") if d else None,
+        "review": (d / "needs_review.txt") if d else None,
+        "drip":  (d / (st.get("drip_script") or "run.sh")) if d else None,
     }
+
+
+def _lock_held(path) -> bool:
+    """Is someone holding this flock? Exact, unlike grepping `ps`.
+
+    The panel used to look for the uploader's ABSOLUTE path in `ps`, but a loop
+    started from its own directory shows up as "bash ./run.sh" -- so the check
+    said "nothing running" and started a second loop posting the same releases.
+    """
+    if os.name == "nt":
+        return False
+    try:
+        import fcntl
+        with open(path, "a") as fh:
+            try:
+                fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError:
+                return True
+            fcntl.flock(fh, fcntl.LOCK_UN)
+        return False
+    except Exception:
+        return False
 
 
 def _proc_running(needle: str) -> bool:
@@ -276,12 +312,18 @@ def uploader_status(cfg: dict) -> dict:
         "task": _task_state(st["drip_task"]),
         "task_name": st["drip_task"],
         "posted": 0, "files": 0, "failed": 0, "total": 0,
+        "held": 0, "held_rows": [],
         "last": "", "last_error": "", "log_tail": [],
     }
     if not out["configured"]:
         return out
 
-    out["running"] = _proc_running("uploader.py")
+    if os.name == "nt":
+        out["running"] = _proc_running("uploader.py")
+        out["drip_up"] = False
+    else:
+        out["running"] = _lock_held(p["dir"] / ".uploader.lock")
+        out["drip_up"] = _lock_held(p["dir"] / ".run.lock")
     out["stopped_by_latch"] = bool(p["stop"] and p["stop"].exists())
 
     try:
@@ -295,6 +337,19 @@ def uploader_status(cfg: dict) -> dict:
                 out["last"] = Path(list(done)[-1]).name
     except Exception as exc:
         out["last_error"] = "state unreadable: %s" % exc
+
+    # Folders the release rules held back: more tracks than one release can
+    # honestly have, i.e. a container or a whole series dumped flat. They are
+    # NOT posted and NOT marked done, so this list is work waiting on a human.
+    try:
+        if p["review"] and p["review"].exists():
+            rows = [ln.rstrip() for ln in
+                    p["review"].read_text(encoding="utf-8", errors="replace").splitlines()
+                    if ln.strip() and not ln.startswith("#")]
+            out["held"] = len(rows)
+            out["held_rows"] = rows[:40]
+    except Exception:
+        pass
 
     try:
         if p["log"] and p["log"].exists():
@@ -340,7 +395,20 @@ def uploader_set(cfg: dict, run: bool) -> tuple[bool, str]:
                                capture_output=True, text=True, timeout=20)
                 subprocess.run(["schtasks", "/run", "/tn", task],
                                capture_output=True, text=True, timeout=20)
-            return True, "uploader enabled"
+                return True, "uploader enabled"
+            # Linux: no scheduled task -- a systemd user unit runs the loop.
+            # Removing the latch is enough if it is already up (it re-checks
+            # every 30s).
+            if _lock_held(p["dir"] / ".run.lock"):
+                return True, "uploader enabled — the drip loop picks it up within 30s"
+            unit = st.get("drip_unit") or ""
+            if unit:
+                r = subprocess.run(["systemctl", "--user", "start", unit],
+                                   capture_output=True, text=True, timeout=25)
+                if r.returncode == 0:
+                    return True, "uploader started (%s)" % unit
+                return False, (r.stderr or r.stdout or "systemctl failed").strip()
+            return False, "no drip unit configured"
         else:
             p["stop"].write_text(                      # type: ignore[union-attr]
                 "paused from the web UI %s\n" % time.strftime("%Y-%m-%d %H:%M"),
@@ -353,6 +421,115 @@ def uploader_set(cfg: dict, run: bool) -> tuple[bool, str]:
         return False, str(exc)
 
 
+# ─── uploader settings, tools and one-shot actions ───────────────────────────
+def _tool_dir(cfg: dict):
+    st = settings(cfg)
+    d = Path(st["upload_dir"]) if st["upload_dir"] else None
+    return d if (d and d.exists()) else None
+
+
+def _run_tool(cfg: dict, args: list[str], timeout: int = 900) -> tuple[bool, str]:
+    """Run one of the uploader's own scripts and hand back what it printed.
+
+    Everything the panel offers is a script you could run by hand in that
+    folder, so there is exactly one implementation of each job.
+    """
+    d = _tool_dir(cfg)
+    if not d:
+        return False, "the uploader folder is not on this machine"
+    try:
+        r = subprocess.run([settings(cfg).get("python") or sys.executable] + args,
+                           cwd=str(d), capture_output=True, text=True,
+                           timeout=timeout)
+        out = (r.stdout or "") + (("\n" + r.stderr) if r.returncode else "")
+        return r.returncode == 0, out.strip()[-8000:]
+    except subprocess.TimeoutExpired:
+        return False, "timed out after %ss — it is probably still running" % timeout
+    except Exception as exc:
+        return False, str(exc)
+
+
+def uploader_config(cfg: dict) -> dict:
+    """The switches, straight out of uploader_config.json."""
+    d = _tool_dir(cfg)
+    if not d:
+        return {}
+    try:
+        with open(d / "uploader_config.json", encoding="utf-8") as fh:
+            return json.load(fh)
+    except FileNotFoundError:
+        return {}
+    except Exception as exc:
+        return {"_error": str(exc)}
+
+
+def uploader_config_set(cfg: dict, changes: dict) -> tuple[bool, str]:
+    """Change a switch. Values are coerced to the type of the current one, so
+    a checkbox cannot turn a number into the string "true"."""
+    d = _tool_dir(cfg)
+    if not d:
+        return False, "the uploader folder is not on this machine"
+    path = d / "uploader_config.json"
+    try:
+        cur = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+    except Exception as exc:
+        return False, "current config unreadable: %s" % exc
+    for k, v in (changes or {}).items():
+        if k not in cur:
+            continue
+        old = cur[k]
+        try:
+            if isinstance(old, bool):
+                v = bool(v) if not isinstance(v, str) else v.lower() in ("1", "true", "on", "yes")
+            elif isinstance(old, int) and not isinstance(old, bool):
+                v = int(v)
+            elif isinstance(old, float):
+                v = float(v)
+            else:
+                v = "" if v is None else str(v)
+        except (TypeError, ValueError):
+            return False, "%s: %r is not a %s" % (k, v, type(old).__name__)
+        cur[k] = v
+    tmp = str(path) + ".tmp"
+    Path(tmp).write_text(json.dumps(cur, indent=1), encoding="utf-8")
+    os.replace(tmp, path)
+    return True, "saved — the next release picks it up"
+
+
+def uploader_tools(cfg: dict, what: str) -> tuple[bool, str]:
+    """Account, permissions and topic checks (tgtools.py)."""
+    wanted = {"account": ["whoami"], "permissions": ["permissions"],
+              "topics": ["topics"], "spam": ["spam"],
+              "all": ["whoami", "permissions", "topics"]}.get(what)
+    if not wanted:
+        return False, "unknown check: %r" % what
+    return _run_tool(cfg, ["tgtools.py"] + wanted, timeout=300)
+
+
+ACTIONS = {
+    # name          -> (argv, needs the uploader stopped?)
+    "decide_tabs":   (["uploader.py", "--decide-tabs"], False),
+    "decide_posted": (["rehome.py", "--decide"], True),
+    "rehome_dry":    (["rehome.py"], True),
+    "rehome_apply":  (["rehome.py", "--apply"], True),
+    "seed_sent":     (["rehome.py", "--seed-sent"], True),
+    "verify":        (["rehome.py", "--verify"], True),
+    "report":        (["uploader.py", "--report"], False),
+}
+
+
+def uploader_action(cfg: dict, name: str) -> tuple[bool, str]:
+    entry = ACTIONS.get(name)
+    if not entry:
+        return False, "unknown action: %r" % name
+    argv, needs_stop = entry
+    d = _tool_dir(cfg)
+    if needs_stop and d and _lock_held(d / ".uploader.lock"):
+        return False, ("stop the uploader first — this one edits the state or "
+                       "the session that a running upload is holding")
+    return _run_tool(cfg, argv, timeout=1800)
+
+
 def uploader_retry_failed(cfg: dict) -> tuple[bool, str]:
     """Clear the `failed` map so the next run re-attempts those releases.
 
@@ -363,7 +540,8 @@ def uploader_retry_failed(cfg: dict) -> tuple[bool, str]:
     p = _upload_paths(st)
     if not (p["state"] and p["state"].exists()):
         return False, "no uploader_state.json"
-    if _proc_running("uploader.py"):
+    if _lock_held(p["dir"] / ".uploader.lock") if os.name != "nt" \
+            else _proc_running("uploader.py"):
         return False, "stop the uploader first — it rewrites this file"
     try:
         d = json.loads(p["state"].read_text(encoding="utf-8"))
@@ -393,4 +571,5 @@ def status(cfg: dict, since: int = 0) -> dict:
         },
         "job": JOB.snapshot(since),
         "uploader": uploader_status(cfg),
+        "settings": uploader_config(cfg),
     }
