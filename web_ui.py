@@ -1667,6 +1667,16 @@ async def label_fix_tags(req: Request):
     return JSONResponse(res)
 
 
+@app.post("/api/label/get-artwork")
+async def label_get_artwork(req: Request):
+    g = _lbl_guard()
+    if g:
+        return g
+    body = await req.json()
+    res = lbl.get_artwork(body.get("paths") or [], _load_cfg(), bool(body.get("dry_run")))
+    return JSONResponse(res)
+
+
 @app.get("/api/label/moves")
 def label_moves(limit: int = 200):
     g = _lbl_guard()

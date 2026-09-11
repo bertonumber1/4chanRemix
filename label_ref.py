@@ -782,6 +782,15 @@ class Discogs:
                 out.append(title)
         return out
 
+    def release_images(self, release_id: int) -> list:
+        """A release's own images, straight off the SAME /releases/{id}
+        response tracklist() already calls — no new endpoint, just a field
+        that call used to throw away. Each entry carries at least "type"
+        ("primary" or "secondary") and "uri" (full-size); the caller
+        prefers "primary" and falls back to whatever is there."""
+        d = self._get(f"/releases/{int(release_id)}")
+        return d.get("images", []) or []
+
 
 # ─── caches ───────────────────────────────────────────────────────────────────
 def _read_json(path, default):
@@ -1385,10 +1394,58 @@ def artwork_check(folder_info: dict) -> dict:
     return {
         "present": present, "source": source, "dimension_ok": dimension_ok,
         "deferred": [
-            "Discogs image fetch/compare — new API surface, deferred past "
-            "report-only cross-check's scope",
+            "Discogs image PIXEL compare (does the art actually match the "
+            "release) — label_panel.get_artwork() can now FETCH an image "
+            "when none is present, but comparing one already here against "
+            "Discogs' own stays out of report-only cross-check's scope",
         ],
     }
+
+
+def extract_local_picture(path: str) -> tuple[bytes, str] | None:
+    """The full bytes of one file's embedded picture, if it has one.
+
+    Deliberately NOT the fast scan path: _flac_tags() above seeks OVER a
+    PICTURE block's image bytes on purpose (the 5.5 GB incident in that
+    function's own docstring), because a bulk scan reads every file in a
+    folder. This reads exactly one file, in full, only when a human has
+    already clicked something — the cost this avoids during scan is fine to
+    pay once, opt-in.
+
+    Covers FLAC's own picture blocks and the APIC frame formats (MP3, and
+    WAV via the RIFF 'id3 ' chunk tag_writer's WAVE fix already knows how to
+    open) — whatever mutagen.File() can actually open. None on anything
+    else, or on a file with no embedded picture at all.
+    """
+    try:
+        import mutagen
+        f = mutagen.File(path)
+    except Exception:
+        return None
+    if f is None:
+        return None
+    pics = getattr(f, "pictures", None)
+    if pics:
+        return pics[0].data, (pics[0].mime or "image/jpeg")
+    tags = getattr(f, "tags", None)
+    if tags is not None and hasattr(tags, "getall"):
+        apics = tags.getall("APIC")
+        if apics:
+            return apics[0].data, (apics[0].mime or "image/jpeg")
+    return None
+
+
+def download_image(url: str, timeout: float = 30.0) -> tuple[bytes, str] | None:
+    """Plain HTTP GET for an image URL — Discogs' own CDN, not the API, so
+    no token and no rate pacing needed. None on any failure; the caller
+    treats "no artwork found" and "network hiccup" the same way (nothing to
+    write), rather than surfacing a distinction the UI has no use for."""
+    req = urllib.request.Request(url, headers={"User-Agent": Discogs.UA})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return r.read(), (r.headers.get("Content-Type") or "image/jpeg")
+    except Exception:
+        return None
 
 
 def cross_check(row: dict, folder_info: dict, tracklist: list, matched: dict) -> dict:

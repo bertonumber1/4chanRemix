@@ -484,6 +484,133 @@ def fix_tags(paths: list, dry_run: bool = False) -> dict:
             "results": results, "dry_run": dry_run}
 
 
+def get_artwork(paths: list, cfg: dict, dry_run: bool = False) -> dict:
+    """Give a release a loose cover image (folder.jpg) — never touches the
+    audio files, which sidesteps both embedding art into a format that does
+    not carry it reliably (WAV) and converting to FLAC just to get artwork
+    support.
+
+    Two sources, tried in order, and stops at the first that produces one:
+      1. LOCAL — some file in the folder already has a picture embedded
+         (commonly a FLAC bonus track sitting beside WAV singles). Extract
+         it. No network call.
+      2. DISCOGS — nothing in the folder has any artwork at all. Fetch the
+         release's own primary image and save that instead.
+
+    A folder that already has ANY artwork (embedded or already-loose) is
+    left alone and reported as such — this only fills a genuine gap, same
+    only-additive spirit as fix_tags.
+    """
+    st = load_state()
+    roots = [r["path"] for r in st.get("roots") or []]
+    scan_ = last_scan()
+    if not scan_:
+        return {"ok": False, "results": [],
+                "reason": "no scan yet — run Scan folders first"}
+    by_folder = {row["folder"]: row for row in scan_["rows"] if row.get("folder")}
+
+    results = []
+    for src in paths:
+        src = os.path.abspath(src)
+        name = os.path.basename(src.rstrip(os.sep))
+        out = {"path": src, "name": name, "ok": False, "reason": "", "source": ""}
+
+        if not any(_under(src, r) for r in roots):
+            out["reason"] = "outside every configured folder — refusing to touch it"
+            results.append(out)
+            continue
+        row = by_folder.get(src)
+        if row is None:
+            out["reason"] = "not in the last scan — rescan first"
+            results.append(out)
+            continue
+
+        # A direct top-level check, not artwork_check()['source'] == 'folder-
+        # image': that field prefers "embedded" whenever ANY file has a
+        # picture, even once a loose copy also exists (source only ever
+        # reports "folder-image" when NOTHING is embedded anywhere) — using
+        # it here would re-fetch and rewrite folder.jpg every single run.
+        # Not "artwork_check()['present']" either — that is ALSO true when
+        # the only artwork is embedded in some OTHER file in the folder,
+        # which is exactly the case this exists to act on: a WAV sitting
+        # next to a pictured FLAC bonus track gets no benefit from that on
+        # its own.
+        try:
+            loose = any(n.lower().endswith((".jpg", ".jpeg", ".png", ".bmp"))
+                       for n in os.listdir(src))
+        except OSError:
+            loose = False
+        if loose:
+            out["ok"] = True
+            out["source"] = "folder-image"
+            out["reason"] = "already has a loose cover image — nothing to do"
+            results.append(out)
+            continue
+
+        info = L.folder_tracks(src)
+
+        picture = None
+        file_paths = info.get("paths") or []
+        for i, t in enumerate(info.get("tags") or []):
+            if t.get("has_picture") and i < len(file_paths):
+                picture = L.extract_local_picture(file_paths[i])
+                if picture:
+                    out["source"] = "local"
+                    break
+
+        if picture is None:
+            release_id = row.get("id")
+            if not release_id:
+                out["reason"] = "no local artwork, and no Discogs release id to fetch one with"
+                results.append(out)
+                continue
+            try:
+                images = L.Discogs(_token(cfg)).release_images(release_id)
+            except Exception as exc:
+                out["reason"] = "no local artwork; Discogs fetch failed: %s" % exc
+                results.append(out)
+                continue
+            img = next((im for im in images if im.get("type") == "primary"), None) \
+                or (images[0] if images else None)
+            url = (img or {}).get("uri") or (img or {}).get("resource_url") or ""
+            if not url:
+                out["reason"] = "no local artwork, and Discogs has none for this release"
+                results.append(out)
+                continue
+            picture = L.download_image(url)
+            if picture is None:
+                out["reason"] = "no local artwork; Discogs image download failed"
+                results.append(out)
+                continue
+            out["source"] = "discogs"
+
+        data, mime = picture
+        ext = {"image/png": ".png", "image/jpeg": ".jpg", "image/jpg": ".jpg"}.get(
+            mime.lower(), ".jpg")
+        dest = os.path.join(src, "folder" + ext)
+        kb = len(data) // 1024
+        if dry_run:
+            out["ok"] = True
+            out["reason"] = "would save %s (%d KB) from %s" % (
+                os.path.basename(dest), kb, out["source"])
+            results.append(out)
+            continue
+        try:
+            tmp = dest + ".tmp"
+            with open(tmp, "wb") as fh:
+                fh.write(data)
+            os.replace(tmp, dest)
+            out["ok"] = True
+            out["reason"] = "saved %s (%d KB) from %s" % (
+                os.path.basename(dest), kb, out["source"])
+        except OSError as exc:
+            out["reason"] = "found artwork (%s) but could not write %s: %s" % (
+                out["source"], dest, exc)
+        results.append(out)
+    return {"ok": bool(results) and all(r["ok"] for r in results),
+            "results": results, "dry_run": dry_run}
+
+
 def scan(cfg: dict, log=print, should_stop=None) -> dict:
     st = load_state()
     c = cache(st)

@@ -1674,6 +1674,11 @@ function lbRowClick(ev){
     if(cc.artwork){
       lines.push('<div><b>Artwork</b> — '+
         (cc.artwork.present?('present, '+esc(cc.artwork.source)):'none found')+'</div>');
+      if(!cc.artwork.present && r.folder)
+        lines.push('<div><button class="btn-xs" data-get-artwork="'+esc(r.folder)+'" '+
+          'title="Save a loose folder.jpg next to the tracks — extracted from another file '+
+          'here that already has one, or fetched from Discogs if nothing here does. Never '+
+          'embeds into or otherwise touches the audio files.">Get artwork</button></div>');
       if((cc.artwork.deferred||[]).length)
         lines.push('<div class="lb-dim">Not checked yet: '+
           cc.artwork.deferred.map(esc).join(' · ')+'</div>');
@@ -1689,6 +1694,8 @@ function lbRowClick(ev){
   if(op){ fetch('/api/open-folder?path='+encodeURIComponent(op.dataset.open)); return; }
   const ft=ev.target.closest('[data-fix-tags]');
   if(ft){ lbFixTags(ft.dataset.fixTags); return; }
+  const ga=ev.target.closest('[data-get-artwork]');
+  if(ga){ lbGetArtwork(ga.dataset.getArtwork); return; }
   const un=ev.target.closest('[data-undo]');
   if(un){ lbUndo(un.dataset.undo); return; }
   const cb=ev.target.closest('input[data-pick]');
@@ -1870,6 +1877,18 @@ async function lbUndo(dest){
 // makes this a strictly additive fill-in-the-gaps action, never an overwrite.
 async function lbFixTags(folder){
   const r=await (await fetch('/api/label/fix-tags',{method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({paths:[folder]})})).json();
+  const row=(r.results||[])[0];
+  lbLog(row && row.ok ? 'info' : 'broken', (row && row.reason) || r.reason || '');
+  lbLoad();
+}
+
+// Same opt-in, one-folder-at-a-time shape as lbFixTags. Only ever ADDS a
+// folder.jpg — never touches an audio file, never overwrites artwork that
+// is already there (get_artwork refuses before it gets this far).
+async function lbGetArtwork(folder){
+  const r=await (await fetch('/api/label/get-artwork',{method:'POST',
     headers:{'Content-Type':'application/json'},
     body:JSON.stringify({paths:[folder]})})).json();
   const row=(r.results||[])[0];

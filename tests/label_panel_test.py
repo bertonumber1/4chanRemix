@@ -640,6 +640,63 @@ def main():
         r_outside = P.fix_tags([outside_ft])
         check("outside every configured folder" in r_outside["results"][0]["reason"],
               "a folder outside every root is refused, same as move_folders")
+
+        print("\n[get_artwork]")
+        from mutagen.flac import FLAC, Picture
+
+        def flac_with_picture(path, jpeg_bytes):
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            sf.write(path, np.zeros(4410, dtype="float32"), 44100, format="FLAC")
+            f = FLAC(path)
+            pic = Picture()
+            pic.data = jpeg_bytes
+            pic.type = 3
+            pic.mime = "image/jpeg"
+            f.add_picture(pic)
+            f["title"] = "Has Art"
+            f.save()
+
+        # A minimal-but-real JPEG (SOI + EOI markers) -- good enough for
+        # mutagen's Picture to carry and for the written file to round-trip.
+        FAKE_JPEG = b"\xff\xd8\xff\xe0\x00\x10JFIF" + b"\x00" * 32 + b"\xff\xd9"
+
+        art_root = os.path.join(tmp, "artwork-incoming")
+        art_release = os.path.join(art_root, "(ART-001) Has Art Somewhere (2001)")
+        flac_track(os.path.join(art_release, "01 - Bare.flac"), "Bare")
+        flac_with_picture(os.path.join(art_release, "02 - Pictured.flac"), FAKE_JPEG)
+        P.add_root(art_root, "owned")
+        P._write_scan({"label_id": P.load_state()["label_id"], "rows": [
+            {"folder": art_release, "artist": "Someone", "catno": "ART-001",
+             "title": "Has Art Somewhere", "id": None},
+        ]})
+
+        r_art = P.get_artwork([art_release], cfg={})
+        row_art = r_art["results"][0]
+        check(row_art["ok"], "get_artwork reports ok", str(r_art))
+        eq(row_art["source"], "local",
+           "found the picture embedded in the OTHER file in the folder")
+        saved = os.path.join(art_release, "folder.jpg")
+        check(os.path.isfile(saved), "folder.jpg was actually written")
+        with open(saved, "rb") as fh:
+            eq(fh.read(), FAKE_JPEG, "…with exactly the extracted picture's bytes")
+
+        r_art_again = P.get_artwork([art_release], cfg={})
+        row_again = r_art_again["results"][0]
+        check(row_again["ok"] and row_again["source"] == "folder-image",
+              "run again: the folder.jpg just written now counts as already-present")
+
+        no_art_root = os.path.join(tmp, "no-art-incoming")
+        no_art_release = release(no_art_root, "(NOART-001) Nothing Here (2001)", tracks=1)
+        P.add_root(no_art_root, "owned")
+        P._write_scan({"label_id": P.load_state()["label_id"], "rows": [
+            {"folder": art_release, "artist": "Someone", "catno": "ART-001",
+             "title": "Has Art Somewhere", "id": None},
+            {"folder": no_art_release, "artist": "Nobody", "catno": "NOART-001",
+             "title": "Nothing Here", "id": None},
+        ]})
+        r_no_art = P.get_artwork([no_art_release], cfg={})
+        check("no Discogs release id" in r_no_art["results"][0]["reason"],
+              "no local picture and no Discogs id: refused, not a network call")
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
