@@ -227,8 +227,51 @@ class Provider:
         now = time.monotonic()
         elapsed = now - self._last_request
         if elapsed < self.rate_limit_seconds:
-            time.sleep(self.rate_limit_seconds - elapsed)
+            self._sleep(self.rate_limit_seconds - elapsed)
         self._last_request = time.monotonic()
+
+    # A provider that is down stays down for minutes, not milliseconds. Without
+    # a breaker every one of a run's queries pays the full retry cost and still
+    # fails -- a MusicBrainz 503 spell turned a 4-minute run into a 20-minute
+    # one, with a wall of identical warnings and nothing to show for it.
+    # Set by the web UI when Stop is pressed. Every sleep in here checks it, so
+    # "stop" lands in a quarter of a second instead of waiting out a 15s
+    # provider backoff -- which is what made the button feel dead.
+    CANCEL = None
+
+    @classmethod
+    def _sleep(cls, seconds):
+        end = time.monotonic() + max(0.0, seconds)
+        while True:
+            left = end - time.monotonic()
+            if left <= 0:
+                return
+            if cls.CANCEL is not None and cls.CANCEL.is_set():
+                raise KeyboardInterrupt("cancelled")
+            time.sleep(min(0.25, left))
+
+    _BREAKER_TRIP = 5            # consecutive outage-shaped failures
+    _BREAKER_COOLDOWN = 300.0    # seconds cold before trying again
+    _RETRY_SLEEPS = (5.0, 15.0)  # backoff between attempts
+
+    class Cold(RuntimeError):
+        """Raised instead of a request while the provider is in cooldown."""
+
+    def _breaker_ok(self) -> None:
+        self._consec_fail = 0
+
+    def _breaker_fail(self) -> None:
+        self._consec_fail = getattr(self, "_consec_fail", 0) + 1
+        if self._consec_fail >= self._BREAKER_TRIP:
+            self._cold_until = time.monotonic() + self._BREAKER_COOLDOWN
+            self._consec_fail = 0
+            logger.warning(
+                "%s failed %d times in a row — backing off for %d min. "
+                "Its lookups are skipped until then; other providers carry on.",
+                self.id, self._BREAKER_TRIP, int(self._BREAKER_COOLDOWN // 60))
+
+    def is_cold(self) -> bool:
+        return time.monotonic() < getattr(self, "_cold_until", 0.0)
 
     def http_get_json(
         self,
@@ -238,28 +281,42 @@ class Provider:
         headers: dict[str, str] | None = None,
         timeout: float = 15.0,
     ) -> Any:
-        """Common HTTP helper. Rate-limits, GETs, parses JSON."""
-        self.rate_limit()
+        """Common HTTP helper. Rate-limits, GETs, parses JSON.
+
+        Retries an outage (429 / 5xx / network error) with a growing pause,
+        and trips a circuit breaker once the provider has clearly gone away.
+        A 404 is an answer, not an outage, and is raised straight through.
+        """
+        if self.is_cold():
+            raise self.Cold("%s is in cooldown after repeated failures" % self.id)
         if params:
             url = f"{url}?{_urlencode(params)}"
         h = {"User-Agent": _USER_AGENT, "Accept": "application/json"}
         if headers:
             h.update(headers)
         req = Request(url, headers=h)
-        try:
-            with urlopen(req, timeout=timeout) as r:
-                raw = r.read().decode("utf-8", errors="replace")
-            return json.loads(raw)
-        except HTTPError as e:
-            if e.code == 429 or e.code == 503:
-                # Rate-limit response: back off, retry once
-                logger.warning("%s rate limit hit, sleeping 5s", self.id)
-                time.sleep(5)
-                self.rate_limit()
+
+        attempts = len(self._RETRY_SLEEPS) + 1
+        for i in range(attempts):
+            self.rate_limit()
+            try:
                 with urlopen(req, timeout=timeout) as r:
                     raw = r.read().decode("utf-8", errors="replace")
+                self._breaker_ok()
                 return json.loads(raw)
-            raise
+            except HTTPError as e:
+                if e.code not in (429, 500, 502, 503, 504):
+                    raise                      # a real answer: 404, 400, 401…
+                last = e
+            except (URLError, TimeoutError, OSError) as e:
+                last = e
+            if i < attempts - 1:
+                pause = self._RETRY_SLEEPS[i]
+                logger.warning("%s unavailable (%s) — retrying in %.0fs",
+                               self.id, last, pause)
+                self._sleep(pause)
+        self._breaker_fail()
+        raise last
 
     def http_get_text(
         self,
