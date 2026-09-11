@@ -1,10 +1,11 @@
 [paths]
-sources = [
-    "/mnt/usb-a/drive/downloads",
-    "/mnt/usb-a/drive/downloads/nicotine-downloads",
-]
+# NO DEFAULT. Pick the folder with Browse in the UI.
+# A path left over from someone else's machine is worse than none:
+# a source that does not exist scans nothing and reports success.
+sources = []
 
-destination_root = "/mnt/usb-a/drive/SCENE_MUSIC_[FLAC-WAV]"
+# NO DEFAULT — set it with Browse.
+destination_root = ""
 
 database = "~/.local/share/music-organiser/library.db"
 

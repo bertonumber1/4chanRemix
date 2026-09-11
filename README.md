@@ -128,9 +128,81 @@ Run them individually or all at once with **Run All**.
 - **Session** — browse the current batch, re-fetch broken files, commit to library
 - **Library** — search and browse the full permanent library
 - **Tools** — rebuild index, compact DB, SQL query, audit checks
+- **Telegram** — one control surface for the channel scraper and the uploader
+- **Labels** — compare a record label's Discogs catalogue against the folders you
+  hold: what is complete, what is incomplete, what is missing entirely, and the
+  exact tracks still outstanding. See [Labels](#labels) below.
 - **Fake-FLAC** — scan the library for lossy-transcoded-into-FLAC files (FFT
   spectral cutoff, plus an optional Vamp CNN confirm pass if `sonic-annotator`
   is installed), view a spectrogram per suspect, and isolate / delete / dismiss
+
+---
+
+## Labels
+
+The **Labels** tab is a label sorter with Discogs as the reference. Point it at
+the folders you hold and it tells you, for every release on the label:
+
+| Status | Meaning |
+|---|---|
+| **complete** | every track Discogs lists for it is in your folder |
+| **incomplete** | your folder is missing some of them — and it names which |
+| **missing** | you do not hold it at all |
+| **unverified** | you have a folder, but no track listing is cached to check it against |
+
+**Setting it up**
+
+1. Pick the label — *Change label…* searches Discogs by name, so you never type an id.
+2. *Get catalogue* downloads its release list. *Get tracklists* fills in the per-release
+   track listings; that is what turns "we have this" into "we have 9 of its 12 tracks".
+   It is one API call per release, so it runs in capped batches and can be run again.
+3. Add folders. **Owned** is what you already have. **Incoming** is a share, a
+   download, or a friend's drive being judged against it.
+4. *Scan folders*.
+
+**Incoming folders** are reported as **new** (a release you do not own),
+**upgrade** (more complete than the copy you have) or **duplicate** (adds
+nothing). That is the question to ask of a folder someone has just shared.
+
+**WAV counts, but is flagged.** A WAV or AIFF is lossless, so it satisfies the
+track and closes the gap — the row carries a `WAV` flag so you can convert it
+before calling the release finished. A folder holding only MP3s is flagged
+`lossy` and does **not** count as owning the release.
+
+**Exports** — the lists you actually work from:
+
+- **Outstanding tracks** — every missing track, grouped under its release
+- **Missing releases (CSV)** / **Incomplete (CSV)** — for a spreadsheet
+- **Search terms** — one line per thing to look for, as *artist + title*. Never
+  title alone: a bare title matches the wrong release.
+- **What we have (CSV)** — everything you hold on the label
+
+**Moving folders** puts them in the Archive folder you choose. Every move is
+written to `label_moves.tsv` and each row in the **Move log** view has a *Put
+back* button. *Preview move* shows exactly what would happen first.
+
+**Speed.** The first scan reads tags from every file, which is slow over a
+network mount — expect a few minutes per thousand folders. After that only
+folders whose contents changed are re-read, and a rescan takes seconds.
+
+---
+
+## Language
+
+The header has a language selector: **English** and **Español**.
+
+The page is written in English, and a language is a dictionary from those exact
+English strings, in `static/i18n-lang.js`. Anything without a translation simply
+stays in English, so a partly finished language is usable rather than broken.
+Your choice is remembered in the browser, and a first visit follows the
+browser's own language preference.
+
+Folder names, catalogue numbers, track titles and log output are never
+translated — only the interface is.
+
+**Adding a language**: add one object to `I18N_LANGS` in
+`static/i18n-lang.js` (copy the `es` block, replace the values) and one
+`<option>` to the `#lang-sel` select in `templates/index.html`.
 
 ---
 
