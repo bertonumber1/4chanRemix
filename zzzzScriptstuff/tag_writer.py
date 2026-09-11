@@ -307,8 +307,17 @@ def write_tags_to_file(
         _write_id3(f, tags, only_missing, result, path)
     elif cls_name == "MP4" or path.suffix.lower() in (".m4a", ".mp4", ".m4b"):
         _write_mp4(f, tags, only_missing, result)
+    elif cls_name == "WAVE":
+        # A WAV's ID3 lives inside a RIFF 'id3 ' chunk. EasyID3(path) opens
+        # the file expecting a bare ID3 stream at byte 0 -- a WAV always
+        # starts with "RIFF...WAVE" instead, so EasyID3 failed on every
+        # single WAV here with "doesn't start with an ID3 tag", tagged or
+        # not. mutagen.File() already parsed it correctly above; f.tags is
+        # the real ID3 object (or None on a file with no chunk yet), which
+        # is exactly what _write_id3 (MP3's path) already knows how to grow.
+        _write_id3(f, tags, only_missing, result, path)
     else:
-        # Other formats: try EasyID3 (covers AIFF, WAV with ID3 chunk)
+        # Other formats: try EasyID3 (covers AIFF)
         try:
             tags_obj = EasyID3(str(path))
             _write_easyid3(tags_obj, tags, only_missing, result)
@@ -356,8 +365,8 @@ def _write_vorbis(f, tags: dict[str, Any], only_missing: bool, result: WriteResu
 
 def _write_id3(f, tags: dict[str, Any], only_missing: bool,
                result: WriteResult, path: Path) -> None:
-    """MP3 writeback. f is a mutagen MP3 object, but its .tags is the
-    ID3 object we actually manipulate."""
+    """MP3 (and WAV) writeback. f is a mutagen MP3 or WAVE object, but its
+    .tags is the ID3 object we actually manipulate — same shape either way."""
     from mutagen.id3 import (
         ID3, ID3NoHeaderError, TXXX, TIT2, TPE1, TPE2, TALB, TRCK, TPOS,
         TDRC, TCON, TPUB, TCOM, TEXT, COMM, TBPM, TKEY, TLAN, TSRC,
