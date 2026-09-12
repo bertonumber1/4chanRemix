@@ -831,6 +831,146 @@ def main():
         check("outside every configured folder" in r_ti_outside["results"][0]["reason"],
               "a folder outside every root is refused, same as fix_tags")
 
+        print("\n[search_orphans]")
+
+        class FakeDiscogsSearch:
+            calls = []
+
+            def __init__(self, token, log=print):
+                pass
+
+            def search_release(self, query, label=""):
+                FakeDiscogsSearch.calls.append((query, label))
+                if "Gitana" in query:
+                    # Title agrees closely with the folder's own "Mi Gitana"
+                    # — this is the clean "added" path; title_match()'s own
+                    # bar (and near-miss behaviour) is covered in label_ref_test.py.
+                    return [{"id": 9101, "catno": "71-109",
+                             "title": "Analogue Gipsy Dance - Mi Gitana", "year": "1996"}]
+                if "Nothing Findable" in query:
+                    return []
+                if "Wrong Match" in query:
+                    # A result comes back, but its title does not agree with
+                    # ours closely enough — must be reported ambiguous, not added.
+                    return [{"id": 9102, "catno": "99-999",
+                            "title": "Completely Different Artist - Totally Unrelated Song",
+                            "year": "2000"}]
+                if "Already Catalogued" in query:
+                    # Title agrees closely enough to pass — this checks the
+                    # SEPARATE "already have this id" short-circuit, not the
+                    # title-agreement bar.
+                    return [{"id": 9001, "catno": "PR-001",
+                            "title": "Someone - Track", "year": "2001"}]
+                return []
+
+        real_discogs2 = P.L.Discogs
+        P.L.Discogs = FakeDiscogsSearch
+        try:
+            so_root = os.path.join(tmp, "search-orphans-incoming")
+            os.makedirs(so_root, exist_ok=True)
+            P.add_root(so_root, "incoming")
+            # An OWNED orphan must never be searched — orphans on that side
+            # are a different problem (a stray/wrong root), not "find this".
+            owned_orphan_root = os.path.join(tmp, "search-orphans-owned")
+            os.makedirs(owned_orphan_root, exist_ok=True)
+            P.add_root(owned_orphan_root, "owned")
+
+            P._write_scan({"label_id": label_id, "rows": [
+                {"folder": "", "catno": "PR-001", "artist": "A", "title": "Missing One",
+                 "year": 2001, "id": 9001, "key": "pr001", "status": "missing", "expected": 2},
+            ], "orphans": [
+                {"path": os.path.join(so_root, "(1996) Analogue Gipsy Dance - Mi Gitana FLAC"),
+                 "name": "(1996) Analogue Gipsy Dance - Mi Gitana FLAC", "role": "incoming",
+                 "catno": "1996", "title": "Analogue Gipsy Dance - Mi Gitana FLAC"},
+                {"path": os.path.join(so_root, "(2000) Nothing Findable - Track WAV"),
+                 "name": "(2000) Nothing Findable - Track WAV", "role": "incoming",
+                 "catno": "2000", "title": "Nothing Findable - Track WAV"},
+                {"path": os.path.join(so_root, "(2001) Wrong Match - Track WAV"),
+                 "name": "(2001) Wrong Match - Track WAV", "role": "incoming",
+                 "catno": "2001", "title": "Wrong Match - Track WAV"},
+                {"path": os.path.join(so_root, "(2001) Already Catalogued - Track WAV"),
+                 "name": "(2001) Already Catalogued - Track WAV", "role": "incoming",
+                 "catno": "2001", "title": "Already Catalogued - Track WAV"},
+                {"path": os.path.join(owned_orphan_root, "Some Owned Stray"),
+                 "name": "Some Owned Stray", "role": "owned", "catno": "", "title": "Some Owned Stray"},
+            ]})
+
+            r_so = P.search_orphans(cfg={})
+            eq(r_so, {"added": 1, "assigned": 2, "ambiguous": 1, "no_match": 1}, str(r_so))
+            queried = [q for q, lbl_ in FakeDiscogsSearch.calls]
+            check(not any("Owned Stray" in q for q in queried),
+                  "an OWNED-side orphan is never searched at all")
+
+            cat_after = P.L.LabelCache(P.CACHE_DIR, label_id).catalogue()
+            new_row = next((r for r in cat_after if r.get("id") == 9101), None)
+            check(new_row is not None, "the confident NEW match was added to the catalogue cache")
+            eq(new_row, {"id": 9101, "catno": "71-109", "title": "Mi Gitana",
+                        "artist": "Analogue Gipsy Dance", "year": "1996", "format": ""},
+               "…in label_releases()'s own row shape")
+
+            overrides_after = P.L.LabelCache(P.CACHE_DIR, label_id).folder_overrides()
+            gitana_path = os.path.join(so_root, "(1996) Analogue Gipsy Dance - Mi Gitana FLAC")
+            already_cat_path = os.path.join(so_root, "(2001) Already Catalogued - Track WAV")
+            eq(overrides_after.get(gitana_path), 9101,
+               "the newly-catalogued release is ALSO recorded as this folder's override")
+            eq(overrides_after.get(already_cat_path), 9001,
+               "the already-catalogued release (title-wording gap) is assigned to its folder")
+
+            FakeDiscogsSearch.calls = []
+            r_so_again = P.search_orphans(cfg={})
+            # Re-running still finds the same 4 incoming orphans (the scan
+            # itself is not re-run by this function) — but the Gitana one
+            # is now catalogued, so it should report as "already catalogued"
+            # (still assigned, just no second catalogue entry).
+            eq(r_so_again["added"], 0,
+               "run again without a rescan: the already-added release is not re-added")
+            eq(r_so_again["assigned"], 2,
+               "…but both folders are still (re-)assigned their override — idempotent")
+        finally:
+            P.L.Discogs = real_discogs2
+
+        print("\n[rename_incoming]")
+        ri_root = os.path.join(tmp, "rename-incoming")
+        ri_release = os.path.join(ri_root, "(1994) Test Artist - Test Release WAV")
+        untagged_flac(os.path.join(ri_release, "01 - Track.flac"))
+        P.add_root(ri_root, "incoming")
+        P._write_scan({"label_id": label_id, "rows": [
+            {"folder": "", "incoming_folder": ri_release, "catno": "RI-001?",
+             "artist": "Test Artist", "title": "Weird : Title / Here", "year": 1994,
+             "id": 999, "verdict": "new"},
+        ]})
+
+        r_ri_dry = P.rename_incoming([ri_release], dry_run=True)
+        check(r_ri_dry["results"][0]["ok"] and os.path.isdir(ri_release),
+              "dry run reports ok and does not touch the filesystem")
+
+        r_ri = P.rename_incoming([ri_release])
+        check(r_ri["ok"], "rename_incoming reports ok", str(r_ri))
+        new_path = r_ri["results"][0]["new_path"]
+        check(os.path.isdir(new_path) and not os.path.isdir(ri_release),
+              "the folder actually moved to the new name")
+        check(all(c not in os.path.basename(new_path) for c in '<>:"/\\|?*'),
+              "illegal Windows filename characters (from the catno/title) were stripped")
+
+        r_ri_again = P.rename_incoming([new_path])
+        eq(r_ri_again["results"][0]["reason"], "not matched to a catalogue release in the last scan — rescan first",
+           "the OLD path is gone from the cached scan now — renaming again needs a fresh scan first")
+
+        collide_root = os.path.join(tmp, "rename-collide")
+        collide_release = os.path.join(collide_root, "(1995) Someone - Another WAV")
+        untagged_flac(os.path.join(collide_release, "01 - Track.flac"))
+        os.makedirs(os.path.join(collide_root, "(RI-002) Blocking Name (1995)"), exist_ok=True)
+        P.add_root(collide_root, "incoming")
+        P._write_scan({"label_id": label_id, "rows": [
+            {"folder": "", "incoming_folder": collide_release, "catno": "RI-002",
+             "artist": "Someone", "title": "Blocking Name", "year": 1995,
+             "id": 998, "verdict": "new"},
+        ]})
+        r_ri_collide = P.rename_incoming([collide_release])
+        check("already exists at the target name" in r_ri_collide["results"][0]["reason"],
+              "a name collision is refused, not overwritten or silently numbered")
+        check(os.path.isdir(collide_release), "…and the source folder is untouched")
+
         print("\n[missing_releases export: rarity sort]")
         P._write_scan({"label_id": label_id, "rows": [
             {"catno": "R-1", "artist": "X", "title": "Rare One", "year": 2000, "id": 1,

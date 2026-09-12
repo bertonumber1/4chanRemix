@@ -115,6 +115,50 @@ check("/x/c" in matched_paths,
 a_folder = next(f for f in yl_folders if f["path"] == "/x/a")
 eq(a_folder.get("matched_by"), "year-led-title", "tagged with which tier actually matched it")
 
+print("\n[search_result_to_row]")
+sr = L.search_result_to_row({"id": 1368040, "catno": "71-109",
+                             "title": "Analogue Gipsy Dance - Gitana", "year": "1996"})
+eq(sr, {"id": 1368040, "catno": "71-109", "title": "Gitana",
+       "artist": "Analogue Gipsy Dance", "year": "1996", "format": ""},
+   "a real search hit reshaped into a catalogue.json-style row")
+sr_no_dash = L.search_result_to_row({"id": 2, "catno": "X", "title": "No Dash Title", "year": ""})
+eq(sr_no_dash["artist"], "", "no ' - ' in the search result's title: artist is empty, not guessed")
+eq(sr_no_dash["title"], "No Dash Title", "…title is still the whole string")
+
+print("\n[attach_folders: folder_overrides]")
+fo_catalogue = [
+    {"id": 601, "catno": "71-109", "artist": "Analogue Gipsy Dance", "title": "Gitana"},
+    {"id": 602, "catno": "22-999", "artist": "Someone Else", "title": "Unrelated"},
+]
+fo_folders = [
+    # A name that matches NEITHER catno nor title nor year-led tiers on its
+    # own (the real-world case: catalogue says "Gitana", folder says "Mi
+    # Gitana" — just below title_match()'s bar) — only the override finds it.
+    {"path": "/x/gitana", "name": "(1996) Analogue Gipsy Dance - Mi Gitana FLAC",
+     "catno": L.folder_catno("(1996) Analogue Gipsy Dance - Mi Gitana FLAC"),
+     "title": L.folder_title("(1996) Analogue Gipsy Dance - Mi Gitana FLAC")},
+    # No override at all for this one — must still fall through to the
+    # normal tiers rather than erroring.
+    {"path": "/x/plain", "name": "(22-999) Unrelated",
+     "catno": L.folder_catno("(22-999) Unrelated"),
+     "title": L.folder_title("(22-999) Unrelated")},
+]
+fo_overrides = {"/x/gitana": 601, "/x/nonexistent-path": 999999}
+fo_by_release, fo_orphans = L.attach_folders(fo_catalogue, fo_folders, fo_overrides)
+eq(len(fo_orphans), 0, "both folders matched — one by override, one by the normal catno tier")
+fo_matched = {f["path"]: f for group in fo_by_release.values() for f in group}
+eq(fo_matched["/x/gitana"]["matched_by"], "override",
+   "the override tier is what actually placed the near-miss-title folder")
+eq(fo_matched["/x/plain"]["matched_by"], "catno",
+   "a folder with no override still matches normally — the override tier never interferes")
+# An override pointing at an id that ISN'T in the catalogue must not crash
+# or match — it silently falls through to the normal tiers instead.
+fo_bad_override = {"path": "/x/plain2", "name": "(22-999) Unrelated",
+                   "catno": "22-999", "title": "Unrelated"}
+fo_by_release2, fo_orphans2 = L.attach_folders(
+    fo_catalogue, [fo_bad_override], {"/x/plain2": 999999})
+check(len(fo_orphans2) == 0, "an override id not in the catalogue falls through, not a crash")
+
 # Discogs packs every pressing into one field; matching the joined string
 # never hit a folder key, so multi-catno releases could not be owned at all.
 check("mxcd1562" in L.catno_keys("MXCD 1562 (CD), MXCD1562(CD), MXCD 1562 CD"),

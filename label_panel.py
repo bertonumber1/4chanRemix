@@ -445,6 +445,123 @@ def fetch_prices(cfg: dict, log=print, limit: int = 2000,
     return {"added": added}
 
 
+def search_orphans(cfg: dict, log=print, limit: int = 50,
+                   time_budget_s: float = 300.0, should_stop=None) -> dict:
+    """Live Discogs search for INCOMING folders the local catalogue cache
+    has no answer for at all — the last resort after attach_folders()'s
+    catno / title / year-led-title tiers all came up empty (folder_catno(),
+    folder_title() and year_led_artist_title() combined between them, still
+    nothing).
+
+    Two outcomes for a confident find, both recorded — measured against the
+    real archive, the second one is the common case, not the first:
+      - the release isn't in the catalogue cache at all yet: add it
+        (search_result_to_row()'s shape matches label_releases() rows
+        exactly, so it gets every consequence of being catalogued —
+        price, artwork, tag_incoming — for free on the next scan).
+      - it's ALREADY catalogued, just under a title-wording that never
+        would have cleared attach_folders()' own title_match() bar (e.g.
+        catalogue says "Gitana", the folder says "Mi Gitana") — record a
+        folder_overrides entry (this ONE folder's path -> that release id)
+        so attach_folders() can place it directly next scan, without
+        loosening the bar for every other folder in the process.
+
+    Neither one assigns anything itself — the NEXT Scan does the actual
+    matching, through the normal attach_folders() path, so this stays a
+    one-way "here is the answer for this folder" step, not a second
+    matching engine of its own.
+
+    Owned folders are not in scope: an owned folder the catalogue can't
+    explain is a different problem (a stray or a wrong root), not "help me
+    find what release this is" — that question only makes sense for
+    something judged against a catalogue it isn't confirmed to belong to
+    yet.
+
+    A label-name text filter on the search is real insurance but not a
+    guarantee (Discogs has no id-scoped label filter), so this still only
+    ever accepts Discogs' own top result when OUR OWN title_match() bar
+    agrees with it — never a guess, same as every other matching tier.
+    """
+    st = load_state()
+    scan_ = last_scan()
+    if not scan_:
+        log("[label] no scan yet — run Scan folders first")
+        return {"added": 0, "assigned": 0, "ambiguous": 0, "no_match": 0}
+    orphans = [o for o in scan_.get("orphans", []) if o.get("role") == "incoming"]
+    if not orphans:
+        log("[label] no incoming orphans — nothing to search for")
+        return {"added": 0, "assigned": 0, "ambiguous": 0, "no_match": 0}
+
+    c = cache(st)
+    cat = c.catalogue()
+    have_ids = {r.get("id") for r in cat if r.get("id")}
+    overrides = c.folder_overrides()
+    d = L.Discogs(_token(cfg), log)
+    label_name = st.get("label_name", "")
+
+    log(f"[label] {len(orphans)} incoming orphan(s); searching Discogs for up to "
+        f"{min(len(orphans), limit)} (time budget {time_budget_s:.0f}s)")
+    added = assigned = ambiguous = no_match = 0
+    start = time.time()
+    for o in orphans:
+        if should_stop and should_stop():
+            log(f"[label] search: stopped — {added} added, {assigned} assigned so far")
+            break
+        if time.time() - start > time_budget_s:
+            log(f"[label] search: time budget ({time_budget_s:.0f}s) reached, "
+                f"{added} added, {assigned} assigned — run again to continue")
+            break
+        if added + assigned + ambiguous + no_match >= limit:
+            log(f"[label] search: limit ({limit}) reached — run again to continue")
+            break
+
+        alt = L.year_led_artist_title(o.get("name") or "")
+        artist, title = alt if alt is not None else ("", o.get("title") or o.get("name") or "")
+        if not title:
+            no_match += 1
+            continue
+
+        try:
+            results = d.search_release(f"{artist} {title}".strip(), label=label_name)
+        except L.DiscogsError as e:
+            log(f"[label]   {o.get('name', '?')}: {e}")
+            no_match += 1
+            continue
+        if not results:
+            no_match += 1
+            continue
+
+        candidate = L.search_result_to_row(results[0])
+        if not L.title_match(candidate.get("title", ""), title):
+            ambiguous += 1
+            continue
+
+        path = o.get("path")
+        if candidate.get("id") not in have_ids:
+            cat.append(candidate)
+            have_ids.add(candidate.get("id"))
+            added += 1
+            log(f"[label]   found (new): ({candidate['catno']}) {candidate['artist']} - "
+                f"{candidate['title']}")
+        else:
+            log(f"[label]   found (already catalogued, title-wording gap): "
+                f"({candidate['catno']}) {candidate['artist']} - {candidate['title']}")
+        if path:
+            overrides[path] = candidate.get("id")
+            assigned += 1
+        if (added + assigned) % 10 == 0:
+            c.save_catalogue(cat)
+            c.save_folder_overrides(overrides)
+
+    c.save_catalogue(cat)
+    c.save_folder_overrides(overrides)
+    log(f"[label] search: {added} newly catalogued, {assigned} folder(s) assigned "
+        f"(including any newly-catalogued ones), {ambiguous} ambiguous (Discogs' own top "
+        f"result didn't agree closely enough to trust), {no_match} no match — "
+        f"rescan to see the assigned folders matched")
+    return {"added": added, "assigned": assigned, "ambiguous": ambiguous, "no_match": no_match}
+
+
 # ─── the scan ─────────────────────────────────────────────────────────────────
 def last_scan(label_id=None) -> dict | None:
     """The given label's cached scan result, or the ACTIVE label's if
@@ -657,6 +774,81 @@ def tag_incoming(paths: list, dry_run: bool = False) -> dict:
             "results": results, "dry_run": dry_run}
 
 
+def rename_incoming(paths: list, dry_run: bool = False) -> dict:
+    """Rename a matched incoming folder to this archive's own convention —
+    canonical_name()'s "(catno) Title (Year)" — so it reads like the rest
+    of the collection once it lands in the archive. A rename only, in
+    place: this never relocates a folder between directories, that is
+    move_folders()'s job, and the two are meant to be run in that order
+    (rename, then move) rather than combined into one action, so a wrong
+    catalogue match is still just a folder with a bad name, not one
+    already sitting in the archive under it.
+
+    Same "outside every configured folder" refusal as fix_tags/
+    move_folders — this touches the filesystem. Refuses a name collision
+    rather than overwriting or numbering something — never guess, same as
+    everywhere else here. The scan does not know about the rename until
+    the next one runs; incoming_folder in the cached scan is now stale for
+    anything just renamed, same as after any other write in this file.
+    """
+    st = load_state()
+    roots = [r["path"] for r in st.get("roots") or []]
+    scan_ = last_scan()
+    if not scan_:
+        return {"ok": False, "results": [],
+                "reason": "no scan yet — run Scan folders first"}
+    by_folder = {row["incoming_folder"]: row for row in scan_["rows"]
+                if row.get("incoming_folder")}
+
+    results = []
+    for src in paths:
+        src = os.path.abspath(src)
+        name = os.path.basename(src.rstrip(os.sep))
+        out = {"path": src, "name": name, "new_path": "", "ok": False, "reason": ""}
+
+        if not any(_under(src, r) for r in roots):
+            out["reason"] = "outside every configured folder — refusing to touch it"
+            results.append(out)
+            continue
+        row = by_folder.get(src)
+        if row is None:
+            out["reason"] = "not matched to a catalogue release in the last scan — rescan first"
+            results.append(out)
+            continue
+        if not os.path.isdir(src):
+            out["reason"] = "source folder is gone"
+            results.append(out)
+            continue
+
+        new_name = L.safe_folder_name(L.canonical_name(row))
+        dest = os.path.join(os.path.dirname(src.rstrip(os.sep)), new_name)
+        out["new_path"] = dest
+
+        if _norm(dest) == _norm(src):
+            out["ok"] = True
+            out["reason"] = "already named correctly"
+            results.append(out)
+            continue
+        if os.path.exists(dest):
+            out["reason"] = "a folder already exists at the target name: " + dest
+            results.append(out)
+            continue
+        if dry_run:
+            out["ok"] = True
+            out["reason"] = "would rename to: " + new_name
+            results.append(out)
+            continue
+        try:
+            os.rename(src, dest)
+            out["ok"] = True
+            out["reason"] = "renamed to: " + new_name
+        except OSError as exc:
+            out["reason"] = str(exc)
+        results.append(out)
+    return {"ok": bool(results) and all(r["ok"] for r in results),
+            "results": results, "dry_run": dry_run}
+
+
 def get_artwork(paths: list, cfg: dict, dry_run: bool = False) -> dict:
     """Give a release a loose cover image (folder.jpg) — never touches the
     audio files, which sidesteps both embedding art into a format that does
@@ -807,7 +999,7 @@ def scan(cfg: dict, log=print, should_stop=None) -> dict:
                             should_stop=should_stop)
     log(f"[label] read {len(folders)} release folders; matching …")
     tls = c.tracklists()
-    res = L.assess(cat, folders, tls, st.get("overrides"))
+    res = L.assess(cat, folders, tls, st.get("overrides"), c.folder_overrides())
     # Cross-check costs nothing new (no audio decode, no Discogs calls — just
     # the tags/artwork index_roots already read), so unlike authenticity it
     # runs on every scan, not as a separate opt-in job.

@@ -1613,6 +1613,10 @@ async function lbLoad(){
           `title="This folder's files have no tags at all — write the catalogue number, artist and album `+
           `this row matched it to into every file (only_missing, so anything already tagged is left alone). `+
           `Per-track title/track-number too, wherever a track listing lets it match a specific file.">Tag files</button>`:''}
+        ${r.incoming_folder && r.verdict?`<button class="btn-xs ghost" data-rename-incoming="${esc(r.incoming_folder)}" `+
+          `title="Rename this folder in place to this archive's own convention — (catno) Title (Year) — `+
+          `so it reads like the rest of the collection. Refuses if a folder already exists under that name. `+
+          `Run this before Move to archive, not instead of it.">Rename folder</button>`:''}
         ${r.folder?`<button class="btn-xs ghost" data-open="${esc(r.folder)}" title="Open the folder you hold in the file manager">↗</button>`:''}
       </td></tr>`;
   }).join('');
@@ -1702,6 +1706,8 @@ function lbRowClick(ev){
   if(ga){ lbGetArtwork(ga.dataset.getArtwork); return; }
   const ti=ev.target.closest('[data-tag-incoming]');
   if(ti){ lbTagIncoming(ti.dataset.tagIncoming); return; }
+  const ri=ev.target.closest('[data-rename-incoming]');
+  if(ri){ lbRenameIncoming(ri.dataset.renameIncoming); return; }
   const un=ev.target.closest('[data-undo]');
   if(un){ lbUndo(un.dataset.undo); return; }
   const cb=ev.target.closest('input[data-pick]');
@@ -1908,6 +1914,17 @@ async function lbGetArtwork(folder){
 // somehow already has a value is left alone.
 async function lbTagIncoming(folder){
   const r=await (await fetch('/api/label/tag-incoming',{method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({paths:[folder]})})).json();
+  const row=(r.results||[])[0];
+  lbLog(row && row.ok ? 'info' : 'broken', (row && row.reason) || r.reason || '');
+  lbLoad();
+}
+
+// Renames the folder in place to the archive's own "(catno) Title (Year)"
+// convention. A rename only — Move to archive stays a separate step.
+async function lbRenameIncoming(folder){
+  const r=await (await fetch('/api/label/rename-incoming',{method:'POST',
     headers:{'Content-Type':'application/json'},
     body:JSON.stringify({paths:[folder]})})).json();
   const row=(r.results||[])[0];

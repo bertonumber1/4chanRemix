@@ -623,6 +623,9 @@ def _do_label(ui, kind, cfg, dest="", force=False):
         elif kind == "label_prices":
             lbl.fetch_prices(cfg, log, limit=int(dest) if dest else 2000,
                              should_stop=_stop_flag.is_set)
+        elif kind == "label_search_orphans":
+            lbl.search_orphans(cfg, log, limit=int(dest) if dest else 50,
+                               should_stop=_stop_flag.is_set)
         else:
             # Stop must reach the folder loop itself. ui.log() only raises
             # _StopRequested on the NEXT log line, and this job logs once every
@@ -705,7 +708,7 @@ def _run_job(kind, sources, dest, provider_ids, cfg, dry_run, db_target="library
                 _do_direct(ui, sources, dest, provider_ids, cfg, dry_run,
                            steps=("import", "organise"))
             elif kind in ("label_scan", "label_catalogue", "label_tracklists",
-                         "label_prices"):
+                         "label_prices", "label_search_orphans"):
                 _do_label(ui, kind, cfg, dest, force)
             elif kind == "label_onboard":
                 _do_label_onboard(ui, cfg, dest, role)
@@ -1691,6 +1694,16 @@ async def label_tag_incoming(req: Request):
     return JSONResponse(res)
 
 
+@app.post("/api/label/rename-incoming")
+async def label_rename_incoming(req: Request):
+    g = _lbl_guard()
+    if g:
+        return g
+    body = await req.json()
+    res = lbl.rename_incoming(body.get("paths") or [], bool(body.get("dry_run")))
+    return JSONResponse(res)
+
+
 @app.get("/api/label/moves")
 def label_moves(limit: int = 200):
     g = _lbl_guard()
@@ -2160,8 +2173,8 @@ async def start_job(kind: str, request: Request):
              "direct_scan","direct_tags","direct_organise",
              "rebuild","vacuum","fake_flac_scan","fake_flac_vamp",
              "tags_from_names","label_scan","label_catalogue",
-             "label_tracklists","label_prices","label_onboard",
-             "label_authenticity","stop"}
+             "label_tracklists","label_prices","label_search_orphans",
+             "label_onboard","label_authenticity","stop"}
     if kind not in valid:
         return JSONResponse({"error": f"unknown job: {kind}"}, status_code=400)
     if kind == "stop":

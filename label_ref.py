@@ -132,6 +132,16 @@ _INVISIBLE = re.compile(
     "[​-‏‪-‮﻿]")
 
 
+def _split_artist_title(s: str) -> tuple[str, str]:
+    """"Artist - Title" -> (artist, title), invisible formatting marks
+    stripped first. artist is "" when there is no " - " to split on."""
+    rest = _INVISIBLE.sub("", s or "")
+    parts = re.split(r"\s+-\s+", rest.strip(), maxsplit=1)
+    if len(parts) == 2 and parts[0].strip():
+        return parts[0].strip(), parts[1].strip()
+    return "", rest.strip()
+
+
 def year_led_artist_title(name: str) -> tuple[str, str] | None:
     """For a folder named "(YEAR) Artist - Title FORMAT" -- a different
     archive's convention (year leads, not a catalogue number) from this
@@ -146,12 +156,22 @@ def year_led_artist_title(name: str) -> tuple[str, str] | None:
     m = _YEAR_LED.match((name or "").strip())
     if not m:
         return None
-    rest = _INVISIBLE.sub("", m.group(1))
-    rest = _TRAILING_FORMAT.sub("", rest).strip()
-    parts = re.split(r"\s+-\s+", rest, maxsplit=1)
-    if len(parts) == 2 and parts[0].strip():
-        return parts[0].strip(), parts[1].strip()
-    return "", rest
+    rest = _TRAILING_FORMAT.sub("", m.group(1)).strip()
+    return _split_artist_title(rest)
+
+
+def search_result_to_row(sr: dict) -> dict:
+    """One live search_release() hit, reshaped into a catalogue.json-style
+    row (separate artist/title, not search's combined "Artist - Title") --
+    the same shape label_releases() rows already have, so a release found
+    this way slots into the existing catalogue cache and every function
+    that reads it (attach_folders, tag_incoming, price/artwork lookups)
+    needs no special case for where the row came from.
+    """
+    artist, title = _split_artist_title(sr.get("title") or "")
+    return {"id": sr.get("id"), "catno": sr.get("catno") or "",
+            "title": title, "artist": artist,
+            "year": str(sr.get("year") or ""), "format": ""}
 
 
 def ncat(s: str) -> str:
@@ -841,6 +861,27 @@ class Discogs:
             "want": community.get("want"),
         }
 
+    def search_release(self, query: str, label: str = "") -> list:
+        """Live Discogs search, for a folder the local catalogue cache has
+        no answer for at all — a DIFFERENT source of truth than
+        label_releases() (which only ever lists what was already fetched
+        for this label), so this is the only way to find a release the
+        catalogue fetch missed or that was added to Discogs since.
+
+        `label` narrows results to this label by name (a text filter, not
+        an id — Discogs' own search API has no id-scoped label filter), cheap
+        insurance against matching a same-titled release on someone else's
+        catalogue. Results carry catno and a combined "title" ("Artist -
+        Title") straight from search, not the separate artist/title fields
+        label_releases() returns — the caller splits it the same way a
+        year-led folder name gets split.
+        """
+        params = {"type": "release", "q": query}
+        if label:
+            params["label"] = label
+        d = self._get("/database/search", params)
+        return d.get("results", []) or []
+
     def release_images(self, release_id: int) -> list:
         """A release's own images, straight off the SAME /releases/{id}
         response tracklist() already calls — no new endpoint, just a field
@@ -890,6 +931,7 @@ class LabelCache:
         self.cat_path = os.path.join(self.dir, "catalogue.json")
         self.tl_path = os.path.join(self.dir, "tracklists.json")
         self.pr_path = os.path.join(self.dir, "prices.json")
+        self.fo_path = os.path.join(self.dir, "folder_overrides.json")
 
     # -- catalogue --
     def catalogue(self) -> list:
@@ -913,6 +955,17 @@ class LabelCache:
 
     def save_prices(self, d: dict):
         _write_json(self.pr_path, d)
+
+    # -- folder path -> Discogs release id, for a specific folder search_orphans()
+    # has already confirmed the answer for by name, keyed on path rather than
+    # any catno/title key because the whole reason it exists is that this ONE
+    # folder's name doesn't agree with attach_folders()' own matching tiers --
+    # even though the release itself is (or now is) in the catalogue.
+    def folder_overrides(self) -> dict:
+        return _read_json(self.fo_path, {})
+
+    def save_folder_overrides(self, d: dict):
+        _write_json(self.fo_path, d)
 
     def seed(self, log=print) -> str:
         """Import label2lossless's caches for this label, if they exist.
@@ -1072,18 +1125,30 @@ def _catalogue_index(catalogue: list) -> dict:
     return idx
 
 
-def attach_folders(catalogue: list, folders: list) -> tuple:
+def attach_folders(catalogue: list, folders: list, folder_overrides: dict | None = None) -> tuple:
     """Decide, for every folder, which catalogue release it is.
 
     Returns (by_release, orphans) where by_release maps the release's identity
     key to the folders claiming it, and orphans are folders that matched nothing
     in this label's catalogue.
+
+    `folder_overrides` ({path: release_id}) is checked FIRST, ahead of every
+    other tier — it exists for exactly the folder this function's own tiers
+    cannot place: search_orphans() found and confirmed the release by name,
+    sometimes one already sitting in the catalogue under a title-wording
+    that never would have cleared title_match()'s bar. An explicit answer
+    for THIS folder outranks every generic rule this function has.
     """
     idx = _catalogue_index(catalogue)
+    id_idx = {r["id"]: r for r in catalogue if r.get("id")}
     by_release, orphans = {}, []
     for f in folders:
         row = None
-        keys = catno_keys(f["catno"]) if f["catno"] else set()
+        override_id = (folder_overrides or {}).get(f.get("path"))
+        if override_id is not None and override_id in id_idx:
+            row = id_idx[override_id]
+            f["matched_by"] = "override"
+        keys = catno_keys(f["catno"]) if row is None and f["catno"] else set()
         for k in keys:
             if k in idx:
                 row = idx[k]
@@ -1176,16 +1241,22 @@ def price_for(row: dict, prices: dict) -> dict | None:
     return None
 
 
-def assess(catalogue: list, folders: list, tls: dict, overrides=None) -> dict:
+def assess(catalogue: list, folders: list, tls: dict, overrides=None,
+          folder_overrides=None) -> dict:
     """The whole picture: one row per catalogue release, plus the orphan folders.
 
     Completeness is computed WITHIN A SINGLE FOLDER, never across the library.
     Counting scattered track matches anywhere under a root is what made 146 Bit
     Music compilations read as owned when no folder held them — they were never
     hunted for again.
+
+    `overrides` and `folder_overrides` are unrelated despite the name: the
+    first is catnos the owner has declared finished regardless of track
+    count; the second is {folder path: release id}, search_orphans()'
+    per-folder answer for a name attach_folders()'s own tiers can't place.
     """
     overrides = {ncat(o) for o in (overrides or [])}
-    by_release, orphans = attach_folders(catalogue, folders)
+    by_release, orphans = attach_folders(catalogue, folders, folder_overrides)
 
     # One row per RELEASE, not per catalogue entry.  Discogs lists every
     # pressing separately — the CD and the 2xCD reissue of "Bit Music: 10 Años
@@ -1435,6 +1506,20 @@ def canonical_name(row: dict) -> str:
     if row.get("year"):
         name += f" ({row['year']})"
     return name
+
+
+def safe_folder_name(name: str) -> str:
+    """canonical_name()'s output, made safe to actually create on disk.
+
+    A Discogs title routinely carries "?", ":" or "/" — a remix credit
+    alone can hold two of them — and every one of those is illegal in a
+    Windows filename. canonical_name() itself stays a pure display/compare
+    string (naming_check() diffs it against a folder's ACTUAL name, where
+    sanitising would just make real mismatches invisible); this is the
+    separate step for the one caller that renames something for real.
+    """
+    cleaned = "".join("_" if c in '<>:"/\\|?*' or ord(c) < 32 else c for c in name)
+    return cleaned.strip(" .") or "untitled"
 
 
 def naming_check(folder_name: str, row: dict) -> dict:
