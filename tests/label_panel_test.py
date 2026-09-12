@@ -755,6 +755,82 @@ def main():
         finally:
             P.L.Discogs = real_discogs
 
+        print("\n[tag_incoming]")
+        from mutagen.flac import FLAC as _FLAC2
+
+        def untagged_flac(path, title=None):
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            sf.write(path, np.zeros(4410, dtype="float32"), 44100, format="FLAC")
+            if title is not None:
+                f = _FLAC2(path)
+                f["title"] = title
+                f.save()
+
+        ti_root = os.path.join(tmp, "tag-incoming")
+        ti_release = os.path.join(ti_root, "(1994) Test Artist - Test Release WAV")
+        t1 = os.path.join(ti_release, "01 - Track One.flac")
+        t2 = os.path.join(ti_release, "02 - Track Two.flac")
+        untagged_flac(t1, title="Track One")
+        untagged_flac(t2, title="Track Two")
+        P.add_root(ti_root, "incoming")
+
+        ti_catno = "TI-001"
+        ti_key = sorted(P.L.catno_keys(ti_catno))[0]
+        P.L.LabelCache(P.CACHE_DIR, label_id).save_tracklists(
+            {ti_key: {"tracks": ["Track One", "Track Two"]}})
+        P._write_scan({"label_id": label_id, "rows": [
+            {"folder": "", "incoming_folder": ti_release, "catno": ti_catno,
+             "artist": "Test Artist", "title": "Test Release", "id": 888,
+             "verdict": "new"},
+        ]})
+
+        r_dry_ti = P.tag_incoming([ti_release], dry_run=True)
+        eq(r_dry_ti["results"][0]["tagged_files"], 2,
+           "dry run: both untagged files would get written")
+        eq(_FLAC2(t1).get("artist"), None, "dry run writes nothing to disk")
+
+        r_ti = P.tag_incoming([ti_release])
+        check(r_ti["ok"], "tag_incoming reports ok", str(r_ti))
+        eq(r_ti["results"][0]["tagged_files"], 2, "both files actually got written")
+
+        tags_t1 = _FLAC2(t1)
+        eq(tags_t1.get("artist"), ["Test Artist"], "release artist written")
+        eq(tags_t1.get("album"), ["Test Release"], "release title written as album")
+        eq(tags_t1.get("catalognumber"), ["TI-001"], "catalogue number written")
+        eq(tags_t1.get("title"), ["Track One"],
+           "per-track title from the tracklist match — untouched since it was already there")
+        eq(tags_t1.get("tracknumber"), ["1"], "per-track number from tracklist position")
+
+        tags_t2 = _FLAC2(t2)
+        eq(tags_t2.get("tracknumber"), ["2"], "track two got position 2")
+
+        r_ti_again = P.tag_incoming([ti_release])
+        eq(r_ti_again["results"][0]["tagged_files"], 0,
+           "run again: every field already has a value — nothing re-written")
+
+        # A "Various" catalogue artist must never get stamped onto a specific
+        # folder's files — that would be actively wrong metadata.
+        va_root = os.path.join(tmp, "tag-incoming-va")
+        va_release = os.path.join(va_root, "(2000) Anyone - Comp Track WAV")
+        untagged_flac(os.path.join(va_release, "01 - Comp Track.flac"))
+        P.add_root(va_root, "incoming")
+        P._write_scan({"label_id": label_id, "rows": [
+            {"folder": "", "incoming_folder": ti_release, "catno": ti_catno,
+             "artist": "Test Artist", "title": "Test Release", "id": 888, "verdict": "new"},
+            {"folder": "", "incoming_folder": va_release, "catno": "VA-001",
+             "artist": "Various", "title": "Some Compilation", "id": 889, "verdict": "new"},
+        ]})
+        r_va = P.tag_incoming([va_release])
+        va_file = os.path.join(va_release, "01 - Comp Track.flac")
+        eq(_FLAC2(va_file).get("artist"), None,
+           "catalogue artist 'Various' is never written as a specific file's artist")
+        eq(_FLAC2(va_file).get("album"), ["Some Compilation"],
+           "…but the album/catno still get written")
+
+        r_ti_outside = P.tag_incoming([os.path.join(tmp, "not-a-root")])
+        check("outside every configured folder" in r_ti_outside["results"][0]["reason"],
+              "a folder outside every root is refused, same as fix_tags")
+
         print("\n[missing_releases export: rarity sort]")
         P._write_scan({"label_id": label_id, "rows": [
             {"catno": "R-1", "artist": "X", "title": "Rare One", "year": 2000, "id": 1,

@@ -1609,6 +1609,10 @@ async function lbLoad(){
       <td class="lb-c-do">
         ${r.missing_tracks.length?`<button class="btn-xs ghost" data-more="${i}" title="Show the tracks still missing from this release">${r.missing_tracks.length} <span>missing</span> ▾</button>`:''}
         ${ccBadge}
+        ${r.incoming_folder && r.verdict?`<button class="btn-xs ghost" data-tag-incoming="${esc(r.incoming_folder)}" `+
+          `title="This folder's files have no tags at all — write the catalogue number, artist and album `+
+          `this row matched it to into every file (only_missing, so anything already tagged is left alone). `+
+          `Per-track title/track-number too, wherever a track listing lets it match a specific file.">Tag files</button>`:''}
         ${r.folder?`<button class="btn-xs ghost" data-open="${esc(r.folder)}" title="Open the folder you hold in the file manager">↗</button>`:''}
       </td></tr>`;
   }).join('');
@@ -1696,6 +1700,8 @@ function lbRowClick(ev){
   if(ft){ lbFixTags(ft.dataset.fixTags); return; }
   const ga=ev.target.closest('[data-get-artwork]');
   if(ga){ lbGetArtwork(ga.dataset.getArtwork); return; }
+  const ti=ev.target.closest('[data-tag-incoming]');
+  if(ti){ lbTagIncoming(ti.dataset.tagIncoming); return; }
   const un=ev.target.closest('[data-undo]');
   if(un){ lbUndo(un.dataset.undo); return; }
   const cb=ev.target.closest('input[data-pick]');
@@ -1889,6 +1895,19 @@ async function lbFixTags(folder){
 // is already there (get_artwork refuses before it gets this far).
 async function lbGetArtwork(folder){
   const r=await (await fetch('/api/label/get-artwork',{method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({paths:[folder]})})).json();
+  const row=(r.results||[])[0];
+  lbLog(row && row.ok ? 'info' : 'broken', (row && row.reason) || r.reason || '');
+  lbLoad();
+}
+
+// Incoming-only: this folder's files carry no tags at all yet, and the row
+// it is showing under IS the catalogue match — write that match's own
+// catalog_number/artist/album into every file, only_missing so a file that
+// somehow already has a value is left alone.
+async function lbTagIncoming(folder){
+  const r=await (await fetch('/api/label/tag-incoming',{method:'POST',
     headers:{'Content-Type':'application/json'},
     body:JSON.stringify({paths:[folder]})})).json();
   const row=(r.results||[])[0];

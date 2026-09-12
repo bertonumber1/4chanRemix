@@ -559,6 +559,104 @@ def fix_tags(paths: list, dry_run: bool = False) -> dict:
             "results": results, "dry_run": dry_run}
 
 
+def tag_incoming(paths: list, dry_run: bool = False) -> dict:
+    """Stamp an INCOMING folder's files with the catalogue release the scan
+    already matched it to — catalog_number, artist and album on every file,
+    plus per-track title/track_number wherever the tracklist lets a track
+    be matched to a specific file.
+
+    Exists for shares like this: a whole label's worth of releases,
+    correctly organised into one folder per release, but the audio files
+    themselves carry NO tags at all — no artist, no title, nothing. Without
+    this they would need a full retag pass through the Fetch Tags pipeline
+    before they mean anything as files, even though the one piece of
+    information a lookup would have to guess at (which release this is) is
+    exactly what the label match already knows for certain.
+
+    write_tags_to_file's only_missing=True throughout — a file that already
+    has a value, right or wrong, is never touched. Same "outside the
+    configured roots" refusal as fix_tags/move_folders, keyed on
+    incoming_folder rather than folder since that is where an incoming
+    match's path actually lives on a scan row.
+    """
+    from tag_writer import write_tags_to_file
+
+    st = load_state()
+    roots = [r["path"] for r in st.get("roots") or []]
+    scan_ = last_scan()
+    if not scan_:
+        return {"ok": False, "results": [],
+                "reason": "no scan yet — run Scan folders first"}
+    by_folder = {row["incoming_folder"]: row for row in scan_["rows"]
+                if row.get("incoming_folder")}
+    tls = cache(st).tracklists()
+
+    results = []
+    for src in paths:
+        src = os.path.abspath(src)
+        name = os.path.basename(src.rstrip(os.sep))
+        out = {"path": src, "name": name, "tagged_files": 0, "ok": False, "reason": ""}
+
+        if not any(_under(src, r) for r in roots):
+            out["reason"] = "outside every configured folder — refusing to touch it"
+            results.append(out)
+            continue
+        row = by_folder.get(src)
+        if row is None:
+            out["reason"] = "not matched to a catalogue release in the last scan — rescan first"
+            results.append(out)
+            continue
+
+        info = L.folder_tracks(src)
+        file_paths = info.get("paths") or []
+        if not file_paths:
+            out["reason"] = "no lossless audio files found here"
+            results.append(out)
+            continue
+
+        row_artist = (row.get("artist") or "").strip()
+        various = row_artist.lower() in ("", "various", "various artists", "va", "v/a")
+        release_tags = {"catalog_number": row.get("catno") or "", "album": row.get("title") or ""}
+        if not various:
+            release_tags["artist"] = row_artist
+        release_tags = {k: v for k, v in release_tags.items() if v}
+
+        expected = L.tracklist_for(row, tls)
+        matched = L.match_tracks(expected, info.get("ids") or []) if expected else {}
+        track_tags_by_file = {}
+        for ti, track_title in enumerate(expected):
+            fi = matched.get(ti)
+            if fi is not None and 0 <= fi < len(file_paths):
+                track_tags_by_file[fi] = {"title": track_title, "track_number": str(ti + 1)}
+
+        tagged = errors = 0
+        for fi, fpath in enumerate(file_paths):
+            tags = dict(release_tags)
+            tags.update(track_tags_by_file.get(fi, {}))
+            if not tags:
+                continue
+            res = write_tags_to_file(fpath, tags, only_missing=True, dry_run=dry_run)
+            if res.error:
+                errors += 1
+            elif res.written_fields:
+                tagged += 1
+        out["tagged_files"] = tagged
+        out["ok"] = errors == 0
+        if dry_run:
+            out["reason"] = "would tag %d file(s) as (%s) %s" % (
+                tagged, row.get("catno", ""), row.get("title", ""))
+        elif errors:
+            out["reason"] = "%d error(s) writing tags" % errors
+        elif tagged:
+            out["reason"] = "tagged %d file(s) as (%s) %s" % (
+                tagged, row.get("catno", ""), row.get("title", ""))
+        else:
+            out["reason"] = "nothing to tag — every file already had these fields"
+        results.append(out)
+    return {"ok": bool(results) and all(r["ok"] for r in results),
+            "results": results, "dry_run": dry_run}
+
+
 def get_artwork(paths: list, cfg: dict, dry_run: bool = False) -> dict:
     """Give a release a loose cover image (folder.jpg) — never touches the
     audio files, which sidesteps both embedding art into a format that does
