@@ -782,6 +782,30 @@ class Discogs:
                 out.append(title)
         return out
 
+    def release_price(self, release_id: int, curr_abbr: str = "") -> dict:
+        """Marketplace stats for one release — SAME /releases/{id} endpoint
+        tracklist() and release_images() already call, just with a currency
+        param and reading different fields off the same response. No new
+        endpoint, no new rate-limit concern.
+
+        `lowest_price` and `num_for_sale` only appear at all once curr_abbr
+        is passed (Discogs' own behaviour, not a choice made here) and
+        EXCLUDE postage — the price on the label is not the price in your
+        basket. `community` (have/want) is always present and is the
+        better rarity signal anyway: a release with zero copies for sale
+        this week is not necessarily rare, but one only 3 people on Discogs
+        have ever logged owning is.
+        """
+        d = self._get(f"/releases/{int(release_id)}",
+                      {"curr_abbr": curr_abbr} if curr_abbr else None)
+        community = d.get("community") or {}
+        return {
+            "lowest_price": d.get("lowest_price"),
+            "num_for_sale": d.get("num_for_sale"),
+            "have": community.get("have"),
+            "want": community.get("want"),
+        }
+
     def release_images(self, release_id: int) -> list:
         """A release's own images, straight off the SAME /releases/{id}
         response tracklist() already calls — no new endpoint, just a field
@@ -830,6 +854,7 @@ class LabelCache:
         self.dir = os.path.join(root, str(self.label_id))
         self.cat_path = os.path.join(self.dir, "catalogue.json")
         self.tl_path = os.path.join(self.dir, "tracklists.json")
+        self.pr_path = os.path.join(self.dir, "prices.json")
 
     # -- catalogue --
     def catalogue(self) -> list:
@@ -844,6 +869,15 @@ class LabelCache:
 
     def save_tracklists(self, d: dict):
         _write_json(self.tl_path, d)
+
+    # -- marketplace price/rarity, keyed by every catno key too (same shape
+    # as tracklists, so callers that already know how to look one up know
+    # how to look up the other) --
+    def prices(self) -> dict:
+        return _read_json(self.pr_path, {})
+
+    def save_prices(self, d: dict):
+        _write_json(self.pr_path, d)
 
     def seed(self, log=print) -> str:
         """Import label2lossless's caches for this label, if they exist.
@@ -1042,6 +1076,29 @@ def release_key(row: dict) -> str:
     return ks[0] if ks else "t:" + norm(row.get("title", ""))
 
 
+def classify_rarity(price: dict | None) -> str:
+    """"cheap and common" vs "rare — long hunt", from cached release_price()
+    data. "" when nothing has been fetched for this release yet — never
+    guessed, never defaulted to either bucket.
+
+    num_for_sale is the primary signal, not lowest_price: a copy sitting at
+    any price is a copy you can actually go buy today, while a price alone
+    says nothing about whether one is available RIGHT NOW. `have` backs it
+    up for the edge case num_for_sale can't see — a release with plenty of
+    copies logged as owned but none currently listed is still a common
+    record having a quiet week, not a rare one.
+    """
+    if not price:
+        return ""
+    n = price.get("num_for_sale")
+    have = price.get("have")
+    if n is None and have is None:
+        return ""
+    if (n or 0) >= 2 or (have or 0) >= 15:
+        return "cheap and common"
+    return "rare — long hunt"
+
+
 def tracklist_for(row: dict, tls: dict) -> list:
     """The expected tracklist for a catalogue row, from cache.  [] when unknown."""
     for k in sorted(catno_keys(row.get("catno"))):
@@ -1049,6 +1106,16 @@ def tracklist_for(row: dict, tls: dict) -> list:
         if got:
             return list(got.get("tracks") or []) if isinstance(got, dict) else list(got)
     return []
+
+
+def price_for(row: dict, prices: dict) -> dict | None:
+    """The cached release_price() data for a catalogue row. None when
+    unknown — same lookup-by-every-catno-key shape as tracklist_for()."""
+    for k in sorted(catno_keys(row.get("catno"))):
+        got = prices.get(k)
+        if got:
+            return got
+    return None
 
 
 def assess(catalogue: list, folders: list, tls: dict, overrides=None) -> dict:

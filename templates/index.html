@@ -644,6 +644,7 @@
       <button class="btn-xs" onclick="lbChangeLabel()" title="Search Discogs for a different record label and make it the one this tab reports on">Change label…</button>
       <button class="btn-xs" onclick="lbJob('label_catalogue')" title="Download this label's full release list from Discogs. Reuses the copy label2lossless already fetched when there is one, so it usually costs nothing.">Get catalogue</button>
       <button class="btn-xs" onclick="lbJob('label_tracklists')" title="Fetch the track listings for releases that still lack one — that is what turns 'we have this' into 'we have 9 of its 12 tracks'. One Discogs call per release, so it runs in capped batches and can be run again.">Get tracklists</button>
+      <button class="btn-xs" onclick="lbJob('label_prices')" title="Fetch marketplace price and rarity for releases you do not hold at all, so the Missing releases (CSV) export can sort them cheap-and-common first, rare — long hunt after. One Discogs call per release, so it runs in capped batches and can be run again.">Get prices</button>
     </div>
   </div>
 

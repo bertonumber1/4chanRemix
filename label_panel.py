@@ -370,6 +370,81 @@ def fetch_tracklists(cfg: dict, log=print, limit: int = 2000,
     return {"added": added}
 
 
+def fetch_prices(cfg: dict, log=print, limit: int = 2000,
+                 time_budget_s: float = 600.0, should_stop=None) -> dict:
+    """Marketplace price/rarity for releases you do not hold at all —
+    fetch_tracklists' own pacing, resume and time-budget shape, aimed at a
+    narrower set: only MISSING releases get one, because price/rarity exists
+    to answer one question — is this one worth the hunt — that a release you
+    already own in full or in part does not need answered.
+    """
+    st = load_state()
+    c = cache(st)
+    cat, prices = c.catalogue(), c.prices()
+    if not cat:
+        log("[label] no catalogue yet — fetch that first")
+        return {"added": 0}
+
+    scan = last_scan()
+    if not scan:
+        log("[label] no scan yet — run Scan folders first, so this knows what is missing")
+        return {"added": 0}
+    missing_keys = {r["key"] for r in scan.get("rows", []) if r["status"] == "missing"}
+    if not missing_keys:
+        log("[label] nothing missing — every release here is at least partly held")
+        return {"added": 0}
+
+    want = []
+    for r in cat:
+        if not r.get("id"):
+            continue
+        if L.release_key(r) not in missing_keys:
+            continue
+        if L.price_for(r, prices):
+            continue
+        want.append(r)
+    if not want:
+        log("[label] every missing release already has a cached price")
+        return {"added": 0}
+
+    d = L.Discogs(_token(cfg), log)
+    # No per-label currency setting exists (or was asked for) — USD is
+    # Discogs' own default market and a reasonable one to fix on rather
+    # than invent config surface nothing else reads yet.
+    curr_abbr = "USD"
+    log(f"[label] {len(want)} missing releases without a price; "
+        f"fetching up to {min(len(want), limit)} in {curr_abbr} "
+        f"(time budget {time_budget_s:.0f}s)")
+    added = 0
+    start = time.time()
+    for r in want:
+        if should_stop and should_stop():
+            log(f"[label] prices: stopped — {added}/{len(want)} done")
+            break
+        if time.time() - start > time_budget_s:
+            log(f"[label] prices: time budget ({time_budget_s:.0f}s) reached, "
+                f"{added}/{len(want)} done — run again to continue")
+            break
+        if added >= limit:
+            log(f"[label] prices: limit ({limit}) reached, "
+                f"{added}/{len(want)} done — run again to continue")
+            break
+        try:
+            info = d.release_price(r["id"], curr_abbr)
+        except L.DiscogsError as e:
+            log(f"[label]   {r.get('catno', '?')}: {e}")
+            continue
+        for k in L.catno_keys(r.get("catno")):
+            prices[k] = info
+        added += 1
+        if added % 25 == 0:
+            c.save_prices(prices)
+            log(f"[label]   {added}/{len(want)} …")
+    c.save_prices(prices)
+    log(f"[label] prices added: {added}")
+    return {"added": added}
+
+
 # ─── the scan ─────────────────────────────────────────────────────────────────
 def last_scan(label_id=None) -> dict | None:
     """The given label's cached scan result, or the ACTIVE label's if
@@ -642,6 +717,17 @@ def scan(cfg: dict, log=print, should_stop=None) -> dict:
     for row in res["rows"]:
         if row.get("folder"):
             cross_check_release(row, by_path.get(row["folder"]), tls)
+    # Price/rarity, same free-ride shape as cross-check: nothing new to
+    # fetch, just attaching whatever fetch_prices() already cached. Missing
+    # releases only — see fetch_prices()'s own docstring for why.
+    prices = c.prices()
+    if prices:
+        for row in res["rows"]:
+            if row["status"] == "missing":
+                info = L.price_for(row, prices)
+                if info:
+                    row["price"] = info
+                    row["rarity"] = L.classify_rarity(info)
     out = {
         "when": int(time.time()),
         "label_id": st["label_id"], "label_name": st["label_name"],
@@ -828,11 +914,28 @@ def export(kind: str) -> tuple[str, str]:
         buf = io.StringIO()
         w = csv.writer(buf)
         w.writerow(["catno", "artist", "title", "year", "discogs_id",
-                    "tracks_expected"])
-        for r in rows:
-            if r["status"] == "missing":
-                w.writerow([r["catno"], r["artist"], r["title"], r["year"],
-                            r["id"] or "", r["expected"]])
+                    "tracks_expected", "rarity", "lowest_price", "num_for_sale",
+                    "discogs_have", "discogs_want"])
+        missing = [r for r in rows if r["status"] == "missing"]
+        # Cheap-and-common first (grab those today), rare — long hunt after
+        # (the ones worth watching), and never-fetched last (no signal to
+        # act on yet, rather than guessed into either bucket). Price is only
+        # a tiebreak WITHIN a bucket — see classify_rarity()'s own docstring
+        # for why availability outranks it.
+        _order = {"cheap and common": 0, "rare — long hunt": 1, "": 2}
+
+        def _sort_key(r):
+            price = r.get("price") or {}
+            lowest = price.get("lowest_price")
+            return (_order.get(r.get("rarity", ""), 2),
+                    lowest if lowest is not None else float("inf"))
+
+        for r in sorted(missing, key=_sort_key):
+            price = r.get("price") or {}
+            w.writerow([r["catno"], r["artist"], r["title"], r["year"],
+                        r["id"] or "", r["expected"], r.get("rarity", ""),
+                        price.get("lowest_price", ""), price.get("num_for_sale", ""),
+                        price.get("have", ""), price.get("want", "")])
         return f"{label} - missing releases - {stamp}.csv", buf.getvalue()
 
     if kind == "outstanding_tracks":

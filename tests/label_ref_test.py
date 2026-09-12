@@ -500,6 +500,24 @@ m2 = L.match_against_catalogues(folder_title_only, catalogues)
 check(200 in m2 and m2[200]["matched_by"] == "title",
       "no catno on the folder falls back to title match, same as attach_folders()")
 
+print("\n[classify_rarity]")
+eq(L.classify_rarity(None), "", "no price data at all: unclassified, not guessed")
+eq(L.classify_rarity({}), "", "an empty price dict: also unclassified")
+eq(L.classify_rarity({"num_for_sale": None, "have": None}), "",
+   "num_for_sale and have both unknown: unclassified")
+eq(L.classify_rarity({"num_for_sale": 5, "have": 2}), "cheap and common",
+   "copies for sale right now: cheap and common, regardless of a low have count")
+eq(L.classify_rarity({"num_for_sale": 0, "have": 40}), "cheap and common",
+   "nothing for sale THIS WEEK, but plenty of copies logged as owned: still common")
+eq(L.classify_rarity({"num_for_sale": 0, "have": 3}), "rare — long hunt",
+   "nothing for sale and almost nobody owns it: the actual rare case")
+eq(L.classify_rarity({"num_for_sale": None, "have": 3}), "rare — long hunt",
+   "num_for_sale missing (no curr_abbr was passed) but have is low: still classifiable")
+price_a = L.price_for({"catno": "10-001"}, {})
+check(price_a is None, "price_for with an empty cache returns None, not KeyError")
+price_b = L.price_for({"catno": "10-001"}, {"10001": {"num_for_sale": 1}})
+eq(price_b, {"num_for_sale": 1}, "price_for looks the release up by its normalised catno key")
+
 print("\n%d checks, %d failed" % (ran, len(fails)))
 print("PASS" if not fails else "FAILED:\n  - " + "\n  - ".join(fails))
 sys.exit(1 if fails else 0)

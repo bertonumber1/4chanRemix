@@ -620,6 +620,9 @@ def _do_label(ui, kind, cfg, dest="", force=False):
         elif kind == "label_tracklists":
             lbl.fetch_tracklists(cfg, log, limit=int(dest) if dest else 2000,
                                  should_stop=_stop_flag.is_set)
+        elif kind == "label_prices":
+            lbl.fetch_prices(cfg, log, limit=int(dest) if dest else 2000,
+                             should_stop=_stop_flag.is_set)
         else:
             # Stop must reach the folder loop itself. ui.log() only raises
             # _StopRequested on the NEXT log line, and this job logs once every
@@ -701,7 +704,8 @@ def _run_job(kind, sources, dest, provider_ids, cfg, dry_run, db_target="library
             elif kind == "direct_organise":
                 _do_direct(ui, sources, dest, provider_ids, cfg, dry_run,
                            steps=("import", "organise"))
-            elif kind in ("label_scan", "label_catalogue", "label_tracklists"):
+            elif kind in ("label_scan", "label_catalogue", "label_tracklists",
+                         "label_prices"):
                 _do_label(ui, kind, cfg, dest, force)
             elif kind == "label_onboard":
                 _do_label_onboard(ui, cfg, dest, role)
@@ -2146,7 +2150,8 @@ async def start_job(kind: str, request: Request):
              "direct_scan","direct_tags","direct_organise",
              "rebuild","vacuum","fake_flac_scan","fake_flac_vamp",
              "tags_from_names","label_scan","label_catalogue",
-             "label_tracklists","label_onboard","label_authenticity","stop"}
+             "label_tracklists","label_prices","label_onboard",
+             "label_authenticity","stop"}
     if kind not in valid:
         return JSONResponse({"error": f"unknown job: {kind}"}, status_code=400)
     if kind == "stop":

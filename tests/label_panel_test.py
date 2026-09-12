@@ -697,6 +697,89 @@ def main():
         r_no_art = P.get_artwork([no_art_release], cfg={})
         check("no Discogs release id" in r_no_art["results"][0]["reason"],
               "no local picture and no Discogs id: refused, not a network call")
+
+        print("\n[fetch_prices]")
+        label_id = P.load_state()["label_id"]
+
+        class FakeDiscogs:
+            """Stands in for label_ref.Discogs — no network, records every
+            call so the test can assert exactly which releases were fetched
+            and which were correctly skipped."""
+            calls = []
+
+            def __init__(self, token, log=print):
+                pass
+
+            def release_price(self, release_id, curr_abbr=""):
+                FakeDiscogs.calls.append((release_id, curr_abbr))
+                return {"lowest_price": 4.0 + release_id, "num_for_sale": 3,
+                        "have": 20, "want": 5}
+
+        real_discogs = P.L.Discogs
+        P.L.Discogs = FakeDiscogs
+        try:
+            P.L.LabelCache(P.CACHE_DIR, label_id).save_catalogue([
+                {"id": 9001, "catno": "PR-001", "title": "Missing One",
+                 "artist": "A", "year": 2001},
+                {"id": 9002, "catno": "PR-002", "title": "Missing Two",
+                 "artist": "B", "year": 2002},
+                {"id": 9003, "catno": "PR-003", "title": "Already Have It",
+                 "artist": "C", "year": 2003},
+            ])
+            P._write_scan({"label_id": label_id, "rows": [
+                {"folder": "", "catno": "PR-001", "artist": "A", "title": "Missing One",
+                 "year": 2001, "id": 9001, "key": "pr001", "status": "missing", "expected": 2},
+                {"folder": "", "catno": "PR-002", "artist": "B", "title": "Missing Two",
+                 "year": 2002, "id": 9002, "key": "pr002", "status": "missing", "expected": 3},
+                {"folder": "/somewhere", "catno": "PR-003", "artist": "C",
+                 "title": "Already Have It", "year": 2003, "id": 9003, "key": "pr003",
+                 "status": "complete", "expected": 4},
+            ]})
+
+            r_fp = P.fetch_prices(cfg={})
+            eq(r_fp["added"], 2, "fetched prices for exactly the two MISSING releases")
+            eq(sorted(c[0] for c in FakeDiscogs.calls), [9001, 9002],
+               "the already-complete release 9003 was never called for — no signal it needs")
+            eq(FakeDiscogs.calls[0][1], "USD", "priced in USD")
+
+            cached = P.L.LabelCache(P.CACHE_DIR, label_id).prices()
+            price_1 = P.L.price_for({"catno": "PR-001"}, cached)
+            check(price_1 is not None and price_1["lowest_price"] == 9005.0,
+                  "the fetched price actually landed in the per-label cache")
+
+            FakeDiscogs.calls = []
+            r_fp_again = P.fetch_prices(cfg={})
+            eq(r_fp_again["added"], 0,
+               "run again: both missing releases already have a cached price — no re-fetch")
+            eq(FakeDiscogs.calls, [], "…and no Discogs call was made at all")
+        finally:
+            P.L.Discogs = real_discogs
+
+        print("\n[missing_releases export: rarity sort]")
+        P._write_scan({"label_id": label_id, "rows": [
+            {"catno": "R-1", "artist": "X", "title": "Rare One", "year": 2000, "id": 1,
+             "expected": 2, "status": "missing", "rarity": "rare — long hunt",
+             "price": {"lowest_price": 50.0}},
+            {"catno": "C-1", "artist": "Y", "title": "Cheap Two", "year": 2000, "id": 2,
+             "expected": 2, "status": "missing", "rarity": "cheap and common",
+             "price": {"lowest_price": 8.0}},
+            {"catno": "C-2", "artist": "Z", "title": "Cheap One", "year": 2000, "id": 3,
+             "expected": 2, "status": "missing", "rarity": "cheap and common",
+             "price": {"lowest_price": 3.0}},
+            {"catno": "U-1", "artist": "W", "title": "Unpriced", "year": 2000, "id": 4,
+             "expected": 2, "status": "missing", "rarity": "", "price": {}},
+            {"catno": "H-1", "artist": "V", "title": "Not Missing", "year": 2000, "id": 5,
+             "expected": 2, "status": "complete", "rarity": "cheap and common",
+             "price": {"lowest_price": 1.0}},
+        ]})
+        _fn, text = P.export("missing_releases")
+        import csv as _csv, io as _io
+        csv_rows = list(_csv.reader(_io.StringIO(text)))
+        eq(csv_rows[0][:2], ["catno", "artist"], "header row is as expected")
+        titles = [row[2] for row in csv_rows[1:]]
+        eq(titles, ["Cheap One", "Cheap Two", "Rare One", "Unpriced"],
+           "cheap-and-common first (cheapest first within it), then rare, "
+           "then never-priced last — and the COMPLETE release is not in the export at all")
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
