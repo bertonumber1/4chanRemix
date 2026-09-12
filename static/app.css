@@ -31,9 +31,9 @@ header{background:var(--panel);border-bottom:1px solid var(--border);
 .brand{display:flex;align-items:center;gap:9px;flex-shrink:0;text-decoration:none}
 .brand-mark{width:27px;height:27px;display:block;fill:var(--acc)}
 .brand-mark rect:nth-child(even){fill:var(--acc2)}
-.brand-name{font-size:15px;font-weight:800;letter-spacing:.05em;
+.brand-name{font-family:'Segoe UI','Helvetica Neue',Arial,sans-serif;
+            font-size:18px;font-weight:800;letter-spacing:.01em;
             color:var(--text);white-space:nowrap}
-.brand-dash{color:var(--acc)}
 .brand:hover .brand-name{color:var(--acc2)}
 .tabs{display:flex;gap:8px;margin-left:18px;align-items:stretch}
 .tab-btn{background:#181420;border:1px solid var(--border);border-bottom:2px solid transparent;
