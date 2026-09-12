@@ -13,13 +13,12 @@ PROJ_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 if [ "${1:-}" != "" ]; then
     RELEASE_NAME="${1}"
 else
-    PY=$(command -v python3 || command -v python || echo "")
-    VERSION=$("${PY}" -c "
-import re
-txt = open('${PROJ_DIR}/web_ui.py').read()
-m = re.search(r'_VERSION\s*=\s*\"([^\"]+)\"', txt)
-print(m.group(1) if m else '0.0.0')
-" 2>/dev/null || echo "0.0.0")
+    # sed, not python -c: PROJ_DIR is a POSIX-style path (from `pwd`), and on
+    # Windows the interpreter on PATH is native python.exe, which can't open
+    # a /c/... path — that mismatch silently fell through to "0.0.0" every
+    # time this ran under Git Bash.
+    VERSION=$(sed -n 's/^_VERSION *= *"\([^"]*\)".*/\1/p' "${PROJ_DIR}/web_ui.py" | head -1)
+    [ -n "${VERSION}" ] || VERSION="0.0.0"
     RELEASE_NAME="music-organiser-v${VERSION}"
 fi
 
