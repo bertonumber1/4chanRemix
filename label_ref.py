@@ -119,6 +119,41 @@ def folder_title(name: str) -> str:
     return re.sub(r"\s*\((?:19|20)\d\d\)\s*$", "", s).strip()
 
 
+_YEAR_LED = re.compile(r"^\((?:19|20)\d{2}\)\s*(.+)$")
+_TRAILING_FORMAT = re.compile(r"\s+(WAV|FLAC|MP3|AIFF|ALAC|OGG)\s*\Z", re.I)
+# ZERO WIDTH SPACE/NON-JOINER/NON-BREAK, LEFT-TO-RIGHT MARK and the other
+# Unicode formatting marks in that block, plus the BOM -- invisible, but
+# they sit right next to a dash often enough in this specific archive to
+# silently break a plain " - " split (real incident: "MC Hair ‎-
+# Jewels E.P." would not split at all). Built from explicit \u escapes,
+# never pasted as literal glyphs, so the codepoints stay auditable instead
+# of invisible in a diff.
+_INVISIBLE = re.compile(
+    "[​-‏‪-‮﻿]")
+
+
+def year_led_artist_title(name: str) -> tuple[str, str] | None:
+    """For a folder named "(YEAR) Artist - Title FORMAT" -- a different
+    archive's convention (year leads, not a catalogue number) from this
+    one's own "(CATNO) Title (Year)" -- the (artist, title) pair to match
+    against Discogs. None when the folder isn't shaped like this at all (no
+    leading 4-digit-year bracket), so this never fires against this
+    archive's own folders and can't regress their matching.
+
+    artist is "" when there is no " - " to split on; the caller still gets
+    a usable title either way.
+    """
+    m = _YEAR_LED.match((name or "").strip())
+    if not m:
+        return None
+    rest = _INVISIBLE.sub("", m.group(1))
+    rest = _TRAILING_FORMAT.sub("", rest).strip()
+    parts = re.split(r"\s+-\s+", rest, maxsplit=1)
+    if len(parts) == 2 and parts[0].strip():
+        return parts[0].strip(), parts[1].strip()
+    return "", rest
+
+
 def ncat(s: str) -> str:
     """The ONE catalogue-number key: punctuation is not information here."""
     return re.sub(r"\W", "", (s or "")).lower()
@@ -1061,6 +1096,29 @@ def attach_folders(catalogue: list, folders: list) -> tuple:
                 if title_match(r.get("title", ""), f["title"]):
                     row = r
                     f["matched_by"] = "title"
+                    break
+        if row is None:
+            # A DIFFERENT archive's naming convention: "(YEAR) Artist - Title
+            # FORMAT" rather than this one's "(CATNO) Title (Year)". Without
+            # this, folder_catno() reads the year as a catalogue number (it
+            # matches nothing real, correctly), and the title-only fallback
+            # above compares "Artist - Title" against the catalogue's BARE
+            # title field, which rarely scores high enough — 264 of 272
+            # folders from one such share went unmatched before this tier
+            # existed, on files with no embedded tags to fall back to either.
+            alt = year_led_artist_title(f.get("name") or "")
+            if alt is not None:
+                alt_artist, alt_title = alt
+                for r in catalogue:
+                    if not title_match(r.get("title", ""), alt_title):
+                        continue
+                    cat_artist = (r.get("artist") or "").strip().lower()
+                    if alt_artist and cat_artist not in ("", "various", "various artists",
+                                                         "va", "v/a"):
+                        if fuzzy(cat_artist, alt_artist.lower()) < 0.55:
+                            continue
+                    row = r
+                    f["matched_by"] = "year-led-title"
                     break
         if row is None:
             orphans.append(f)

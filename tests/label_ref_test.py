@@ -61,6 +61,60 @@ eq(L.folder_catno("Live Set (Recorded Live - 2004)"), "",
 eq(L.folder_title("(12-414) Esto es... Makina (1997)"), "Esto es... Makina",
    "title drops catno and year")
 
+print("\n[year_led_artist_title]")
+# A different archive's own convention -- yash's NAS: "(YEAR) Artist - Title
+# FORMAT", year leading rather than a catalogue number. folder_catno() reads
+# the leading bracket as "1994" regardless (matches nothing real, correctly)
+# — this is the fallback that makes something usable out of it anyway.
+eq(L.year_led_artist_title("(1994) Berlin - Maldito Amanecer WAV"),
+   ("Berlin", "Maldito Amanecer"), "year, artist and format all stripped")
+eq(L.year_led_artist_title("(1998) White Widow - Spy FLAC"),
+   ("White Widow", "Spy"), "same shape, different format extension")
+eq(L.year_led_artist_title("(2001) DJ Skaky - Pin8"),
+   ("DJ Skaky", "Pin8"), "no format suffix at all is fine too")
+eq(L.year_led_artist_title("(1994) Square - Feel Alright"),
+   ("Square", "Feel Alright"), "…same, confirmed with a second example")
+eq(L.year_led_artist_title("(1994) No Dash Here WAV"),
+   ("", "No Dash Here"), "no ' - ' to split on: artist empty, title is what's left")
+# A real incident: a handful of yash's folders carry a LEFT-TO-RIGHT MARK
+# (invisible) glued to the dash, which silently defeated a plain split.
+eq(L.year_led_artist_title("(1995) MC Hair ‎- Jewels E.P. FLAC"),
+   ("MC Hair", "Jewels E.P."), "an invisible LTR mark next to the dash doesn't break the split")
+check(L.year_led_artist_title("(2102472) Spy (1998)") is None,
+      "this archive's OWN convention (catno leads) is left alone -- not year-shaped")
+check(L.year_led_artist_title("No Brackets Here") is None,
+      "no leading bracket at all: not this convention either")
+check(L.year_led_artist_title("(30211, 37849) Dance Collection (2008)") is None,
+      "a multi-catno bracket is not a bare 4-digit year -- correctly not mistaken for one")
+
+print("\n[attach_folders: year-led fallback]")
+yl_catalogue = [
+    {"id": 501, "catno": "71-006", "artist": "Berlin (2)", "title": "Maldito Amanecer"},
+    {"id": 502, "catno": "22-908", "artist": "Various", "title": "Heroes Del Tekno"},
+]
+yl_folders = [
+    {"path": "/x/a", "name": "(1994) Berlin - Maldito Amanecer WAV",
+     "catno": L.folder_catno("(1994) Berlin - Maldito Amanecer WAV"),
+     "title": L.folder_title("(1994) Berlin - Maldito Amanecer WAV")},
+    # Wrong artist, same-ish title shape -- must NOT match Berlin's release.
+    {"path": "/x/b", "name": "(1994) Someone Else - Maldito Amanecer WAV",
+     "catno": L.folder_catno("(1994) Someone Else - Maldito Amanecer WAV"),
+     "title": L.folder_title("(1994) Someone Else - Maldito Amanecer WAV")},
+    # Catalogue artist is "Various" -- the artist guard must not block this.
+    {"path": "/x/c", "name": "(2000) Anyone - Heroes Del Tekno WAV",
+     "catno": L.folder_catno("(2000) Anyone - Heroes Del Tekno WAV"),
+     "title": L.folder_title("(2000) Anyone - Heroes Del Tekno WAV")},
+]
+yl_by_release, yl_orphans = L.attach_folders(yl_catalogue, yl_folders)
+eq(len(yl_orphans), 1, "the wrong-artist folder is refused, not matched by title alone")
+eq(yl_orphans[0]["path"], "/x/b", "…specifically the one with the wrong artist")
+matched_paths = {f["path"] for group in yl_by_release.values() for f in group}
+check("/x/a" in matched_paths, "Berlin's release matched via the year-led fallback")
+check("/x/c" in matched_paths,
+      "a Various-artist catalogue release matches regardless of the folder's own 'artist'")
+a_folder = next(f for f in yl_folders if f["path"] == "/x/a")
+eq(a_folder.get("matched_by"), "year-led-title", "tagged with which tier actually matched it")
+
 # Discogs packs every pressing into one field; matching the joined string
 # never hit a folder key, so multi-catno releases could not be owned at all.
 check("mxcd1562" in L.catno_keys("MXCD 1562 (CD), MXCD1562(CD), MXCD 1562 CD"),
