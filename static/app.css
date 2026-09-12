@@ -29,8 +29,7 @@ header{background:var(--panel);border-bottom:1px solid var(--border);
 /* Wordmark. Bars are the spectrum motif SPEK-TRO already uses; alternating
    fills give it depth without a second colour outside the palette. */
 .brand{display:flex;align-items:center;gap:9px;flex-shrink:0;text-decoration:none}
-.brand-mark{width:27px;height:27px;display:block;fill:var(--acc)}
-.brand-mark rect:nth-child(even){fill:var(--acc2)}
+.brand-mark{width:32px;height:32px;display:block;border-radius:6px;object-fit:cover}
 .brand-name{font-family:'Segoe UI','Helvetica Neue',Arial,sans-serif;
             font-size:18px;font-weight:800;letter-spacing:.01em;
             color:var(--text);white-space:nowrap}

@@ -800,14 +800,20 @@ def wallpaper():
 
     wallpaper-pirate.jpg (the original theme) stays in assets/, just unused by
     default — swap the filename below to bring it back.
-
-    There is deliberately no /logo.png or /logo-icon.png any more: the header
-    wordmark is CSS + inline SVG in templates/index.html and the favicon is
-    static/favicon.svg, so the page carries no logo image at all.
     """
     from fastapi.responses import FileResponse
     import os
     p = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets", "wallpaper-ice.jpg")
+    return FileResponse(p, media_type="image/jpeg")
+
+
+@app.get("/logo-icon.jpg")
+def logo_icon():
+    """The AUDIO-KING mark (Bit Music's own Discogs label image) — used as
+    both the header brand-mark and the browser-tab favicon."""
+    from fastapi.responses import FileResponse
+    import os
+    p = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets", "logo-audio-king.jpg")
     return FileResponse(p, media_type="image/jpeg")
 
 
