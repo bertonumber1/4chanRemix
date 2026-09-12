@@ -27,6 +27,7 @@ in, paths out. That makes it cheap to unit-test and easy to reason about.
 
 from __future__ import annotations
 
+import os
 import re
 import unicodedata
 from collections import Counter
@@ -712,7 +713,10 @@ def decide_album_label(
 
 # Local Bit Music catalogue (Discogs label 10663, catno/title/artist/year) — used to
 # stamp the correct catalogue number when the live provider lookup misses or is wrong.
-_BM_CATALOG_PATH = "/home/media/BitMusicHunter/discogs_bitmusic_catalog.json"
+# A convenience on the box that already has it; absent elsewhere, where
+# _load_bm_catalog()'s own try/except just yields nothing, same as LabelCache.SEED_DIR.
+_BM_CATALOG_PATH = os.environ.get("BM_CATALOG_PATH",
+                                  "/home/media/BitMusicHunter/discogs_bitmusic_catalog.json")
 _BM_CATALOG = None
 
 
