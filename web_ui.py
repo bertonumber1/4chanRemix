@@ -42,7 +42,7 @@ _LIBRARY_DB = Path("~/.local/share/music-organiser/library.db").expanduser()
 _FOLDER_DB  = Path("~/.local/share/music-organiser/web_folder_scan.db").expanduser()
 _CFG_PATH   = Path("~/.config/music-organiser/config.toml").expanduser()
 _LOG_FILE   = Path("~/.local/share/music-organiser/web_ui.log").expanduser()
-_VERSION    = "1.10.0"
+_VERSION    = "1.10.1"
 
 try:
     import telegram_panel as tgp
