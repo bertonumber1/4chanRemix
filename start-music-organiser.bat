@@ -1,6 +1,13 @@
 @echo off
 setlocal enabledelayedexpansion
 cd /d "%~dp0"
+
+if not exist "%~dp0.venv\Scripts\python.exe" (
+    echo   No .venv found - run setup-windows.bat first.
+    pause
+    exit /b 1
+)
+
 start "" /b "%~dp0.venv\Scripts\python.exe" web_ui.py >> "%~dp0run.log" 2>&1
 
 rem Wait for the server to actually answer before opening the browser --
@@ -11,6 +18,9 @@ for /l %%i in (1,1,30) do (
     if "!MO_CODE!"=="200" goto :up
     timeout /t 1 /nobreak >nul
 )
+echo   Server did not answer after 30s - check run.log for errors.
+pause
+exit /b 1
 :up
 del "%TEMP%\mo-health.txt" >nul 2>&1
 start "" http://127.0.0.1:8082/

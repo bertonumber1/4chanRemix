@@ -64,8 +64,14 @@ The service runs in the background and auto-starts whenever you log in.
 - **Python 3.10+** — check with `python3 --version`
 - **Linux with systemd** for the one-command install (Ubuntu 20.04+, Debian 11+, etc.).
   The app itself also runs on **Windows** and **macOS** — see [Running on Windows](#running-on-windows).
-- **fpcalc** — for AcoustID fingerprinting: `sudo apt install libchromaprint-tools`
-  (Windows: drop `fpcalc.exe` from the Chromaprint release on your `PATH`)
+- **fpcalc** — for AcoustID/duplicate fingerprinting: `sudo apt install
+  libchromaprint-tools` (Windows: install
+  [MusicBrainz Picard](https://picard.musicbrainz.org/) or grab `fpcalc.exe`
+  from a [Chromaprint release](https://github.com/acoustid/chromaprint/releases)
+  and put it on your `PATH`). Optional — everything else works without it,
+  fingerprint-based duplicate detection just stays off. The Windows-only
+  comparison library it needs ships in `vendor/` already, nothing else to
+  install for that half.
 - Internet access for metadata lookups (Discogs, MusicBrainz, etc.)
 
 All Python packages are installed automatically when you run `bash install.sh --deps`.
@@ -239,11 +245,24 @@ Removes the service and control script. Your music files and databases are untou
 ## Running on Windows
 
 `install.sh` is Linux-only (it installs a systemd user unit), but nothing in the
-app is. On Windows, run it directly:
+app is.
+
+**First time:** double-click `setup-windows.bat` (or run it from a terminal).
+It checks for Python, creates an isolated `.venv\` folder next to the app so
+its dependencies never touch anything else installed on your machine, and
+installs everything from `requirements.txt` into it. Needs
+[Python 3.10+](https://www.python.org/downloads/) already installed, with
+"Add python.exe to PATH" checked during its install.
+
+**Every time after that:** double-click `start-music-organiser.bat`. It
+starts the server and opens your browser once it answers — nothing to type.
+
+Prefer doing it by hand instead of the scripts?
 
 ```powershell
-py -m pip install -r requirements.txt
-py web_ui.py
+py -m venv .venv
+.venv\Scripts\python.exe -m pip install -r requirements.txt
+.venv\Scripts\python.exe web_ui.py
 ```
 
 Then open **http://127.0.0.1:8082** — that's this machine, always the same

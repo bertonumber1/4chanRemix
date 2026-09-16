@@ -46,11 +46,23 @@ cp "${PROJ_DIR}/requirements.txt" "${STAGE}/"
 cp "${PROJ_DIR}/README.md"        "${STAGE}/"
 cp "${PROJ_DIR}/make-release.sh"  "${STAGE}/"
 
+# Windows has no systemd/install.sh equivalent — these are its one-command
+# setup + launch, same role install.sh plays on Linux. Missing from every
+# release before this one; a Windows recipient had to hand-run pip/python
+# themselves with no error handling at all.
+[ -f "${PROJ_DIR}/setup-windows.bat" ] && cp "${PROJ_DIR}/setup-windows.bat" "${STAGE}/"
+[ -f "${PROJ_DIR}/start-music-organiser.bat" ] && cp "${PROJ_DIR}/start-music-organiser.bat" "${STAGE}/"
+
 # telegram_panel.py backs the whole Telegram tab; without it web_ui.py still
 # starts and every Telegram endpoint answers "telegram_panel failed to load".
+# cd_tools.py/multicd_dedupe.py back the CD Tools panel + multi-CD dedupe the
+# same way — same silent-degrade-not-crash failure mode if missed.
+# fingerprint_kit.py backs the duration-recovery pass's fingerprint check
+# (self-disables gracefully if missing, but still shouldn't be missing).
 # smoke_test.py ships too, so an install can be checked on the box it landed on.
 for f in acoustid_helper.py detection.py telegram_panel.py \
-         label_panel.py label_ref.py smoke_test.py; do
+         label_panel.py label_ref.py cd_tools.py multicd_dedupe.py \
+         fingerprint_kit.py smoke_test.py; do
     [ -f "${PROJ_DIR}/${f}" ] && cp "${PROJ_DIR}/${f}" "${STAGE}/"
 done
 
@@ -58,7 +70,7 @@ done
 # for weeks: the file existed here and was simply never copied. Fail loudly when
 # a module a tab depends on is missing, rather than shipping a release whose tab
 # answers "panel failed to load".
-for f in telegram_panel.py label_panel.py label_ref.py; do
+for f in telegram_panel.py label_panel.py label_ref.py cd_tools.py multicd_dedupe.py; do
     if [ ! -f "${STAGE}/${f}" ]; then
         printf '\033[0;31m  ✗  %s did not get staged — that tab would be dead\033[0m\n' "${f}"
         exit 1
@@ -66,6 +78,14 @@ for f in telegram_panel.py label_panel.py label_ref.py; do
 done
 
 cp -r "${PROJ_DIR}/zzzzScriptstuff" "${STAGE}/"
+
+# vendor/pyacoustid-chromaprint (the ctypes wrapper) is needed on every
+# platform for fingerprint_kit.py's comparison path; vendor/chromaprint-
+# windows-x64 (the built DLL) only matters on Windows but costs nothing to
+# ship everywhere. Without either, fingerprint_kit.AVAILABLE is just False —
+# not a hard failure — but shipping neither when the source tree has them
+# would silently downgrade a release from what was actually tested.
+[ -d "${PROJ_DIR}/vendor" ] && cp -r "${PROJ_DIR}/vendor" "${STAGE}/"
 
 # The page itself. web_ui.py reads templates/index.html and serves static/ —
 # leave these out and the app boots fine and then 500s on "/". Hard failure,
