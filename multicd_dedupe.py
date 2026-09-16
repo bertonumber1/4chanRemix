@@ -30,8 +30,21 @@ import re
 import shutil
 import sys
 
+# config.py (holds the Discogs token) lives under zzzzScriptstuff/, which
+# only ever lands on sys.path because web_ui.py's own bootstrap puts it
+# there. Standalone CLI use (--scan/--plan/--apply without the web server
+# running) needs the same bootstrap, or _discogs_client() silently falls
+# back to no token (its `except Exception` swallows the ModuleNotFoundError).
+_HERE = os.path.dirname(os.path.abspath(__file__))
+for _sub in ("zzzzScriptstuff", "scriptstuff"):
+    _d = os.path.join(_HERE, _sub)
+    if os.path.isdir(_d) and _d not in sys.path:
+        sys.path.insert(0, _d)
+        break
+
 import label_ref as L
 import label_panel as P
+import fingerprint_kit as FK
 
 # EAC-era filenames in this archive carry accented Spanish/Catalan titles;
 # the default Windows console codepage mangles them on print otherwise.
@@ -294,6 +307,20 @@ def audio_pref_key(path: str) -> int:
 # song, and duration is the only thing here that catches that).
 _DURATION_TOLERANCE_S = 3.0
 
+# Loaded once per build_fix_plan() call (not per-comparison) and saved back
+# at the end — a release only ever has a handful of candidates that reach
+# this check, so this is cheap, but reusing the on-disk cache across calls
+# still avoids re-running fpcalc on the same files every time a release is
+# re-planned.
+_fp_cache = None
+
+
+def _get_fp_cache() -> dict:
+    global _fp_cache
+    if _fp_cache is None:
+        _fp_cache = FK.load_cache()
+    return _fp_cache
+
 
 def build_fix_plan(release_root: str, discs: list, sources: dict,
                    extra_reasons: list = None) -> dict:
@@ -391,6 +418,7 @@ def build_fix_plan(release_root: str, discs: list, sources: dict,
         consumed.update(candidates)
         resolved.append(occ)
 
+    fp_cache_dirty = False
     for occ in list(unresolved):
         title, target_duration = occ["title"], occ["duration"]
         sibling = next((r for r in resolved if r["title"] == title), None)
@@ -402,15 +430,33 @@ def build_fix_plan(release_root: str, discs: list, sources: dict,
             continue
         for spare in list(sibling["losers"]):
             dur = L.audio_duration(spare)
-            if dur is not None and abs(dur - target_duration) <= _DURATION_TOLERANCE_S:
-                sibling["losers"].remove(spare)
-                consumed.add(spare)
-                occ["winner"] = spare
-                occ["losers"] = []
-                occ["recovered_from_duplicate"] = True
-                resolved.append(occ)
-                unresolved.remove(occ)
-                break
+            if dur is None or abs(dur - target_duration) > _DURATION_TOLERANCE_S:
+                continue
+            # Duration agreement alone is the historical bar (see the note
+            # above _DURATION_TOLERANCE_S) but two DIFFERENT songs can
+            # coincidentally land within 3s of each other. Where a real
+            # fingerprint comparison is available on this machine, require
+            # it to agree too, never on its own (see fingerprint_kit.py's
+            # own docstring on why audio similarity alone is never enough —
+            # an Original Mix and its Extended Mix can score above SAME
+            # over a long window despite being different tracks; duration
+            # is what tells them apart). Falls back to duration-only,
+            # unchanged from before, when fingerprinting isn't set up here.
+            if FK.AVAILABLE:
+                cache = _get_fp_cache()
+                if not FK.same_recording(sibling["winner"], spare, cache):
+                    continue
+                fp_cache_dirty = True
+            sibling["losers"].remove(spare)
+            consumed.add(spare)
+            occ["winner"] = spare
+            occ["losers"] = []
+            occ["recovered_from_duplicate"] = True
+            resolved.append(occ)
+            unresolved.remove(occ)
+            break
+    if fp_cache_dirty:
+        FK.save_cache(_fp_cache)
 
     missing = []
     for occ in unresolved:
@@ -485,9 +531,24 @@ def scan_multicd_releases(root: str = DEFAULT_ROOT) -> list:
 
 
 # ─── apply + verify (move, never delete; every move undoable) ────────────────
+# One shared, centralized holding root for the whole archive (2026-09-16) —
+# NOT a sibling of DEFAULT_ROOT any more, and NOT inside this app's own
+# git-tracked repo either (real audio duplicates there risk `git clean`,
+# accidental staging, or ending up mixed into the Linux Chromebox
+# deployment, which tracks this same repo via `git pull`). Same
+# ~/.local/share/music-organiser/ app-data convention library.db and
+# web_ui.log already use, and the SAME base cd_tools.py's own
+# _review_root() writes to — apply_fix()'s existing rel_dir (relative to
+# DEFAULT_ROOT, so it already starts with the release name) still nests
+# each release correctly under here without any other change needed. A
+# plain module attribute, not folded into the function below, so a test
+# can monkeypatch it the same way label_panel_test.py already does for
+# P.CACHE_DIR/P.MOVELOG, instead of ever writing into the real one.
+HOLDING_ROOT = os.path.expanduser(os.path.join("~", ".local", "share", "music-organiser", "cd_review"))
+
+
 def _holding_root() -> str:
-    root = DEFAULT_ROOT.rstrip(os.sep)
-    return os.path.join(os.path.dirname(root), os.path.basename(root) + " - CD_DEDUPE_REVIEW")
+    return HOLDING_ROOT
 
 
 def _move_file(src: str, dest_dir: str, dry_run: bool, action: str) -> dict:

@@ -14,6 +14,14 @@ requests-ratelimiter>=0.4.0
 discogs-client>=2.3.0
 musicbrainzngs>=0.7.1
 pyacoustid>=1.3.0
+# fingerprint_kit.py's comparison path (decode_fingerprint + bit similarity)
+# needs the actual libchromaprint shared library, not a pip package — on
+# Linux install it via the system package manager (e.g. apt install
+# libchromaprint1) if fingerprint_kit.AVAILABLE comes up False; on Windows
+# a prebuilt copy ships in vendor/chromaprint-windows-x64/ since no
+# standalone redistributable exists upstream (see that folder's BUILD.md).
+# The Python ctypes wrapper itself is vendored too, NOT pip-installed —
+# see vendor/pyacoustid-chromaprint/README.md for why.
 
 # Image processing (cover art, spectrograms)
 Pillow>=9.0.0

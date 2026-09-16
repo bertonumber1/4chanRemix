@@ -73,6 +73,14 @@ class FakeDiscogs:
 
 tmp = tempfile.mkdtemp(prefix="cdtools_test_")
 
+# CD_REVIEW_BASE is normally ~/.local/share/music-organiser/cd_review — a
+# real, permanent, shared location. Redirect it into this run's temp dir so
+# apply_plan()/verify()'s purge never touches the user's actual one, same
+# monkeypatch style label_panel_test.py already uses for P.CACHE_DIR/
+# P.MOVELOG.
+C.CD_REVIEW_BASE = os.path.join(tmp, "cd_review")
+C.mcd.HOLDING_ROOT = C.CD_REVIEW_BASE
+
 
 # ═══════════════════════════════════════════════════════════════════════════
 print("[resolve_release_id]")
@@ -353,6 +361,50 @@ if winner_rows:
 
 not_fixable = C.apply_plan(apply_root, {"status": "needs_review", "reasons": ["x"]}, dry_run=True)
 eq(not_fixable["ok"], False, "apply_plan refuses a plan that was never auto_fixable")
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+print("\n[_review_root — no double-nesting of the release name]")
+nest_root = os.path.join(tmp, "nesting_release")
+nest_review = C._review_root(nest_root)
+check(os.path.basename(nest_review) == "nesting_release",
+     "the review folder's own name is the release name once", nest_review)
+check(nest_review.count("nesting_release") == 1,
+     "the release name does not appear twice anywhere in the path", nest_review)
+check(os.path.dirname(nest_review) == C.CD_REVIEW_BASE,
+     "it sits directly under the centralized base, not nested under itself again")
+
+print("\n[verify — auto-purges the review folder once clean]")
+verify_root = os.path.join(tmp, "verify_release")
+touch(os.path.join(verify_root, "CD1", "01 - Alpha.flac"))
+touch(os.path.join(verify_root, "CD1", "02 - Beta.flac"))
+touch(os.path.join(verify_root, "CD2", "02 - Beta.flac"))   # duplicate, leaked from CD1
+touch(os.path.join(verify_root, "CD2", "01 - Gamma.flac"))
+with open(os.path.join(verify_root, "CD1", "a.cue"), "w", encoding="utf-8") as fh:
+    fh.write('TRACK 01 AUDIO\n  TITLE "Alpha"\nTRACK 02 AUDIO\n  TITLE "Beta"\n')
+with open(os.path.join(verify_root, "CD2", "a.cue"), "w", encoding="utf-8") as fh:
+    fh.write('TRACK 01 AUDIO\n  TITLE "Gamma"\n')
+
+plan_v = C.build_plan(verify_root, "", None)
+eq(plan_v["status"], "auto_fixable", "setup plan for verify test is auto_fixable")
+C.apply_plan(verify_root, plan_v, dry_run=False)
+review_v = C._review_root(verify_root)
+check(os.path.isdir(review_v) and len(os.listdir(review_v)) > 0,
+     "the duplicate landed in the review folder, same as the earlier apply_plan test")
+
+result_v = C.verify(verify_root, "", None)
+eq(result_v["clean"], True, "everything now resolves cleanly after the apply")
+check(result_v["purged"] > 0, "verify reports how many files it purged", str(result_v["purged"]))
+check(not os.path.exists(review_v),
+     "the review folder is genuinely gone from disk, not just emptied")
+
+print("\n[verify — does NOT purge anything while still needs_review]")
+notclean_root = os.path.join(tmp, "notclean_release")
+touch(os.path.join(notclean_root, "CD1", "01 - Solo.flac"))
+os.makedirs(os.path.join(notclean_root, "CD2"), exist_ok=True)
+result_nc = C.verify(notclean_root, "", None)
+eq(result_nc["clean"], False, "a release with no matched tracks at all is not clean")
+eq(result_nc["purged"], 0, "nothing was purged — there was never anything auto_fixable here")
 
 
 # ═══════════════════════════════════════════════════════════════════════════

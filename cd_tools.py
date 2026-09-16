@@ -132,9 +132,28 @@ def build_plan(root: str, release_id: str, discogs) -> dict:
 
 
 # ─── auto-arrange (apply the plan) ──────────────────────────────────────────
+# One shared, centralized base for every release's duplicates (2026-09-16),
+# not a sibling folder next to every release you ever run this on. Two
+# reasons it lives here and not next to a release root:
+#   1. It stops "- CD_REVIEW" folders scattering across every drive you
+#      point CD Tools at — one place to check, always.
+#   2. It is NOT inside the app's own git-tracked repo either — real audio
+#      duplicates there would risk `git clean`, accidental staging, or (on
+#      the Linux Chromebox deployment, which tracks this same repo via
+#      `git pull`) ending up mixed into a live service's code tree.
+# Same ~/.local/share/music-organiser/ app-data convention library.db and
+# web_ui.log already use, and the SAME base multicd_dedupe.py's own
+# _holding_root() writes to. A plain module attribute (not folded into the
+# function below) so tests can monkeypatch it the same way
+# label_panel_test.py already does for P.CACHE_DIR/P.MOVELOG, instead of
+# ever writing into the real one during a test run.
+CD_REVIEW_BASE = os.path.expanduser(os.path.join("~", ".local", "share", "music-organiser", "cd_review"))
+
+
 def _review_root(root: str) -> str:
-    root = root.rstrip(os.sep)
-    return os.path.join(os.path.dirname(root), os.path.basename(root) + " - CD_REVIEW")
+    """Where this release's duplicates go — namespaced by release name
+    under CD_REVIEW_BASE."""
+    return os.path.join(CD_REVIEW_BASE, os.path.basename(root.rstrip(os.sep)))
 
 
 def _move_file(root: str, src: str, dest_dir: str, dry_run: bool, action: str) -> dict:
@@ -197,8 +216,13 @@ def apply_plan(root: str, plan: dict, dry_run: bool = True) -> dict:
             if P._norm(os.path.dirname(winner)) != P._norm(dest_dir):
                 results.append(_move_file(root, winner, dest_dir, dry_run, "move"))
             for loser in e["losers"]:
-                rel_dir = os.path.relpath(os.path.dirname(loser), os.path.dirname(root))
-                results.append(_move_file(root, loser, os.path.join(review_root, rel_dir),
+                # relative to root itself, not root's parent: review_root
+                # already carries the release name (it is namespaced by
+                # it), so a rel_dir that ALSO started with the release
+                # name would double it up in the final path.
+                rel_dir = os.path.relpath(os.path.dirname(loser), root)
+                dest_dir_for_loser = review_root if rel_dir == "." else os.path.join(review_root, rel_dir)
+                results.append(_move_file(root, loser, dest_dir_for_loser,
                                           dry_run, "cdtools-dupe-holding"))
     ok = all(r["ok"] for r in results)
     verify_ = {}
@@ -220,15 +244,42 @@ def remove_file(root: str, path: str, dry_run: bool = True) -> dict:
 
 
 # ─── verify ──────────────────────────────────────────────────────────────────
+def _purge_review(root: str) -> int:
+    """Delete this release's ENTIRE review folder, permanently. Only ever
+    called from verify() right after it has confirmed clean=True — by that
+    point every file sitting in there has already been proven surplus
+    (every legitimate occurrence of every expected track already has its
+    own winner elsewhere, or this would not be clean), so there is nothing
+    left for a human to review. Returns how many files were removed."""
+    review_root = _review_root(root)
+    if not P._under(review_root, CD_REVIEW_BASE) or not os.path.isdir(review_root):
+        return 0
+    count = len(L.audio_files(review_root))
+    try:
+        shutil.rmtree(review_root)
+    except OSError:
+        return 0
+    P._log_move("cdtools-cleanup", review_root, "(deleted)", True,
+                f"{count} file(s) purged after a clean verify")
+    return count
+
+
 def verify(root: str, release_id: str, discogs) -> dict:
     """Re-run the same checks build_plan()/scan_duplicates() do — for
     AFTER an arrange/tag pass, to confirm the result actually is clean
-    rather than trusting apply_plan()'s own report."""
+    rather than trusting apply_plan()'s own report.
+
+    A clean result also purges this release's review folder — see
+    _purge_review(). The folder is never hidden or special: while a
+    release is NOT yet clean, it is an ordinary folder under
+    ~/.local/share/music-organiser/cd_review/<release>/ you can open and
+    look through any time (list_review() below, or just Explorer)."""
     dupes = scan_duplicates(root)
     plan = build_plan(root, release_id, discogs)
     clean = (not dupes) and (not plan.get("reasons")) \
         and plan.get("status") in ("auto_fixable", "not_multidisc")
-    return {"ok": True, "clean": clean, "duplicates": dupes, "plan": plan}
+    purged = _purge_review(root) if clean else 0
+    return {"ok": True, "clean": clean, "duplicates": dupes, "plan": plan, "purged": purged}
 
 
 def list_review(root: str) -> list:

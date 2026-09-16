@@ -15,9 +15,8 @@
     <span class="brand-name">AUDIO-KING</span>
   </a>
   <nav class="tabs">
-    <button data-tab="pipeline" class="tab-btn active" onclick="switchTab('pipeline')" title="Full pipeline — import, fetch tags, and organise into the library">Pipeline</button>
-    <button data-tab="direct" class="tab-btn" onclick="switchTab('direct')" title="Organise straight through, no database">Direct</button>
-    <button data-tab="session" class="tab-btn" onclick="switchTab('session')" title="Browse the current import batch before committing it">Session</button>
+    <button data-tab="direct" class="tab-btn active" onclick="switchTab('direct')" title="Organise straight through, no database">Direct</button>
+    <button data-tab="session" class="tab-btn" onclick="switchTab('session')" title="Import, fetch tags, and organise into a session batch — then browse it here before committing it to the library">Session</button>
     <button data-tab="library" class="tab-btn" onclick="switchTab('library')" title="Search and browse the full permanent library">Library</button>
     <button data-tab="tools" class="tab-btn" onclick="switchTab('tools')" title="Database maintenance, audits, and ad-hoc SQL">Tools</button>
     <button data-tab="telegram" class="tab-btn" onclick="switchTab('telegram')" title="Control the Telegram scraper and the channel uploader">Telegram</button>
@@ -43,65 +42,9 @@
   <button class="doc-x" onclick="dismissDoctor()" title="Hide until the next reload">dismiss</button>
 </div>
 
-<!-- ═══════════════ PIPELINE TAB ═══════════════ -->
-<div id="tab-pipeline" class="tab-content active">
-<aside>
-  <div class="card">
-    <h3>Input / Output</h3>
-    <div class="path-row">
-      <span class="path-label src">Source</span>
-      <input class="path-input" id="src-in" readonly tabindex="-1" onfocus="setTimeout(()=>this.blur())" placeholder="not set" onclick="openBrowser('src')" title="Click to choose this folder">
-      <button class="btn-xs" onclick="nativePick('src',this)" title="Pick the folder to read from. There is deliberately no default — a path left over from another machine scans nothing and reports success.">📁 Browse</button>
-      <button class="btn-xs ghost" onclick="openInFileManager('src-in',this)" title="Opens this folder in the file manager so you can look at the files. Browse PICKS the folder; Open SHOWS you what is in the one already picked.">↗ Open</button>
-    </div>
-    <div class="path-row">
-      <span class="path-label out">Output</span>
-      <input class="path-input" id="dest-in" readonly tabindex="-1" onfocus="setTimeout(()=>this.blur())" placeholder="not set" onclick="openBrowser('dest')" title="Click to choose this folder">
-      <button class="btn-xs" onclick="nativePick('dest',this)" title="Pick the folder to file into. There is deliberately no default.">📁 Browse</button>
-      <button class="btn-xs ghost" onclick="openInFileManager('dest-in',this)" title="Opens this folder in the file manager so you can look at the files. Browse PICKS the folder; Open SHOWS you what is in the one already picked.">↗ Open</button>
-    </div>
-    <div style="display:flex;gap:5px;margin-top:4px">
-      <button class="btn-xs" style="flex:1" onclick="scanSource()" title="Count audio files in the source folder without importing anything">Scan source</button>
-      <span id="scan-result" style="font-size:10px;color:var(--dim);line-height:22px"></span>
-    </div>
-  </div>
-  <div class="card">
-    <h3>Providers &amp; API keys</h3>
-    <div id="prov-list"></div>
-  </div>
-</aside>
-
-<div class="log-area">
-  <div class="pipeline">
-    <div class="phase" id="ph-import"><span class="dot"></span>Import</div>
-    <span class="phase-arrow">→</span>
-    <div class="phase" id="ph-fetch"><span class="dot"></span>Fetch Tags</div>
-    <span class="phase-arrow">→</span>
-    <div class="phase" id="ph-organise"><span class="dot"></span>Organise</div>
-  </div>
-  <div class="action-bar">
-    <button class="btn run-all" id="btn-all"      onclick="run('pipeline')" title="Import → Fetch Tags → Organise, one after another">▶ Run All</button>
-    <button class="btn ghost"   id="btn-import"   onclick="run('import')" title="Copy/move files from Source into the session database">Import</button>
-    <button class="btn ghost"   id="btn-fetch"    onclick="run('fetch')" title="Look up missing metadata from the enabled providers">Fetch Tags</button>
-    <button class="btn ghost"   id="btn-organise" onclick="run('organise')" title="Move session files into their final Output location">Organise</button>
-    <button class="btn ghost"   onclick="clearLog()" title="Clear the log panel below">Clear log</button>
-    <button class="btn danger"  id="btn-stop" onclick="stopJob(this)" disabled title="Stop the running job at the next file. Anything already written stays written.">■ Stop</button>
-    <label class="dry-label" title="Preview what would happen without writing or moving anything"><input type="checkbox" id="dry-run"> dry run</label>
-  </div>
-  <div class="progress-bar"><div class="progress-fill" id="prog" style="width:0%"></div></div>
-  <div class="log" id="log"></div>
-  <div class="stat-bar">
-    <span id="s-imp">imported: —</span>
-    <span id="s-dup">duplicate: —</span>
-    <span id="s-bad">broken: —</span>
-    <span id="s-prog">0 / 0</span>
-    <span id="s-el">elapsed: —</span>
-  </div>
-</div>
-</div><!-- /pipeline -->
 
 <!-- ═══════════════ DIRECT TAB ═══════════════ -->
-<div id="tab-direct" class="tab-content">
+<div id="tab-direct" class="tab-content active">
 <aside>
   <div class="card">
     <h3>Direct mode — input / output, no database</h3>
@@ -186,7 +129,9 @@
   <div class="path-row">
     <span class="path-label">Discogs</span>
     <input class="path-input" id="cdt-release-in" placeholder="release/master URL or id — optional if a .cue sheet already covers every disc" title="Paste a discogs.com release or master URL, or a bare release id. Used to check/tag whatever a .cue sheet in the folder doesn't already cover.">
+    <button class="btn-xs" onclick="cdtSearch()" title="Search Discogs using the CD root folder's own name — runs automatically the moment you pick a folder above, or press this to redo it">🔍 Search</button>
   </div>
+  <div id="cdt-search-results" class="hidden" style="margin:-4px 0 8px 0"></div>
   <div style="display:flex;gap:5px;flex-wrap:wrap;margin-top:8px;align-items:center">
     <button class="btn-xs" onclick="cdtCheck()" title="Read every disc's tracks and compare against .cue sheets and the Discogs release above. Read-only — moves nothing.">Check tracks</button>
     <button class="btn-xs" onclick="cdtDupes()" title="List any track that appears more than once anywhere in this release, across every disc. Read-only.">Dupe check</button>
@@ -229,10 +174,60 @@
 <!-- ═══════════════ SESSION TAB ═══════════════ -->
 <div id="tab-session" class="tab-content">
 <div class="page-panel">
+  <div class="card">
+    <h3>Input / Output</h3>
+    <div class="path-row">
+      <span class="path-label src">Source</span>
+      <input class="path-input" id="src-in" readonly tabindex="-1" onfocus="setTimeout(()=>this.blur())" placeholder="not set" onclick="openBrowser('src')" title="Click to choose this folder">
+      <button class="btn-xs" onclick="nativePick('src',this)" title="Pick the folder to read from. There is deliberately no default — a path left over from another machine scans nothing and reports success.">📁 Browse</button>
+      <button class="btn-xs ghost" onclick="openInFileManager('src-in',this)" title="Opens this folder in the file manager so you can look at the files. Browse PICKS the folder; Open SHOWS you what is in the one already picked.">↗ Open</button>
+    </div>
+    <div class="path-row">
+      <span class="path-label out">Output</span>
+      <input class="path-input" id="dest-in" readonly tabindex="-1" onfocus="setTimeout(()=>this.blur())" placeholder="not set" onclick="openBrowser('dest')" title="Click to choose this folder">
+      <button class="btn-xs" onclick="nativePick('dest',this)" title="Pick the folder to file into. There is deliberately no default.">📁 Browse</button>
+      <button class="btn-xs ghost" onclick="openInFileManager('dest-in',this)" title="Opens this folder in the file manager so you can look at the files. Browse PICKS the folder; Open SHOWS you what is in the one already picked.">↗ Open</button>
+    </div>
+    <div style="display:flex;gap:5px;margin-top:4px">
+      <button class="btn-xs" style="flex:1" onclick="scanSource()" title="Count audio files in the source folder without importing anything">Scan source</button>
+      <span id="scan-result" style="font-size:10px;color:var(--dim);line-height:22px"></span>
+    </div>
+  </div>
+  <div class="card">
+    <h3>Providers &amp; API keys</h3>
+    <div id="prov-list"></div>
+  </div>
+
+  <div class="job-phases">
+    <div class="phase" id="ph-import"><span class="dot"></span>Import</div>
+    <span class="phase-arrow">→</span>
+    <div class="phase" id="ph-fetch"><span class="dot"></span>Fetch Tags</div>
+    <span class="phase-arrow">→</span>
+    <div class="phase" id="ph-organise"><span class="dot"></span>Organise</div>
+  </div>
+  <div class="action-bar">
+    <button class="btn run-all" id="btn-all"      onclick="run('pipeline')" title="Import → Fetch Tags → Organise, one after another">▶ Run All</button>
+    <button class="btn ghost"   id="btn-import"   onclick="run('import')" title="Copy/move files from Source into this session">Import</button>
+    <button class="btn ghost"   id="btn-fetch"    onclick="run('fetch')" title="Look up missing metadata from the enabled providers">Fetch Tags</button>
+    <button class="btn ghost"   id="btn-organise" onclick="run('organise')" title="Move session files into their final Output location">Organise</button>
+    <button class="btn ghost"   onclick="clearLog()" title="Clear the log panel below">Clear log</button>
+    <button class="btn danger"  id="btn-stop" onclick="stopJob(this)" disabled title="Stop the running job at the next file. Anything already written stays written.">■ Stop</button>
+    <label class="dry-label" title="Preview what would happen without writing or moving anything"><input type="checkbox" id="dry-run"> dry run</label>
+  </div>
+  <div class="progress-bar"><div class="progress-fill" id="prog" style="width:0%"></div></div>
+  <div class="log" id="log" style="flex:none;max-height:180px;border-bottom:1px solid var(--border)"></div>
+  <div class="stat-bar">
+    <span id="s-imp">imported: —</span>
+    <span id="s-dup">duplicate: —</span>
+    <span id="s-bad">broken: —</span>
+    <span id="s-prog">0 / 0</span>
+    <span id="s-el">elapsed: —</span>
+  </div>
+
   <p class="tab-blurb">
     <b>Session</b> — the batch you are working on now, held in <code>web_session.db</code>.
-    Import fills it, you check it here, and <b>Tools → Commit session</b> merges it into the
-    permanent library. Nothing here is final: clearing a session throws away the record,
+    Import above fills it, you check it here, and <b>Tools → Commit session</b> merges it into
+    the permanent library. Nothing here is final: clearing a session throws away the record,
     never the audio.
   </p>
   <div class="stats-ribbon" id="sess-ribbon">

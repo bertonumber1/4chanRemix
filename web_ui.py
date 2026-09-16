@@ -1301,7 +1301,7 @@ def fs_list(path: str = "", audio: bool = True):
         p = Path.home()
 
     out = {"path": str(p), "parent": str(p.parent) if p.parent != p else "",
-           "dirs": [], "files": 0, "audio": 0, "error": ""}
+           "dirs": [], "files": 0, "audio": 0, "audio_names": [], "error": ""}
     if not p.is_dir():
         out["error"] = "not a folder: %s" % p
         return JSONResponse(out)
@@ -1314,6 +1314,11 @@ def fs_list(path: str = "", audio: bool = True):
         out["error"] = str(exc)
         return JSONResponse(out)
 
+    # Loose audio filenames directly in THIS folder (never recursive, same
+    # one-level scope as the dirs/audio-count scan above) — capped so a
+    # folder full of thousands of stray files can't blow up the response;
+    # picking a release folder never has anywhere near this many tracks.
+    audio_names_cap = 300
     for e in entries:
         try:
             if e.name.startswith("."):
@@ -1334,6 +1339,8 @@ def fs_list(path: str = "", audio: bool = True):
                 out["files"] += 1
                 if _os.path.splitext(e.name)[1].lower() in exts:
                     out["audio"] += 1
+                    if len(out["audio_names"]) < audio_names_cap:
+                        out["audio_names"].append(e.name)
         except OSError:
             continue
     return JSONResponse(out)
@@ -1870,6 +1877,38 @@ def cdtools_scan(root: str = ""):
     except Exception as exc:
         result = {"ok": False, "reason": str(exc)}
     _cdt_log("scan", root, result)
+    return JSONResponse(result)
+
+
+@app.get("/api/cdtools/search")
+def cdtools_search(root: str = ""):
+    """Live Discogs search for the release the CD root folder LOOKS like,
+    so picking a folder doesn't require already knowing/pasting its
+    release id — guesses a query from the folder name the same way
+    label_ref.folder_catno()/folder_title() already split it for every
+    other matcher in this app, then hands back candidates for a human to
+    pick from (never auto-applied — a wrong pick here would tag/arrange
+    against the wrong release entirely)."""
+    g = _cdt_guard()
+    if g:
+        return g
+    if not root or not os.path.isdir(root):
+        return JSONResponse({"ok": False, "reason": "not a folder: " + root})
+    discogs = _cdt_discogs()
+    if discogs is None:
+        return JSONResponse({"ok": False, "reason": "no Discogs token configured"})
+    name = os.path.basename(root.rstrip("\\/"))
+    catno, title = label_ref.folder_catno(name), label_ref.folder_title(name)
+    query = f"{catno} {title}".strip() or name
+    try:
+        hits = discogs.search_release(query)
+        rows = [label_ref.search_result_to_row(h) for h in hits[:8]]
+    except label_ref.DiscogsError as exc:
+        result = {"ok": False, "reason": str(exc)}
+        _cdt_log("search", root, result)
+        return JSONResponse(result)
+    result = {"ok": True, "query": query, "results": rows}
+    _cdt_log("search", root, result)
     return JSONResponse(result)
 
 

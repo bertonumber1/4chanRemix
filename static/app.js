@@ -459,10 +459,16 @@ async function fbGo(path){
     return `<div class="fb-row" data-go="${esc(x.path)}" data-pick="${esc(x.path)}">
       <span class="ic">▶</span><span class="nm">${esc(x.name)}</span>${c}</div>`;
   });
-  list.innerHTML = rows.join('') || (
-    '<div class="fb-empty">No sub-folders here.'+
-    (d.audio?' The audio is in this folder itself — press <b>Use this folder</b>.':'')+
-    '</div>');
+  // Loose audio tracks directly in this folder — not another level to
+  // navigate into, so no data-go/▶: these just show you what's actually
+  // here, the same question "how much is in here" already answers as a
+  // count, now answered as the real track names.
+  const fileRows=(d.audio_names||[]).map(name=>
+    `<div class="fb-row file"><span class="ic">♪</span><span class="nm">${esc(name)}</span></div>`);
+  if((d.audio||0) > fileRows.length)
+    fileRows.push(`<div class="fb-row file dim">…and ${(d.audio-fileRows.length).toLocaleString()} more</div>`);
+  list.innerHTML = rows.join('') + fileRows.join('') || (
+    '<div class="fb-empty">Nothing here.</div>');
 }
 function fbUse(){
   if(fbResolve_){
@@ -730,6 +736,32 @@ function cdtRenderPlan(plan){
   return lines.join('\n');
 }
 
+async function cdtSearch(){
+  const root=cdtNeedRoot(); if(!root) return;
+  const box=document.getElementById('cdt-search-results');
+  box.classList.remove('hidden');
+  box.innerHTML='<span style="color:var(--dim)">searching Discogs…</span>';
+  const d=await (await fetch('/api/cdtools/search?root='+encodeURIComponent(root))).json();
+  if(!d.ok){ box.innerHTML='<span style="color:var(--warn)">'+esc(d.reason||'search failed')+'</span>'; return; }
+  if(!(d.results||[]).length){
+    box.innerHTML='<span style="color:var(--dim)">no Discogs matches for "'+esc(d.query)+'"</span>';
+    return;
+  }
+  box.innerHTML='<div style="color:var(--dim);margin-bottom:3px">Discogs results for "'+esc(d.query)+
+    '" — click one to use it:</div>'+d.results.map(r=>
+    `<button class="btn-xs ghost" style="display:block;width:100%;text-align:left;margin-bottom:2px" `+
+    `data-cdt-pick="${r.id}">${esc(r.artist?r.artist+' - ':'')}${esc(r.title)}`+
+    ` (${esc(r.year||'?')}${r.catno?', '+esc(r.catno):''})</button>`).join('');
+}
+document.addEventListener('click',ev=>{
+  const b=ev.target.closest('[data-cdt-pick]');
+  if(!b) return;
+  document.getElementById('cdt-release-in').value=b.getAttribute('data-cdt-pick');
+  document.getElementById('cdt-search-results').classList.add('hidden');
+});
+document.getElementById('cdt-root-in') && document.getElementById('cdt-root-in')
+  .addEventListener('change', ()=>{ if(!cdtRelease()) cdtSearch(); });
+
 let cdtLastPlan_=null;
 async function cdtCheck(){
   const root=cdtNeedRoot(); if(!root) return;
@@ -835,9 +867,11 @@ async function cdtVerify(){
   const d=await (await fetch('/api/cdtools/verify?'+qs)).json();
   if(!d.ok){ cdtLog('broken', d.reason||'verify failed'); return; }
   const dkeys=Object.keys(d.duplicates||{});
-  cdtLog(d.clean?'info':'warning',
-    (d.clean?'CLEAN — no duplicates, plan status: ':'NOT CLEAN — plan status: ')+d.plan.status+
-    (dkeys.length?(', '+dkeys.length+' duplicate track(s) remain'):''));
+  let msg=(d.clean?'CLEAN — no duplicates, plan status: ':'NOT CLEAN — plan status: ')+d.plan.status+
+    (dkeys.length?(', '+dkeys.length+' duplicate track(s) remain'):'');
+  if(d.purged) msg+=` — review folder cleaned up (${d.purged} file(s) permanently removed, all confirmed surplus)`;
+  cdtLog(d.clean?'info':'warning', msg);
+  if(d.purged) cdtRefreshReview();
 }
 
 async function cdtMove(){
