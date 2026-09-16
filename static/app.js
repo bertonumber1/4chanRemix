@@ -407,6 +407,8 @@ const FB_TARGETS={
   'direct-src': {input:'direct-src-in', label:'SOURCE folder (direct mode)'},
   'direct-dest':{input:'direct-dest-in',label:'OUTPUT folder (direct mode)'},
   'ff-folder':  {input:'ff-folder-in',  label:'folder to check for fake FLACs'},
+  'cdt-root':   {input:'cdt-root-in',   label:'CD / release folder for CD Tools'},
+  'cdt-dest':   {input:'cdt-dest-in',   label:'destination for Move/Copy release'},
 };
 let fbTarget_=null, fbPath_='', fbSel_='', fbResolve_=null;
 
@@ -615,7 +617,20 @@ async function scanSourceDirect(){
   document.getElementById('direct-scan-result').textContent=
     d.error?d.error:d.count.toLocaleString()+' files';
 }
+function directContentType(){
+  const btn=document.querySelector('#direct-content-type .active');
+  return btn ? btn.dataset.contentType : 'single';
+}
 async function runDirect(){
+  const contentType=directContentType();
+  // CD / Multi-disc: Run All skips Fetch Tags. That step looks each track up
+  // online ON ITS OWN, which can disagree track-to-track and tag two tracks
+  // of the SAME disc with different albums/years/labels — the exact failure
+  // this content-type switch exists to prevent. Import + Organise only
+  // (same job the "Organise only" button already runs) keeps every CD1/CD2/
+  // ... folder intact; tag the whole release afterwards, from one Discogs
+  // match, with CD Tools below.
+  const kind = contentType==='cd' ? 'direct_organise' : 'direct';
   const body={
     sources:[document.getElementById('direct-src-in').value.trim()].filter(Boolean),
     dest:document.getElementById('direct-dest-in').value.trim(),
@@ -624,21 +639,13 @@ async function runDirect(){
   };
   if(!body.sources.length){ appendLogDirect('broken','set a source folder first'); return; }
   if(!body.dest){ appendLogDirect('broken','set an output folder first'); return; }
-  if(body.dry_run) appendLogDirect('warning','DRY RUN — nothing will be written');
-  const r=await fetch('/api/job/direct',{method:'POST',
+  if(contentType==='cd')
+    appendLogDirect('info','CD / Multi-disc — skipping Fetch Tags, organising from existing tags only. Use CD Tools below to tag this release from one Discogs match.');
+  const r=await fetch('/api/job/'+kind,{method:'POST',
     headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
   const j=await r.json();
   if(j.error){ appendLogDirect('broken',j.error); return; }
-  setRunningDirect(true); jobStartDirect=Date.now();
-  if(esDirect) esDirect.close();
-  esDirect=new EventSource('/api/job/stream');
-  esDirect.onmessage=e=>{
-    const m=JSON.parse(e.data);
-    if(m.type==='log')      appendLogDirect(m.level,m.text);
-    else if(m.type==='progress') onProgressDirect(m);
-    else if(m.type==='done'){ setRunningDirect(false); esDirect.close(); esDirect=null; }
-  };
-  esDirect.onerror=()=>{ setRunningDirect(false); if(esDirect){esDirect.close();esDirect=null;} };
+  startDirectStream(kind);
 }
 function startDirectStream(kind){
   if(document.getElementById('direct-dry-run').checked)
@@ -680,6 +687,222 @@ function appendLogDirect(level,text){
   el.appendChild(div); el.scrollTop=el.scrollHeight;
 }
 function clearLogDirect(){ document.getElementById('direct-log').innerHTML=''; }
+
+// ── CD Tools (Direct tab) ────────────────────────────────────────────────────
+function cdtRoot(){ return document.getElementById('cdt-root-in').value.trim(); }
+function cdtRelease(){ return document.getElementById('cdt-release-in').value.trim(); }
+function cdtDry(){ return document.getElementById('cdt-dry-run').checked; }
+function cdtNeedRoot(){
+  const r=cdtRoot();
+  if(!r){ cdtLog('broken','pick a CD root folder first'); return null; }
+  return r;
+}
+function cdtLog(level,text){
+  const el=document.getElementById('cdt-result');
+  const ts=new Date().toTimeString().slice(0,8);
+  const div=document.createElement('div');
+  div.className='ll '+(level||'info');
+  div.innerHTML=`<span class="ts">${ts}</span><span class="lv">${level}</span>`+
+    `<span class="tx" style="white-space:pre-wrap">${esc(text)}</span>`;
+  el.appendChild(div); el.scrollTop=el.scrollHeight;
+}
+function cdtBasename(p){ return String(p).split(/[\\/]/).pop(); }
+
+function cdtRenderPlan(plan){
+  const lines=['status: '+plan.status];
+  for(const d of Object.keys(plan.disc_plan||{})){
+    const entries=plan.disc_plan[d];
+    lines.push(`CD${d} (source: ${(plan.sources||{})[d]||'?'}, ${entries.length} track(s)):`);
+    entries.forEach(e=>{
+      const losers=(e.losers||[]).map(cdtBasename).join(', ');
+      lines.push(`  "${e.expected_title}" <- ${cdtBasename(e.winner)}`+
+        (losers?`   [duplicate(s) -> review: ${losers}]`:''));
+    });
+  }
+  if((plan.reasons||[]).length){
+    lines.push(plan.status==='auto_fixable' ? 'notes:' : 'NOT auto-fixable because:');
+    plan.reasons.forEach(r=>lines.push('  - '+r));
+  }
+  if((plan.missing||[]).length){
+    lines.push('genuinely missing (no matching file anywhere in this release) — use "Search SLSK" below:');
+    plan.missing.forEach(m=>lines.push(`  - CD${m.disc}: ${m.artist?m.artist+' - ':''}${m.title}`));
+  }
+  return lines.join('\n');
+}
+
+let cdtLastPlan_=null;
+async function cdtCheck(){
+  const root=cdtNeedRoot(); if(!root) return;
+  cdtLog('info','checking tracks…');
+  const qs=new URLSearchParams({root, release: cdtRelease()});
+  const d=await (await fetch('/api/cdtools/plan?'+qs)).json();
+  if(!d.ok){ cdtLog('broken', d.reason||'check failed'); return; }
+  cdtLastPlan_=d.plan;
+  cdtLog(d.plan.status==='auto_fixable'?'info':'warning', cdtRenderPlan(d.plan));
+}
+
+// Reuses the exact same Nicotine+ /search wiring the Labels tab's
+// "Search SLSK" button uses (SLSK_API, _SLSK_VARIOUS — both already
+// defined once, module-level, further down this file). Only ever searches
+// for tracks Check tracks itself already decided are genuinely missing
+// (plan.missing) — never an ambiguous tie, never a duplicate — so this
+// always follows a Check tracks run, not a replacement for it.
+async function cdtSearchSlsk(){
+  const missing=(cdtLastPlan_ && cdtLastPlan_.missing) || [];
+  if(!missing.length){
+    cdtLog('warning','Run Check tracks first — nothing queued to search for '+
+      '(either nothing is missing, or Check tracks has not run yet on this folder).');
+    return;
+  }
+  for(const m of missing){
+    const a=(m.artist||'').trim();
+    const query=(_SLSK_VARIOUS.has(a.toLowerCase().replace(/\.$/,'')) ? m.title : `${a} ${m.title}`).trim();
+    if(!query) continue;
+    try{
+      const resp=await fetch(SLSK_API+'/search',{method:'POST',
+        headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({query, mode:'global', switch_page:true})});
+      const dd=await resp.json().catch(()=>({}));
+      if(resp.ok && dd.ok!==false) cdtLog('info','SLSK search: '+query);
+      else cdtLog('warning','SLSK search failed: '+query+' — '+(dd.error||resp.status));
+    }catch(e){
+      cdtLog('broken','Could not reach Nicotine+ on '+SLSK_API+
+        ' — is it running, with the api-nicotine-plus plugin enabled?');
+      return;
+    }
+  }
+}
+
+async function cdtDupes(){
+  const root=cdtNeedRoot(); if(!root) return;
+  cdtLog('info','checking for duplicate tracks…');
+  const d=await (await fetch('/api/cdtools/scan?root='+encodeURIComponent(root))).json();
+  if(!d.ok){ cdtLog('broken', d.reason||'scan failed'); return; }
+  const keys=Object.keys(d.duplicates||{});
+  if(!keys.length){ cdtLog('info','no duplicate tracks found'); return; }
+  const lines=keys.map(k=>k+':  '+d.duplicates[k].map(cdtBasename).join('   |   '));
+  cdtLog('warning', keys.length+' duplicate track(s):\n'+lines.join('\n'));
+}
+
+async function cdtArrange(preview){
+  const root=cdtNeedRoot(); if(!root) return;
+  const dry = preview || cdtDry();
+  if(!preview && !dry && !confirm('Auto-arrange for real?\n\n'+root+
+      '\n\nMatched tracks move into their correct CD folder; duplicates move to a review '+
+      'folder next to the release. Nothing is ever deleted.')) return;
+  cdtLog('info',(dry?'previewing':'running')+' auto-arrange…');
+  const r=await fetch('/api/cdtools/apply',{method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({root, release:cdtRelease(), dry_run:dry})});
+  const d=await r.json();
+  if(!d.ok && !(d.results&&d.results.length)){ cdtLog('broken', d.reason||'auto-arrange failed'); return; }
+  const moved=(d.results||[]).filter(x=>x.ok);
+  cdtLog(d.ok?'info':'broken', (dry?'[preview] ':'')+moved.length+' file move(s):\n'+
+    moved.map(m=>cdtBasename(m.src)+'  ->  '+m.dest).join('\n'));
+  if(d.verify && Object.keys(d.verify).length) cdtLog('broken','VERIFY MISMATCH: '+JSON.stringify(d.verify));
+  if(!dry) cdtRefreshReview();
+}
+
+async function cdtTag(preview){
+  const root=cdtNeedRoot(); if(!root) return;
+  const dry = preview || cdtDry();
+  if(!preview && !dry && !confirm('Write tags for real onto files in:\n\n'+root+
+      '\n\nOnly fills in fields that are currently MISSING — never overwrites a tag that '+
+      'already has a value, right or wrong.')) return;
+  cdtLog('info',(dry?'previewing':'running')+' tag from Discogs…');
+  const r=await fetch('/api/cdtools/tag',{method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({root, release:cdtRelease(), dry_run:dry})});
+  const d=await r.json();
+  cdtLog(d.ok?'info':'broken', (dry?'[preview] ':'')+(d.reason||(d.ok?'done':'failed')));
+}
+
+async function cdtArtwork(preview){
+  const root=cdtNeedRoot(); if(!root) return;
+  const dry = preview || cdtDry();
+  cdtLog('info',(dry?'previewing':'fetching')+' artwork…');
+  const r=await fetch('/api/cdtools/artwork',{method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({root, release:cdtRelease(), dry_run:dry})});
+  const d=await r.json();
+  cdtLog(d.ok?'info':'broken', (dry?'[preview] ':'')+(d.reason||(d.ok?'done':'failed')));
+}
+
+async function cdtVerify(){
+  const root=cdtNeedRoot(); if(!root) return;
+  cdtLog('info','verifying…');
+  const qs=new URLSearchParams({root, release: cdtRelease()});
+  const d=await (await fetch('/api/cdtools/verify?'+qs)).json();
+  if(!d.ok){ cdtLog('broken', d.reason||'verify failed'); return; }
+  const dkeys=Object.keys(d.duplicates||{});
+  cdtLog(d.clean?'info':'warning',
+    (d.clean?'CLEAN — no duplicates, plan status: ':'NOT CLEAN — plan status: ')+d.plan.status+
+    (dkeys.length?(', '+dkeys.length+' duplicate track(s) remain'):''));
+}
+
+async function cdtMove(){
+  const root=cdtNeedRoot(); if(!root) return;
+  const dest=document.getElementById('cdt-dest-in').value.trim();
+  if(!dest){ cdtLog('broken','pick a Move/copy destination first'); return; }
+  const dry=cdtDry();
+  if(!dry && !confirm('Move this release folder for real?\n\n'+root+'\n\n->  '+dest)) return;
+  const r=await fetch('/api/cdtools/move',{method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({root, dest, dry_run:dry})});
+  const d=await r.json();
+  cdtLog(d.ok?'info':'broken', (dry?'[preview] ':'')+(d.reason||(d.ok?'moved':'failed')));
+  if(d.ok && !dry) document.getElementById('cdt-root-in').value='';
+}
+
+async function cdtCopy(){
+  const root=cdtNeedRoot(); if(!root) return;
+  const dest=document.getElementById('cdt-dest-in').value.trim();
+  if(!dest){ cdtLog('broken','pick a Move/copy destination first'); return; }
+  const dry=cdtDry();
+  const r=await fetch('/api/cdtools/copy',{method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({root, dest, dry_run:dry})});
+  const d=await r.json();
+  cdtLog(d.ok?'info':'broken', (dry?'[preview] ':'')+(d.reason||(d.ok?'copied':'failed')));
+}
+
+async function cdtRefreshReview(){
+  const root=cdtRoot();
+  const wrap=document.getElementById('cdt-review-list');
+  if(!root){ wrap.innerHTML='<span style="color:var(--dim)">pick a CD root first</span>'; return; }
+  const d=await (await fetch('/api/cdtools/review?root='+encodeURIComponent(root))).json();
+  if(!d.ok){ wrap.innerHTML=esc(d.reason||'could not read the review folder'); return; }
+  if(!d.files.length){ wrap.innerHTML='<span style="color:var(--dim)">empty</span>'; return; }
+  wrap.innerHTML=d.files.map(f=>`<div style="display:flex;gap:6px;align-items:center;padding:2px 0">
+    <span style="flex:1" title="${esc(f)}">${esc(cdtBasename(f))}</span>
+    <button class="btn-xs danger" data-cdt-del="${esc(f)}" title="Permanently delete this one file from the review folder — cannot be undone">✕ Delete</button>
+  </div>`).join('');
+}
+
+document.addEventListener('DOMContentLoaded',()=>{
+  const ct=document.getElementById('direct-content-type');
+  if(ct) ct.addEventListener('click',(ev)=>{
+    const btn=ev.target.closest('[data-content-type]');
+    if(!btn) return;
+    ct.querySelectorAll('[data-content-type]').forEach(b=>b.classList.remove('active'));
+    btn.classList.add('active');
+  });
+  const rl=document.getElementById('cdt-review-list');
+  if(rl) rl.addEventListener('click', async (ev)=>{
+    const del=ev.target.closest('[data-cdt-del]');
+    if(!del) return;
+    const path=del.dataset.cdtDel;
+    if(!confirm('Permanently delete this file?\n\n'+path+'\n\nThis cannot be undone.')) return;
+    const r=await fetch('/api/cdtools/delete',{method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({root:cdtRoot(), paths:[path]})});
+    const d=await r.json();
+    const row=(d.results||[])[0];
+    cdtLog((row&&row.ok)?'info':'broken', (row&&row.ok)?('deleted '+cdtBasename(path)):
+      ((row&&row.reason)||d.reason||'delete failed'));
+    cdtRefreshReview();
+  });
+});
 
 // ── session tab ───────────────────────────────────────────────────────────────
 async function loadSession(){
@@ -1543,6 +1766,20 @@ async function lbLoad(){
     return;
   }
 
+  if(lbView_==='multicd'){
+    const d=await (await fetch('/api/multicd/scan')).json();
+    if(d.ok===false){ empty.textContent=d.reason||'multi-CD dedupe unavailable'; empty.hidden=false; return; }
+    if(!(d.releases||[]).length){
+      empty.textContent='No jumbled multi-CD releases flagged in the Bit Music owned archive.';
+      empty.hidden=false; return;
+    }
+    wrap.innerHTML=d.releases.map(name=>`<tr class="lb-tr">
+      <td class="lb-c-title" data-i18n-skip><div class="lb-t">${esc(name)}</div></td>
+      <td class="lb-c-do"><button class="btn-xs" data-mcdplan="${esc(name)}" title="Show the fix plan — which file wins each track, which duplicates move to a holding folder. Nothing moves until you apply it.">Preview plan</button></td>
+    </tr>`).join('');
+    return;
+  }
+
   if(lbView_==='other-labels'){
     const d=await (await fetch('/api/label/cross-label?role=incoming')).json();
     if(!(d.rows||[]).length){
@@ -1640,7 +1877,7 @@ function lbVerdictTip(v){
           duplicate:'The incoming folder adds nothing you do not already have'}[v]||'';
 }
 
-function lbRowClick(ev){
+async function lbRowClick(ev){
   const more=ev.target.closest('[data-more]');
   if(more){
     const tr=more.closest('tr'), r=lbRows_[+more.dataset.more];
@@ -1698,6 +1935,44 @@ function lbRowClick(ev){
       ${lines.join('')}</div></td>`;
     tr.after(row); return;
   }
+  const mp=ev.target.closest('[data-mcdplan]');
+  if(mp){
+    const tr=mp.closest('tr'), name=mp.dataset.mcdplan;
+    const nx=tr.nextElementSibling;
+    if(nx && nx.classList.contains('lb-more-mcd')){ nx.remove(); return; }
+    mp.disabled=true; const oldText=mp.textContent; mp.textContent='Loading…';
+    const d=await (await fetch('/api/multicd/plan?name='+encodeURIComponent(name))).json();
+    mp.disabled=false; mp.textContent=oldText;
+    if(!d.ok){ lbLog('broken', d.reason||'could not build a plan'); return; }
+    const plan=d.plan, lines=[`<div><b>status:</b> ${esc(plan.status)}</div>`];
+    for(const disc of Object.keys(plan.disc_plan||{})){
+      const entries=plan.disc_plan[disc];
+      lines.push(`<div style="margin-top:4px"><b>CD${esc(disc)}</b> `+
+        `(source: ${esc((plan.sources||{})[disc]||'?')}, ${entries.length} track(s))</div>`);
+      entries.forEach(e=>{
+        const winnerName=String(e.winner).split(/[\\/]/).pop();
+        const losers=(e.losers||[]).map(l=>esc(String(l).split(/[\\/]/).pop())).join(', ');
+        lines.push(`<div class="lb-dim">"${esc(e.expected_title)}" ← ${esc(winnerName)}`+
+          (losers?` · duplicate(s) → holding: ${losers}`:'')+`</div>`);
+      });
+    }
+    if((plan.reasons||[]).length){
+      lines.push(`<div style="margin-top:4px"><b>${plan.status==='auto_fixable'?'notes':'NOT auto-fixable because'}:</b></div>`);
+      plan.reasons.forEach(r=>lines.push(`<div class="lb-dim">- ${esc(r)}</div>`));
+    }
+    if(plan.status==='auto_fixable'){
+      lines.push(`<div style="margin-top:6px">`+
+        `<button class="btn-xs warn" data-mcdapply="${esc(name)}" data-dry="1" title="Show exactly what would move, without touching a file">Preview apply (dry run)</button> `+
+        `<button class="btn-xs danger" data-mcdapply="${esc(name)}" data-dry="0" title="Move the files for real. Duplicates go to a holding folder, never deleted; every move is undoable from the Move log view.">Apply for real</button></div>`);
+    }
+    const row=document.createElement('tr');
+    row.className='lb-more-mcd';
+    row.innerHTML=`<td colspan="2"><div class="lb-missing" data-i18n-skip>${lines.join('')}</div></td>`;
+    tr.after(row);
+    return;
+  }
+  const ma=ev.target.closest('[data-mcdapply]');
+  if(ma){ lbMcdApply(ma.dataset.mcdapply, ma.dataset.dry==='1'); return; }
   const op=ev.target.closest('[data-open]');
   if(op){ fetch('/api/open-folder?path='+encodeURIComponent(op.dataset.open)); return; }
   const ft=ev.target.closest('[data-fix-tags]');
@@ -1874,6 +2149,24 @@ async function lbSearchSlsk(){
       return;
     }
   }
+}
+
+// Duplicates always go to a holding folder next to the archive, never
+// deleted; every move is logged the same as any other Labels-tab move, so
+// Undo (in the Move log view) puts a wrong call back exactly as it was.
+async function lbMcdApply(name, dryRun){
+  if(!dryRun && !confirm('Apply the multi-CD fix for real?\n\n'+name+
+      '\n\nMatched tracks move into their correct CD folder; duplicates move to a '+
+      'holding folder next to the archive. Nothing is deleted, and every move is '+
+      'undoable afterwards from the Move log view.')) return;
+  const r=await (await fetch('/api/multicd/apply',{method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({name, dry_run: dryRun})})).json();
+  const tag=dryRun?'[dry run] ':'';
+  let msg=tag+name+': '+(r.ok?'done':(r.reason||'failed'));
+  if(r.verify && Object.keys(r.verify).length) msg+=' — VERIFY MISMATCH: '+JSON.stringify(r.verify);
+  lbLog(r.ok?'info':'broken', msg);
+  lbLoad();
 }
 
 async function lbUndo(dest){

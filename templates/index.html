@@ -128,6 +128,19 @@
       <code>(catalog#) Artist - Album (Year)/NN - Title.ext</code>.
     </p>
   </div>
+
+  <div class="card">
+    <h3>What is this?</h3>
+    <div class="direct-content-type" id="direct-content-type">
+      <button class="btn-xs active" data-content-type="single" title="Independent tracks, EPs, or singles — each one is safe to look up and tag online individually, same as today.">Single(s)</button>
+      <button class="btn-xs" data-content-type="cd" title="A CD, multi-disc release, or box set. Run All will skip the automatic online tag lookup below, because looking each track up individually can disagree track-to-track and split one CD's tracks across different albums/years/labels. CD1/CD2/... folders are kept intact; tag the whole release afterwards as one unit with CD Tools below.">CD / Multi-disc</button>
+      <button class="btn-xs" data-content-type="loose" title="Random unrelated loose tracks with no shared release. Behaves the same as Single(s) — this option just exists so you don't mistake an unsorted CD for a pile of loose tracks.">Loose tracks</button>
+    </div>
+    <p style="font-size:10px;color:var(--dim);margin-top:6px;line-height:1.4" id="direct-content-hint">
+      Fetch Tags looks each track up online on its own — fine for singles, risky for a CD. CD / Multi-disc skips that step in Run All and keeps every disc folder intact; use CD Tools below to check and tag the whole release from one Discogs match instead.
+    </p>
+  </div>
+
   <div class="card">
     <h3>Providers &amp; API keys</h3>
     <div id="direct-prov-list"></div>
@@ -152,6 +165,63 @@
     <span id="direct-s-bad">broken: —</span>
     <span id="direct-s-prog">0 / 0</span>
     <span id="direct-s-el">elapsed: —</span>
+  </div>
+</div>
+
+<div class="card cdt-panel">
+  <h3>CD Tools — check, arrange, tag one release folder</h3>
+  <p style="font-size:10px;color:var(--dim);margin:-4px 0 8px;line-height:1.4">
+    Works on any folder you point it at — a single CD, or a multi-disc release with
+    CD1/CD2/... subfolders. Verifies against a .cue sheet already in the folder first,
+    and the Discogs release below for whatever a cue doesn't cover. Never deletes a file
+    on its own: duplicates are set aside in a review folder next to the release, and stay
+    there until you explicitly delete them below.
+  </p>
+  <div class="path-row">
+    <span class="path-label">CD root</span>
+    <input class="path-input" id="cdt-root-in" readonly tabindex="-1" onfocus="setTimeout(()=>this.blur())" placeholder="not set" onclick="openBrowser('cdt-root')" title="Click to choose the release folder to work on">
+    <button class="btn-xs" onclick="openBrowser('cdt-root')" title="Pick the release folder to work on — a single CD, or a multi-disc release with CD1/CD2/... subfolders">📁 Browse</button>
+    <button class="btn-xs ghost" onclick="openInFileManager('cdt-root-in',this)" title="Open this folder in the file manager">↗ Open</button>
+  </div>
+  <div class="path-row">
+    <span class="path-label">Discogs</span>
+    <input class="path-input" id="cdt-release-in" placeholder="release/master URL or id — optional if a .cue sheet already covers every disc" title="Paste a discogs.com release or master URL, or a bare release id. Used to check/tag whatever a .cue sheet in the folder doesn't already cover.">
+  </div>
+  <div style="display:flex;gap:5px;flex-wrap:wrap;margin-top:8px;align-items:center">
+    <button class="btn-xs" onclick="cdtCheck()" title="Read every disc's tracks and compare against .cue sheets and the Discogs release above. Read-only — moves nothing.">Check tracks</button>
+    <button class="btn-xs" onclick="cdtDupes()" title="List any track that appears more than once anywhere in this release, across every disc. Read-only.">Dupe check</button>
+    <button class="btn-xs warn" onclick="cdtArrange(true)" title="Preview exactly what Auto-arrange would move, without touching a file.">Preview arrange</button>
+    <button class="btn-xs warn" onclick="cdtArrange(false)" title="Move each track's winning file into its correct CD folder, and every duplicate into a review folder next to this release. Nothing is ever deleted. Only runs once Check tracks reports the release is safe to auto-fix.">Auto-arrange</button>
+    <button class="btn-xs" onclick="cdtSearchSlsk()" title="Search Soulseek (via Nicotine+'s local API on 127.0.0.1:12339) for each track the last Check tracks run found genuinely missing — no file for it anywhere in this release, not just an ambiguous duplicate. Run Check tracks first. Nicotine+ must be running.">Search SLSK (missing)</button>
+    <span class="lb-sep"></span>
+    <button class="btn-xs" onclick="cdtTag(true)" title="Preview what tagging would write, without touching a file.">Preview tag</button>
+    <button class="btn-xs" onclick="cdtTag(false)" title="Write catalogue number / artist / album / year from the Discogs release above onto every file, plus per-track title and track number wherever a track can be matched. Never overwrites a tag that already has a value.">Tag from Discogs</button>
+    <button class="btn-xs" onclick="cdtArtwork(false)" title="Save a loose folder.jpg — from an embedded picture already somewhere in the folder if there is one, otherwise fetched from the Discogs release above. Never touches an audio file.">Get artwork</button>
+    <span class="lb-sep"></span>
+    <button class="btn-xs" onclick="cdtVerify()" title="Re-check this release after arranging/tagging, to confirm it is actually clean now rather than trusting the last action's own report.">Verify</button>
+    <label class="dry-label" title="Preview only, for the buttons above that support it"><input type="checkbox" id="cdt-dry-run" checked> dry run</label>
+  </div>
+  <div id="cdt-result" class="log" style="margin-top:8px;max-height:260px"></div>
+
+  <div style="margin-top:10px;padding-top:8px;border-top:1px solid var(--border)">
+    <div class="path-row">
+      <span class="path-label">Move/copy to</span>
+      <input class="path-input" id="cdt-dest-in" readonly tabindex="-1" onfocus="setTimeout(()=>this.blur())" placeholder="not set" onclick="openBrowser('cdt-dest')" title="Pick where Move/Copy below sends this release folder — e.g. your real archive">
+      <button class="btn-xs" onclick="openBrowser('cdt-dest')" title="Choose the destination folder">📁 Browse</button>
+    </div>
+    <div style="display:flex;gap:5px;margin-top:6px">
+      <button class="btn-xs warn" onclick="cdtMove()" title="Move this whole release folder into the destination above. Logged and undoable from the Labels tab's Move log, the same as any other move in this app.">Move release</button>
+      <button class="btn-xs" onclick="cdtCopy()" title="Copy (not move) this whole release folder into the destination above. The original release folder stays exactly where it is.">Copy release</button>
+    </div>
+  </div>
+
+  <div style="margin-top:10px;padding-top:8px;border-top:1px solid var(--border)">
+    <div style="display:flex;align-items:center;gap:8px">
+      <b style="font-size:11px">Review folder</b>
+      <span style="font-size:10px;color:var(--dim)">— duplicates set aside by Auto-arrange. Nothing here is deleted until you say so.</span>
+      <button class="btn-xs ghost" onclick="cdtRefreshReview()" title="Refresh this list">↻</button>
+    </div>
+    <div id="cdt-review-list" style="font-size:11px;margin-top:6px"></div>
   </div>
 </div>
 </div><!-- /direct -->
@@ -685,6 +755,7 @@
       <button class="lb-view" data-view="series" title="Numbered series and volumes grouped together — 'Limite Vol I-XIII' as one line, not thirteen">Series</button>
       <button class="lb-view" data-view="other-labels" title="Incoming folders that match a DIFFERENT tracked label's catalogue than the one active now">Other labels</button>
       <button class="lb-view" data-view="moves" title="Every folder this tab has moved, newest first, each one with a button to put it back">Move log</button>
+      <button class="lb-view" data-view="multicd" title="Bit Music owned releases whose CD1/CD2/CD3 folders have jumbled or duplicate tracks — verified against .cue sheets or the Discogs per-disc tracklist before anything moves">Multi-CD dedupe</button>
     </div>
     <div class="lb-filters" id="lb-filters">
       <button class="lb-f active" data-status="" title="Show every release">All</button>

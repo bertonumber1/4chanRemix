@@ -763,6 +763,15 @@ def bitmusic_catno_lookup(album, artist, year):
     return best
 
 
+# Same convention label_ref.is_disc_dir() uses for the owned archive
+# (CD1, Disc 2, Vol. 3, ...) — kept as a local copy rather than importing
+# label_ref here, since that module pulls in the Discogs client and other
+# Labels-tab-only machinery that a generic organiser function has no business
+# depending on.
+_DISC_DIR_RE = re.compile(
+    r"^(cd|disc|disco|disk|dvd|vol|volume|part|parte)\s*_?-?\s*\d+\b", re.I)
+
+
 def build_destination_path(
     record: dict[str, Any],
     album_type: str,
@@ -828,6 +837,22 @@ def build_destination_path(
     # --- BROKEN files just go to a flat dump folder ----------------------
     if record.get("status") == "broken":
         return dest_root / "Broken" / src_path.name
+
+    # --- multi-disc: carry a CDn parent folder through to the destination ---
+    # A source file's immediate parent may itself be a disc folder (CD1,
+    # Disc 2, ...) — same convention label_ref.is_disc_dir() already uses
+    # for the owned archive. Without this, two discs' files land in the
+    # SAME release folder with no disc marker, and same-numbered tracks off
+    # different discs (a "5" on both CD1 and CD2 is the normal case, not an
+    # edge case) collide into "05 - Artist - Title.ext" / "...(2).ext" —
+    # the destination-collision suffix hides that these are two different
+    # songs from two different discs, not a duplicate.
+    disc_dir = ""
+    _disc_m = _DISC_DIR_RE.match(src_path.parent.name.strip())
+    if _disc_m:
+        _dnum_m = re.search(r"\d+", src_path.parent.name)
+        if _dnum_m:
+            disc_dir = s(f"CD{int(_dnum_m.group())}", "")
 
     # --- shared fields ---------------------------------------------------
     # If the importer pre-decided an album-level label for cohesion,
@@ -960,9 +985,13 @@ def build_destination_path(
         if name_stem:
             name_stem = s(name_stem, "Unknown Track")
             filename = f"{name_stem}.{name_ext}" if name_ext else name_stem
-        # --- routing:  (catno) Artist (Year) / Artist - Album (Year) / NN - Title.ext
+        # --- routing:  (catno) Artist (Year) / Artist - Album (Year) / [CDn /] NN - Title.ext
         base = dest_root / "Self-Released" if is_self_release else dest_root
-        return base / outer_name / inner_name / filename
+        parts = [base, outer_name, inner_name]
+        if disc_dir:
+            parts.append(disc_dir)
+        parts.append(filename)
+        return Path(*parts)
 
     folder_name = s(
         (f"({catno}) " if catno else "") + rel_title + (f" ({year})" if year else ""),
@@ -979,7 +1008,10 @@ def build_destination_path(
         name_stem = s(name_stem, "Unknown Track")
         filename = f"{name_stem}.{name_ext}" if name_ext else name_stem
 
-    # --- routing:  (catno) Title (Year) / NN - Artist - Title.ext ---------
-    if is_self_release:
-        return dest_root / "Self-Released" / folder_name / filename
-    return dest_root / folder_name / filename
+    # --- routing:  (catno) Title (Year) / [CDn /] NN - Artist - Title.ext -
+    base = dest_root / "Self-Released" if is_self_release else dest_root
+    parts = [base, folder_name]
+    if disc_dir:
+        parts.append(disc_dir)
+    parts.append(filename)
+    return Path(*parts)

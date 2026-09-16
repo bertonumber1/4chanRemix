@@ -217,6 +217,45 @@ def catno_match(a, b) -> bool:
     return bool(ka and kb and (ka & kb))
 
 
+# ─── durations ──────────────────────────────────────────────────────────────
+def parse_discogs_duration(s) -> float | None:
+    """Discogs' `duration` field is "M:SS" or "H:MM:SS" text, or "" when the
+    submitter never filled it in — None here means exactly that absence,
+    never 0. A caller comparing this against a real audio file's length
+    must treat None as "cannot check", not as a zero-length track."""
+    s = (s or "").strip()
+    if not s:
+        return None
+    parts = s.split(":")
+    try:
+        parts = [int(p) for p in parts]
+    except ValueError:
+        return None
+    secs = 0
+    for p in parts:
+        secs = secs * 60 + p
+    return float(secs)
+
+
+def _format_track_artists(artists) -> str:
+    """A Discogs track-level `artists` list -> "Name1 Name2" display
+    string, same anv-over-name preference and join-word handling as the
+    Dark-Decade BBCode script's Format-Artists (PowerShell) — kept as its
+    own small copy here rather than a shared dependency between an
+    unrelated forum-post generator and this app."""
+    if not artists:
+        return ""
+    parts = []
+    for a in artists:
+        name = (a.get("anv") or a.get("name") or "").strip()
+        name = re.sub(r"\s*\(\d+\)\s*$", "", name)   # Discogs same-name disambiguator
+        if not name:
+            continue
+        join = (a.get("join") or "").strip()
+        parts.append(f"{name} {join}" if join else name)
+    return " ".join(parts).strip()
+
+
 # ─── titles ───────────────────────────────────────────────────────────────────
 def norm(s: str) -> str:
     return re.sub(r"\s+", " ", re.sub(r"[^a-z0-9]+", " ", (s or "").lower())).strip()
@@ -252,6 +291,21 @@ def fuzzy(a: str, b: str) -> float:
 def title_match(a: str, b: str, bar: float = 0.86) -> bool:
     """A title match must also AGREE ON ITS NUMBERS."""
     return fuzzy(a, b) >= bar and not num_conflict(a, b)
+
+
+def audio_duration(path: str) -> float | None:
+    """A real audio file's own length in seconds, or None on anything that
+    is not a readable audio file. Full mutagen.File() load (not the
+    seek-past-pictures FLAC-only fast path _flac_tags() uses) — this is
+    called for a handful of specific candidate files during multi-disc
+    duplicate recovery, never over a whole folder, so the cost that fast
+    path exists to avoid does not apply here."""
+    try:
+        import mutagen
+        m = mutagen.File(path)
+        return float(m.info.length) if m is not None and getattr(m, "info", None) else None
+    except Exception:
+        return None
 
 
 # ─── what is in a folder ──────────────────────────────────────────────────────
@@ -825,6 +879,14 @@ class Discogs:
             page += 1
         return out
 
+    def release(self, release_id: int) -> dict:
+        """The full raw /releases/{id} response — artists, title, labels
+        (name+catno), year, images, tracklist. tracklist()/tracklist_by_disc()
+        each independently re-fetch this same endpoint for their one field;
+        this is for a caller (cd_tools.tag_release) that needs the release-
+        level fields (artist/catno/album/year) too, not just the tracklist."""
+        return self._get(f"/releases/{int(release_id)}")
+
     def tracklist(self, release_id: int) -> list:
         d = self._get(f"/releases/{int(release_id)}")
         out = []
@@ -835,6 +897,53 @@ class Discogs:
             title = (t.get("title") or "").strip()
             if title:
                 out.append(title)
+        return out
+
+    def tracklist_by_disc(self, release_id: int) -> dict:
+        """Same /releases/{id} response as tracklist(), but split by disc —
+        for a multi-CD release, tracklist() flattens CD1/CD2/CD3 into one
+        sequence and throws away which disc each track came from.
+
+        Discogs' own `position` field is the only per-track disc signal, and
+        it is inconsistent across releases: usually "2-3" (disc 2, track 3),
+        sometimes a bare number/letter with a preceding `type_: "heading"`
+        entry naming the disc ("CD 2") instead. Track "current disc" state
+        across headings for the second form. When neither pattern is present
+        anywhere in the tracklist, there is no reliable way to split it — put
+        everything under disc 1 rather than guessing a boundary, so a caller
+        checking this against actual CDn folders on disk correctly treats a
+        release with 2+ real discs but only one Discogs "disc" as unusable.
+
+        Each entry is {"title", "duration", "artist"} rather than a bare
+        string — "duration" is the Discogs-stated length in seconds
+        (float), or None when the submitter never filled it in (common —
+        do not assume it is always there). A VA compilation can legitimately
+        list the SAME title on two different discs; a caller trying to tell
+        those apart (a real second copy vs. the same physical file misfiled)
+        needs the duration to do it, not just the title. "artist" is the
+        track's own credited artist (VA compilations credit each track
+        separately) — needed for a Soulseek search on a track this release
+        genuinely does not have a file for; "title" alone matches far too
+        broadly.
+        """
+        d = self._get(f"/releases/{int(release_id)}")
+        out: dict = {}
+        disc = 1
+        for t in d.get("tracklist", []):
+            if (t.get("type_") or "track") == "heading":
+                heading = (t.get("title") or "")
+                m = re.search(r"\b(?:cd|disc|disco|disk|dvd)\D{0,3}(\d+)\b", heading, re.I)
+                if m:
+                    disc = int(m.group(1))
+                continue
+            title = (t.get("title") or "").strip()
+            if not title:
+                continue
+            pos = (t.get("position") or "").strip()
+            m = re.match(r"^(\d+)\s*-\s*\d+", pos)
+            entry = {"title": title, "duration": parse_discogs_duration(t.get("duration")),
+                     "artist": _format_track_artists(t.get("artists"))}
+            out.setdefault(int(m.group(1)) if m else disc, []).append(entry)
         return out
 
     def release_price(self, release_id: int, curr_abbr: str = "") -> dict:

@@ -1356,9 +1356,12 @@ def move_log(limit: int = 200) -> list:
             out.append({"when": when, "action": action, "src": src, "dest": dest,
                         "ok": ok == "1", "note": note,
                         # undoable only while the destination is still there and
-                        # the original place is still free
+                        # the original place is still free. os.path.exists (not
+                        # isdir): a "move" row can be a single FILE (cd_tools.py,
+                        # multicd_dedupe.py move individual tracks, not whole
+                        # release folders) just as often as a directory.
                         "undoable": ok == "1" and action == "move"
-                        and os.path.isdir(dest) and not os.path.exists(src)})
+                        and os.path.exists(dest) and not os.path.exists(src)})
     out.reverse()
     return out[:limit]
 
@@ -1519,12 +1522,12 @@ def move_folders(paths: list, dest_dir: str = "", dry_run: bool = False) -> dict
 
 
 def undo_move(dest: str) -> tuple[bool, str]:
-    """Put one moved folder back where it came from."""
+    """Put one moved file or folder back where it came from."""
     for row in move_log(limit=5000):
         if row["action"] != "move" or _norm(row["dest"]) != _norm(dest):
             continue
-        if not os.path.isdir(row["dest"]):
-            return False, "the moved folder is no longer there"
+        if not os.path.exists(row["dest"]):
+            return False, "the moved file or folder is no longer there"
         if os.path.exists(row["src"]):
             return False, "something is already back at the original path"
         try:

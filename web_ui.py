@@ -59,6 +59,22 @@ except Exception as _lbl_err:           # likewise: no tab is worth the whole ap
 else:
     _LBL_ERR = ""
 
+try:
+    import multicd_dedupe as mcd
+except Exception as _mcd_err:
+    mcd = None
+    _MCD_ERR = repr(_mcd_err)
+else:
+    _MCD_ERR = ""
+
+try:
+    import cd_tools as cdt
+except Exception as _cdt_err:
+    cdt = None
+    _CDT_ERR = repr(_cdt_err)
+else:
+    _CDT_ERR = ""
+
 # ─── logging ──────────────────────────────────────────────────────────────────
 def _setup_logging(verbose: bool = False) -> None:
     fmt = "%(asctime)s  %(levelname)-7s  %(message)s"
@@ -374,6 +390,12 @@ def _do_direct(ui, sources, dest, provider_ids, cfg, dry_run, steps=("import", "
     override["paths"] = p
     organise_cfg = dict(override.get("organise", {}))
     organise_cfg["artist_led_folder"] = True
+    # build_destination_path checks folder_scheme BEFORE artist_led_folder —
+    # the config default ("artist_release_track_mix_year") always wins and
+    # silently splits a release's tracks into one folder each, no matter
+    # what artist_led_folder says. Force "release" so Direct actually gets
+    # the one-folder-per-release layout its own log message above implies.
+    organise_cfg["folder_scheme"] = "release"
     override["organise"] = organise_cfg
 
     ui.log("info", "DIRECT MODE — no database will be written, files only")
@@ -1726,6 +1748,326 @@ async def label_undo(req: Request):
     body = await req.json()
     ok, msg = lbl.undo_move(body.get("dest", ""))
     return JSONResponse({"ok": ok, "reason": msg})
+
+
+# ─── multi-CD dedupe (Bit Music owned archive only — see multicd_dedupe.py) ───
+# Wired straight into the Labels tab's move/undo log: an "apply" here shows up
+# in the same /api/label/moves history and is undoable through /api/label/undo,
+# no separate mechanism. Every route below is synchronous JSON, same as the
+# other per-release Labels actions above — a plan/apply touches one release's
+# worth of files, not the whole archive, so there is nothing here slow enough
+# to need the job queue. Only --scan-equivalent walks the archive, and it does
+# the same plain os.listdir()+tag-read pass the CLI already runs synchronously.
+
+def _mcd_guard():
+    if mcd is None:
+        return JSONResponse({"ok": False,
+                             "reason": "multicd_dedupe failed to load: %s" % _MCD_ERR})
+    return None
+
+
+def _mcd_context():
+    """(tracklists cache, Discogs client) — same two inputs the CLI builds
+    once per invocation (see multicd_dedupe.main). Rebuilt per request rather
+    than cached across requests: tracklists() itself is LabelCache-backed and
+    already cheap on a warm cache, and always-fresh beats a plan silently
+    going stale against a tracklist cache update running elsewhere."""
+    tls = label_ref.LabelCache(lbl.CACHE_DIR, mcd.BIT_MUSIC_LABEL_ID).tracklists()
+    discogs = mcd._discogs_client()
+    return tls, discogs
+
+
+@app.get("/api/multicd/scan")
+def multicd_scan():
+    g = _mcd_guard()
+    if g:
+        return g
+    try:
+        flagged = mcd.scan_multicd_releases()
+    except Exception as exc:
+        return JSONResponse({"ok": False, "reason": str(exc)})
+    return JSONResponse({"ok": True, "releases": flagged})
+
+
+@app.get("/api/multicd/plan")
+def multicd_plan(name: str = ""):
+    g = _mcd_guard()
+    if g:
+        return g
+    if not name:
+        return JSONResponse({"ok": False, "reason": "no release folder given"})
+    try:
+        tls, discogs = _mcd_context()
+        plan = mcd.build_plan_for(name, tls, discogs)
+    except Exception as exc:
+        return JSONResponse({"ok": False, "reason": str(exc)})
+    return JSONResponse({"ok": True, "name": name, "plan": plan})
+
+
+@app.post("/api/multicd/apply")
+async def multicd_apply(req: Request):
+    g = _mcd_guard()
+    if g:
+        return g
+    body = await req.json()
+    name = body.get("name", "")
+    if not name:
+        return JSONResponse({"ok": False, "reason": "no release folder given"})
+    dry_run = bool(body.get("dry_run"))
+    try:
+        tls, discogs = _mcd_context()
+        plan = mcd.build_plan_for(name, tls, discogs)
+        if plan["status"] != "auto_fixable":
+            return JSONResponse({"ok": False, "name": name, "plan": plan,
+                                 "reason": "not auto-fixable: " + "; ".join(plan["reasons"])})
+        result = mcd.apply_fix(name, plan, dry_run=dry_run)
+    except Exception as exc:
+        return JSONResponse({"ok": False, "reason": str(exc)})
+    result["name"] = name
+    return JSONResponse(result)
+
+
+# ─── CD Tools (Direct tab) ─────────────────────────────────────────────────
+# Any folder the user Browses to, not tied to a Labels-tab tracked root or
+# the Bit Music catalogue — check tracks against a .cue sheet or a given
+# Discogs release, auto-arrange a jumbled multi-disc release, tag, fetch
+# artwork, move/copy/delete. Every action logs to the persistent log file
+# (not just the on-screen job log), same reasoning _do_label's log()
+# wrapper gives for long jobs: real file moves/deletes/tag-writes on a
+# real archive deserve an audit trail that outlives the browser tab.
+
+def _cdt_guard():
+    if cdt is None:
+        return JSONResponse({"ok": False, "reason": "cd_tools failed to load: %s" % _CDT_ERR})
+    return None
+
+
+def _cdt_log(action: str, root: str, result: dict) -> None:
+    ok = bool(result.get("ok"))
+    reason = result.get("reason", "")
+    msg = "cdtools %s [%s]: %s%s" % (action, root, "ok" if ok else "FAILED",
+                                     (" — " + reason) if reason else "")
+    (logging.info if ok else logging.warning)(msg)
+
+
+def _cdt_discogs():
+    if lbl is None:
+        return None
+    token = lbl._token(_load_cfg())
+    return label_ref.Discogs(token) if token else None
+
+
+@app.get("/api/cdtools/scan")
+def cdtools_scan(root: str = ""):
+    g = _cdt_guard()
+    if g:
+        return g
+    if not root or not os.path.isdir(root):
+        return JSONResponse({"ok": False, "reason": "not a folder: " + root})
+    try:
+        result = {"ok": True, "discs": cdt.disc_numbers(root),
+                  "duplicates": cdt.scan_duplicates(root)}
+    except Exception as exc:
+        result = {"ok": False, "reason": str(exc)}
+    _cdt_log("scan", root, result)
+    return JSONResponse(result)
+
+
+@app.get("/api/cdtools/plan")
+def cdtools_plan(root: str = "", release: str = ""):
+    g = _cdt_guard()
+    if g:
+        return g
+    if not root or not os.path.isdir(root):
+        return JSONResponse({"ok": False, "reason": "not a folder: " + root})
+    discogs = _cdt_discogs()
+    release_id, err = cdt.resolve_release_id(release, discogs)
+    if release and not release_id:
+        result = {"ok": False, "reason": err}
+        _cdt_log("plan", root, result)
+        return JSONResponse(result)
+    try:
+        plan = cdt.build_plan(root, release_id, discogs)
+        result = {"ok": True, "plan": plan}
+    except Exception as exc:
+        result = {"ok": False, "reason": str(exc)}
+    _cdt_log("plan", root, result)
+    return JSONResponse(result)
+
+
+@app.post("/api/cdtools/apply")
+async def cdtools_apply(req: Request):
+    g = _cdt_guard()
+    if g:
+        return g
+    body = await req.json()
+    root = body.get("root", "")
+    release = body.get("release", "")
+    dry_run = bool(body.get("dry_run"))
+    if not root or not os.path.isdir(root):
+        return JSONResponse({"ok": False, "reason": "not a folder: " + root})
+    discogs = _cdt_discogs()
+    release_id, err = cdt.resolve_release_id(release, discogs)
+    if release and not release_id:
+        result = {"ok": False, "reason": err}
+        _cdt_log("apply", root, result)
+        return JSONResponse(result)
+    try:
+        plan = cdt.build_plan(root, release_id, discogs)
+        result = cdt.apply_plan(root, plan, dry_run=dry_run)
+    except Exception as exc:
+        result = {"ok": False, "reason": str(exc)}
+    _cdt_log(("apply" if not dry_run else "apply-preview"), root, result)
+    return JSONResponse(result)
+
+
+@app.post("/api/cdtools/remove")
+async def cdtools_remove(req: Request):
+    g = _cdt_guard()
+    if g:
+        return g
+    body = await req.json()
+    root, path = body.get("root", ""), body.get("path", "")
+    dry_run = bool(body.get("dry_run"))
+    if not root or not path:
+        return JSONResponse({"ok": False, "reason": "root and path are both required"})
+    try:
+        result = cdt.remove_file(root, path, dry_run=dry_run)
+    except Exception as exc:
+        result = {"ok": False, "reason": str(exc)}
+    _cdt_log("remove " + os.path.basename(path), root, result)
+    return JSONResponse(result)
+
+
+@app.post("/api/cdtools/tag")
+async def cdtools_tag(req: Request):
+    g = _cdt_guard()
+    if g:
+        return g
+    body = await req.json()
+    root, release = body.get("root", ""), body.get("release", "")
+    dry_run = bool(body.get("dry_run"))
+    if not root or not os.path.isdir(root):
+        return JSONResponse({"ok": False, "reason": "not a folder: " + root})
+    discogs = _cdt_discogs()
+    release_id, err = cdt.resolve_release_id(release, discogs)
+    if not release_id:
+        result = {"ok": False, "reason": err or "no Discogs release given"}
+        _cdt_log("tag", root, result)
+        return JSONResponse(result)
+    try:
+        result = cdt.tag_release(root, release_id, discogs, dry_run=dry_run)
+    except Exception as exc:
+        result = {"ok": False, "reason": str(exc)}
+    _cdt_log("tag", root, result)
+    return JSONResponse(result)
+
+
+@app.post("/api/cdtools/artwork")
+async def cdtools_artwork(req: Request):
+    g = _cdt_guard()
+    if g:
+        return g
+    body = await req.json()
+    root, release = body.get("root", ""), body.get("release", "")
+    dry_run = bool(body.get("dry_run"))
+    if not root or not os.path.isdir(root):
+        return JSONResponse({"ok": False, "reason": "not a folder: " + root})
+    discogs = _cdt_discogs()
+    release_id, err = cdt.resolve_release_id(release, discogs)
+    if release and not release_id:
+        result = {"ok": False, "reason": err}
+        _cdt_log("artwork", root, result)
+        return JSONResponse(result)
+    try:
+        result = cdt.get_artwork(root, release_id, discogs, dry_run=dry_run)
+    except Exception as exc:
+        result = {"ok": False, "reason": str(exc)}
+    _cdt_log("artwork", root, result)
+    return JSONResponse(result)
+
+
+@app.post("/api/cdtools/move")
+async def cdtools_move(req: Request):
+    g = _cdt_guard()
+    if g:
+        return g
+    body = await req.json()
+    root, dest = body.get("root", ""), body.get("dest", "")
+    dry_run = bool(body.get("dry_run"))
+    if not root or not dest:
+        return JSONResponse({"ok": False, "reason": "root and dest are both required"})
+    try:
+        result = cdt.move_folder(root, dest, dry_run=dry_run)
+    except Exception as exc:
+        result = {"ok": False, "reason": str(exc)}
+    _cdt_log("move -> " + dest, root, result)
+    return JSONResponse(result)
+
+
+@app.post("/api/cdtools/copy")
+async def cdtools_copy(req: Request):
+    g = _cdt_guard()
+    if g:
+        return g
+    body = await req.json()
+    root, dest = body.get("root", ""), body.get("dest", "")
+    dry_run = bool(body.get("dry_run"))
+    if not root or not dest:
+        return JSONResponse({"ok": False, "reason": "root and dest are both required"})
+    try:
+        result = cdt.copy_folder(root, dest, dry_run=dry_run)
+    except Exception as exc:
+        result = {"ok": False, "reason": str(exc)}
+    _cdt_log("copy -> " + dest, root, result)
+    return JSONResponse(result)
+
+
+@app.post("/api/cdtools/delete")
+async def cdtools_delete(req: Request):
+    g = _cdt_guard()
+    if g:
+        return g
+    body = await req.json()
+    root, paths = body.get("root", ""), body.get("paths") or []
+    if not root or not paths:
+        return JSONResponse({"ok": False, "reason": "root and at least one path are required"})
+    try:
+        result = cdt.delete_review_files(root, paths)
+    except Exception as exc:
+        result = {"ok": False, "reason": str(exc)}
+    _cdt_log("delete %d file(s)" % len(paths), root, result)
+    return JSONResponse(result)
+
+
+@app.get("/api/cdtools/verify")
+def cdtools_verify(root: str = "", release: str = ""):
+    g = _cdt_guard()
+    if g:
+        return g
+    if not root or not os.path.isdir(root):
+        return JSONResponse({"ok": False, "reason": "not a folder: " + root})
+    discogs = _cdt_discogs()
+    release_id, _err = cdt.resolve_release_id(release, discogs)
+    try:
+        result = cdt.verify(root, release_id, discogs)
+    except Exception as exc:
+        result = {"ok": False, "reason": str(exc)}
+    _cdt_log("verify", root, result)
+    return JSONResponse(result)
+
+
+@app.get("/api/cdtools/review")
+def cdtools_review(root: str = ""):
+    g = _cdt_guard()
+    if g:
+        return g
+    if not root or not os.path.isdir(root):
+        return JSONResponse({"ok": False, "reason": "not a folder: " + root})
+    try:
+        return JSONResponse({"ok": True, "files": cdt.list_review(root)})
+    except Exception as exc:
+        return JSONResponse({"ok": False, "reason": str(exc)})
 
 
 @app.get("/api/scan")
