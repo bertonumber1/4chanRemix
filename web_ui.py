@@ -368,10 +368,12 @@ def _do_organise(ui, dest, cfg, dry_run):
 def _do_direct(ui, sources, dest, provider_ids, cfg, dry_run, steps=("import", "fetch", "organise")):
     """Direct mode: import → fetch tags → organise, chained on a single
     throwaway in-memory DB (Database(":memory:") — see database.py). Nothing
-    persists to a database file; sources+dest are the only inputs, output is
-    just organised files on disk with Beatport-style "(catno) Artist - Album
-    (Year)/NN - Title.ext" naming (see organise.artist_led_folder in
-    organiser_core.build_destination_path)."""
+    persists to a database file; sources+dest are the only inputs. Output is
+    organised files on disk using whatever organise.folder_scheme the user
+    has configured; only falls back to Beatport-style "(catno) Artist - Album
+    (Year)/NN - Title.ext" naming (organise.artist_led_folder in
+    organiser_core.build_destination_path) when they haven't customised the
+    scheme at all."""
     from database import Database
     from importer import import_sources, organise_in_place
     from metadata_lookup import fill_missing_metadata
@@ -389,13 +391,23 @@ def _do_direct(ui, sources, dest, provider_ids, cfg, dry_run, steps=("import", "
     p["database"] = ":memory:"
     override["paths"] = p
     organise_cfg = dict(override.get("organise", {}))
-    organise_cfg["artist_led_folder"] = True
-    # build_destination_path checks folder_scheme BEFORE artist_led_folder —
-    # the config default ("artist_release_track_mix_year") always wins and
-    # silently splits a release's tracks into one folder each, no matter
-    # what artist_led_folder says. Force "release" so Direct actually gets
-    # the one-folder-per-release layout its own log message above implies.
-    organise_cfg["folder_scheme"] = "release"
+    # Only impose Direct mode's own Beatport-style default when the user
+    # hasn't actually chosen a folder scheme of their own — an explicit
+    # choice (e.g. folder_scheme="custom" with their own template) must
+    # win here, not get silently discarded just because this run went
+    # through Direct instead of the Session pipeline. Both pipelines
+    # share the same organise_cfg/build_destination_path underneath;
+    # Direct isn't a different naming convention, just a different way
+    # to invoke the same one.
+    current_scheme = str(organise_cfg.get("folder_scheme") or "").strip().lower()
+    if not current_scheme or current_scheme == "artist_release_track_mix_year":
+        organise_cfg["artist_led_folder"] = True
+        # build_destination_path checks folder_scheme BEFORE artist_led_folder —
+        # the config default ("artist_release_track_mix_year") always wins and
+        # silently splits a release's tracks into one folder each, no matter
+        # what artist_led_folder says. Force "release" so Direct actually gets
+        # the one-folder-per-release layout its own log message above implies.
+        organise_cfg["folder_scheme"] = "release"
     override["organise"] = organise_cfg
 
     ui.log("info", "DIRECT MODE — no database will be written, files only")
