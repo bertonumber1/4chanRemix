@@ -940,6 +940,19 @@ def fill_missing_metadata(
                 title = (recovered.get("title", "") or "").strip()
             if title and not is_unknown_tag(title):
                 d = dict(row)
+                # Bake the recovered artist/title straight onto the row,
+                # not just the query — `artist`/`title` here may have come
+                # from parsing the FILENAME rather than the file's own
+                # tag (e.g. "01. Mr. John - It's Not Too Late.flac" with
+                # no artist tag at all). If a provider match never comes
+                # back for this track, the per-file write loop below is
+                # never reached for it at all (the "no provider match"
+                # path skips straight past writing anything) — without
+                # this, a confidently-parsed filename artist would be
+                # thrown away right along with the failed lookup instead
+                # of surviving as the next-best thing to a real match.
+                d["artist"] = artist
+                d["title"] = title
                 d["_query_artist"] = artist
                 d["_query_album"] = title
                 key = (artist, title)
@@ -1598,15 +1611,73 @@ def fill_missing_metadata(
                             break
 
         if not provider_releases:
+            # No provider confidently resolved which release this track
+            # is from — but for a single-track group, `rows` already has
+            # the recovered artist/title baked onto it (see the
+            # SINGLE-TRACK REROUTE grouping step above), and that's real
+            # signal even without a confirmed release. Persist it rather
+            # than throwing it away along with the failed lookup — this
+            # is the difference between "no catalogue info, but at least
+            # the right artist" and "nothing at all".
+            if is_single_group:
+                for row in rows:
+                    row_artist = (row.get("artist") or "").strip()
+                    row_title = (row.get("title") or "").strip()
+                    if not row_artist and not row_title:
+                        continue
+                    row_update_dict = dict(row)
+                    updated_fields = 1  # artist/title are already baked in;
+                                        # this just forces the upsert below
+                    try:
+                        db.upsert_file(row_update_dict)
+                        stats.files_updated += 1
+                        stats.fields_updated += updated_fields
+                        if ui is not None:
+                            ui.advance(imported=True)
+                        emit("imported",
+                             f"artist from filename (no catalogue match): "
+                             f"{row_artist} - {Path(row['path']).name}")
+                        if write_to_files and _write_tags_to_file is not None:
+                            try:
+                                _write_tags_to_file(
+                                    row["path"],
+                                    {"artist": row_artist, "title": row_title},
+                                    only_missing=only_missing,
+                                    touch_verified_rips=touch_verified_rips,
+                                )
+                            except Exception:
+                                pass
+                    except Exception as e:
+                        stats.errors.append(f"DB update {row['path']}: {e}")
             stats.files_no_match += len(rows)
             emit("warning", f"no match: {artist} - {album}")
-            if ui is not None:
+            if ui is not None and not is_single_group:
                 ui.advance(broken=True)
             continue
 
         # ----- merge into one consensus result -----
         merged = merge_releases(provider_releases)
-        update_dict = merged.to_db_update(target_columns)
+        # A normal album-group fetch respects the caller's target_columns
+        # exactly — the usual assumption is that artist/album already
+        # came from the file's own tags and shouldn't be second-guessed
+        # by a provider (that's why a caller commonly leaves them out of
+        # target_columns, filling only the "extra" fields like year/
+        # label/genre). That assumption is backwards for a single-track
+        # group: artist/album (well, "album" here is really the resolved
+        # release the track belongs to) are the WHOLE reason this group
+        # exists — the file's own tags had no usable album at all, and
+        # for an artist recovered from the filename rather than the
+        # file's own tag, nothing else in this run will ever persist it.
+        # only_missing (checked per-field below) still protects any
+        # value the file's tag already had, so this can't clobber good
+        # data — it just stops good data from being silently dropped.
+        columns_for_update = target_columns
+        if is_single_group:
+            columns_for_update = list(target_columns)
+            for extra_col in ("artist", "album"):
+                if extra_col not in columns_for_update:
+                    columns_for_update.append(extra_col)
+        update_dict = merged.to_db_update(columns_for_update)
         emit("info",
              f"match: {artist} - {album} "
              f"(from {', '.join(merged.sources)})")
