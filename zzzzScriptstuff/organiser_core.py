@@ -227,35 +227,53 @@ def decide_album_type(
     `records` is a list of metadata dicts (the output of metadata.extract_metadata).
 
     Decision order:
+      0. If there's positive evidence the group doesn't share ONE album
+         at all (see `min_album_agreement` below) -> solo, immediately,
+         before any of the checks below even run. This is a group of
+         unrelated tracks sharing a folder, not a release — no VA tag or
+         mix keyword on an individual leftover file changes that.
       1. If albumartist looks like "Various Artists" -> mix.
       2. If album name contains mix-keywords ("DJ Foo presents...", "Essential Mix...") -> mix.
       3. If the share of tracks whose `artist` differs from the modal
-         artist exceeds `diversity_threshold` -> mix, BUT only when the
-         group also agrees on ONE album name (see `min_album_agreement`
-         below) — artist diversity alone doesn't mean "one compilation",
-         it can just as easily mean "several unrelated singles that
-         happen to sit in the same holding-pen folder". A real VA
-         compilation is one release; tracks with different artists AND
-         different albums aren't a release at all, just a folder.
+         artist exceeds `diversity_threshold` -> mix.
       4. Otherwise -> solo.
 
     `min_album_agreement`: the share of tracks that must agree on the
-    SAME album name for artist-diversity (check 3) to mean "compilation"
-    rather than "unrelated singles". Concretely: a folder of orphan
-    tracks each individually matched to their OWN distinct single/EP
-    (different artist AND different album per track, e.g. after a
-    per-track Discogs lookup) must NOT be classified 'mix' — that would
-    make the organiser fold each track's own real artist into a generic
-    "Various Artists" folder label, throwing away exactly the identity
-    the per-track lookup just resolved. A genuine compilation, by
-    contrast, has one shared album name across (nearly) all tracks even
-    though the artist differs per track — that's what this checks for.
+    SAME album name for this to count as one release at all. Concretely:
+    a folder of orphan tracks each individually matched to their OWN
+    distinct single/EP (different artist AND different album per track,
+    e.g. after a per-track Discogs lookup) must NOT be classified 'mix'
+    — that would fold each track's own real, just-resolved artist into
+    a generic "Various Artists" folder label. This check runs FIRST and
+    overrides checks 1/2 as well as check 3: each of these unrelated
+    tracks may well carry its own leftover "Various Artists" albumartist
+    tag from whatever ORIGINAL compilation it was ripped from once, long
+    before landing in this folder together — that tag describes a
+    different release, not this group, and must not decide this group's
+    classification. Only fires on POSITIVE evidence of disagreement
+    (needs at least 2 distinct album values to judge); a group with no
+    album info at all falls through to checks 1-3 unaffected, so a
+    sparse-tagged real compilation (no album tag, but a consistent
+    'Various Artists' albumartist) still classifies correctly.
     """
     if not records:
         return "unknown"
 
     various_artists_tags = [t.lower() for t in (various_artists_tags or [])]
     mix_keywords = [k.lower() for k in (mix_keywords or [])]
+
+    # --- check 0: does this group even share ONE album? ------------------
+    from detection import normalise_query
+    album_names = [
+        normalise_query(r.get("album") or "").lower()
+        for r in records if r.get("album")
+    ]
+    album_names = [a for a in album_names if a]
+    if len(album_names) >= 2:
+        album_counts = Counter(album_names)
+        album_agreement = album_counts.most_common(1)[0][1] / len(album_names)
+        if album_agreement <= min_album_agreement:
+            return "solo"
 
     # --- check 1: explicit Various Artists tag ---------------------------
     aa_values = [
@@ -283,7 +301,7 @@ def decide_album_type(
             if re.search(r"\b" + re.escape(kw) + r"\b", album):
                 return "mix"
 
-    # --- check 3: track-artist diversity, gated on album agreement -------
+    # --- check 3: track-artist diversity ----------------------------------
     track_artists = [
         (r.get("artist") or "").strip().lower()
         for r in records if r.get("artist")
@@ -293,26 +311,7 @@ def decide_album_type(
         most_common_count = counts.most_common(1)[0][1]
         diff_share = 1.0 - (most_common_count / len(track_artists))
         if diff_share >= diversity_threshold:
-            # Normalised (edition/disc-marker/whitespace noise stripped)
-            # before comparing — a real multi-disc VA compilation or DJ
-            # mix CD routinely has "Comp Name (Disc 1)" on one track and
-            # "Comp Name (Deluxe Edition)" on another; that's still ONE
-            # release and must still agree here. Reuses the same
-            # normaliser `fill_missing_metadata`'s provider queries use
-            # for exactly this kind of noise (see detection.normalise_query).
-            from detection import normalise_query
-            album_names = [
-                normalise_query(r.get("album") or "").lower()
-                for r in records if r.get("album")
-            ]
-            album_names = [a for a in album_names if a]
-            album_agreement = 0.0
-            if album_names:
-                album_counts = Counter(album_names)
-                album_agreement = (album_counts.most_common(1)[0][1]
-                                    / len(album_names))
-            if album_agreement > min_album_agreement:
-                return "mix"
+            return "mix"
 
     return "solo"
 
