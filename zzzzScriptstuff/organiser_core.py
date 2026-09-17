@@ -293,10 +293,19 @@ def decide_album_type(
         most_common_count = counts.most_common(1)[0][1]
         diff_share = 1.0 - (most_common_count / len(track_artists))
         if diff_share >= diversity_threshold:
+            # Normalised (edition/disc-marker/whitespace noise stripped)
+            # before comparing — a real multi-disc VA compilation or DJ
+            # mix CD routinely has "Comp Name (Disc 1)" on one track and
+            # "Comp Name (Deluxe Edition)" on another; that's still ONE
+            # release and must still agree here. Reuses the same
+            # normaliser `fill_missing_metadata`'s provider queries use
+            # for exactly this kind of noise (see detection.normalise_query).
+            from detection import normalise_query
             album_names = [
-                (r.get("album") or "").strip().lower()
+                normalise_query(r.get("album") or "").lower()
                 for r in records if r.get("album")
             ]
+            album_names = [a for a in album_names if a]
             album_agreement = 0.0
             if album_names:
                 album_counts = Counter(album_names)
