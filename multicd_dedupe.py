@@ -435,18 +435,25 @@ def build_fix_plan(release_root: str, discs: list, sources: dict,
             # Duration agreement alone is the historical bar (see the note
             # above _DURATION_TOLERANCE_S) but two DIFFERENT songs can
             # coincidentally land within 3s of each other. Where a real
-            # fingerprint comparison is available on this machine, require
-            # it to agree too, never on its own (see fingerprint_kit.py's
-            # own docstring on why audio similarity alone is never enough —
-            # an Original Mix and its Extended Mix can score above SAME
-            # over a long window despite being different tracks; duration
-            # is what tells them apart). Falls back to duration-only,
-            # unchanged from before, when fingerprinting isn't set up here.
+            # fingerprint comparison is available on this machine AND
+            # actually produces a verdict, require it to agree too, never
+            # on its own (see fingerprint_kit.py's own docstring on why
+            # audio similarity alone is never enough — an Original Mix and
+            # its Extended Mix can score above SAME over a long window
+            # despite being different tracks; duration is what tells them
+            # apart). compare_recordings() returning None (not False) —
+            # fpcalc couldn't get a usable fingerprint from one of the
+            # files at all, e.g. it's silent or corrupt — means this check
+            # has nothing to add; duration already vouched for the match,
+            # so that stays enough, exactly as it was before fingerprinting
+            # existed. Only a real disagreement (False) blocks it.
             if FK.AVAILABLE:
                 cache = _get_fp_cache()
-                if not FK.same_recording(sibling["winner"], spare, cache):
+                verdict = FK.compare_recordings(sibling["winner"], spare, cache)
+                if verdict is False:
                     continue
-                fp_cache_dirty = True
+                if verdict is True:
+                    fp_cache_dirty = True
             sibling["losers"].remove(spare)
             consumed.add(spare)
             occ["winner"] = spare

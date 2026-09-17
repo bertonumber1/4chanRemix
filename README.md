@@ -72,6 +72,11 @@ The service runs in the background and auto-starts whenever you log in.
   fingerprint-based duplicate detection just stays off. The Windows-only
   comparison library it needs ships in `vendor/` already, nothing else to
   install for that half.
+- **ffmpeg** — for CD Tools' "Split tracks" (cutting one continuous rip
+  into individual tracks): `sudo apt install ffmpeg`, or on Windows grab a
+  build from [ffmpeg.org](https://ffmpeg.org/download.html) and put it on
+  `PATH`. Also optional — everything else works without it, that one
+  feature just reports ffmpeg is missing instead of splitting anything.
 - Internet access for metadata lookups (Discogs, MusicBrainz, etc.)
 
 All Python packages are installed automatically when you run `bash install.sh --deps`.

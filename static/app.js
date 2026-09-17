@@ -938,6 +938,56 @@ document.addEventListener('DOMContentLoaded',()=>{
   });
 });
 
+let cdtLastSplit_=null;
+function cdtSplitTime(s){
+  s=Math.max(0,s);
+  const m=Math.floor(s/60), sec=(s-m*60).toFixed(1);
+  return m+':'+(sec<10?'0':'')+sec;
+}
+async function cdtSplitPlan(mode){
+  const root=cdtNeedRoot(); if(!root) return;
+  const box=document.getElementById('cdt-split-results');
+  box.classList.remove('hidden');
+  box.innerHTML='<span style="color:var(--dim)">'+(mode==='cue'?'reading .cue sheet…':'fetching Discogs durations…')+'</span>';
+  const qs=new URLSearchParams({root, mode, release:cdtRelease()});
+  const d=await (await fetch('/api/cdtools/split-plan?'+qs)).json();
+  if(!d.ok){
+    cdtLastSplit_=null;
+    box.innerHTML='<span style="color:var(--warn)">'+esc(d.reason||'could not plan a split')+'</span>';
+    return;
+  }
+  cdtLastSplit_={source:d.source, points:d.points};
+  const rows=d.points.map(p=>
+    `<div>#${p.track_no}  ${cdtSplitTime(p.start)}–${cdtSplitTime(p.end)}  ${esc(p.title||'(untitled)')}`+
+    `${p.performer?'  <span style="color:var(--dim)">— '+esc(p.performer)+'</span>':''}</div>`).join('');
+  box.innerHTML=
+    `<div style="margin-bottom:4px">source: <b>${esc(cdtBasename(d.source))}</b>`+
+    (d.estimate?' <span style="color:var(--warn)">(estimated from Discogs lengths, not measured — spot-check before trusting it)</span>':
+                ' <span style="color:var(--dim)">(from the .cue sheet\'s own timestamps)</span>')+
+    `</div><div style="font-size:11px;line-height:1.5;margin-bottom:6px">${rows}</div>`+
+    `<button class="btn-xs warn" onclick="cdtSplitApply(true)">Preview split</button> `+
+    `<button class="btn-xs warn" onclick="cdtSplitApply(false)">Split for real</button>`;
+}
+async function cdtSplitApply(preview){
+  const root=cdtNeedRoot(); if(!root) return;
+  if(!cdtLastSplit_){ cdtLog('warning','run From .cue / From Discogs lengths first'); return; }
+  const dry = preview || cdtDry();
+  if(!preview && !dry && !confirm('Cut '+cdtLastSplit_.points.length+' track(s) out of\n\n'+
+      cdtLastSplit_.source+'\n\ninto a split_tracks\\ folder next to it?\n\n'+
+      'The original file is never touched or deleted.')) return;
+  const r=await fetch('/api/cdtools/split-apply',{method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({root, source:cdtLastSplit_.source, points:cdtLastSplit_.points, dry_run:dry})});
+  const d=await r.json();
+  if(!d.ok){ cdtLog('broken', d.reason||'split failed'); return; }
+  if(dry){
+    const lines=(d.planned||[]).map(p=>'  '+cdtBasename(p.dest));
+    cdtLog('info','would write '+lines.length+' file(s) into split_tracks\\:\n'+lines.join('\n'));
+  }else{
+    cdtLog('info','split '+d.written.length+' track(s) into '+root+'\\split_tracks\\');
+  }
+}
+
 // ── session tab ───────────────────────────────────────────────────────────────
 async function loadSession(){
   const r=await fetch('/api/session/files');

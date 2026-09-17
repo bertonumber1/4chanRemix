@@ -2109,6 +2109,54 @@ def cdtools_review(root: str = ""):
         return JSONResponse({"ok": False, "reason": str(exc)})
 
 
+@app.get("/api/cdtools/split-plan")
+def cdtools_split_plan(root: str = "", mode: str = "cue", release: str = ""):
+    """Where a continuous rip's tracks would be cut — from a cue sheet
+    (mode=cue) or estimated from Discogs' own per-track durations
+    (mode=discogs). Read-only, same as every other *-plan route here."""
+    g = _cdt_guard()
+    if g:
+        return g
+    if not root or not os.path.isdir(root):
+        return JSONResponse({"ok": False, "reason": "not a folder: " + root})
+    try:
+        if mode == "discogs":
+            discogs = _cdt_discogs()
+            release_id, err = cdt.resolve_release_id(release, discogs)
+            if release and not release_id:
+                result = {"ok": False, "reason": err}
+            else:
+                result = cdt.plan_split_discogs(root, release_id, discogs)
+        else:
+            result = cdt.plan_split_cue(root)
+    except Exception as exc:
+        result = {"ok": False, "reason": str(exc)}
+    _cdt_log("split-plan (%s)" % mode, root, result)
+    return JSONResponse(result)
+
+
+@app.post("/api/cdtools/split-apply")
+async def cdtools_split_apply(req: Request):
+    g = _cdt_guard()
+    if g:
+        return g
+    body = await req.json()
+    root = body.get("root", "")
+    source = body.get("source", "")
+    points = body.get("points") or []
+    dry_run = bool(body.get("dry_run", True))
+    if not root or not os.path.isdir(root):
+        return JSONResponse({"ok": False, "reason": "not a folder: " + root})
+    if not source or not points:
+        return JSONResponse({"ok": False, "reason": "run split-plan first"})
+    try:
+        result = cdt.apply_split(root, source, points, dry_run=dry_run)
+    except Exception as exc:
+        result = {"ok": False, "reason": str(exc)}
+    _cdt_log(("split-apply" if not dry_run else "split-preview"), root, result)
+    return JSONResponse(result)
+
+
 @app.get("/api/scan")
 def scan_source(path: str = ""):
     if not path:

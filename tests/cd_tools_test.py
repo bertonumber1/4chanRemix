@@ -519,6 +519,81 @@ except ImportError as exc:
     print("  SKIP  tag_release/get_artwork section — %s not installed" % exc)
 
 
+# ─── split_tracks — cutting one continuous rip into individual tracks ───────
+# Real audio + real ffmpeg (both self-disable via track_splitter.AVAILABLE,
+# same as every other optional-tool feature in this app) — a plan can be
+# checked with placeholder bytes, but actually cutting a file needs
+# something ffmpeg can decode.
+try:
+    import numpy as np
+    import soundfile as sf
+    import track_splitter as ts
+
+    def split_wav_of(path, seconds, freq=440):
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        t = np.linspace(0, seconds, int(seconds * 44100), endpoint=False)
+        sf.write(path, (0.1 * np.sin(2 * np.pi * freq * t)).astype("float32"), 44100, format="WAV")
+
+    if not ts.AVAILABLE:
+        print("\n  SKIP  split_tracks section — ffmpeg not on PATH")
+    else:
+        print("\n[plan_split_cue — a real continuous-rip cue + matching WAV]")
+        cue_root = os.path.join(tmp, "cue_split_release")
+        split_wav_of(os.path.join(cue_root, "side_a.wav"), 12.0)
+        with open(os.path.join(cue_root, "side.cue"), "w", encoding="utf-8") as fh:
+            fh.write('FILE "side_a.wav" WAVE\n'
+                    '  TRACK 01 AUDIO\n    TITLE "First"\n    INDEX 01 00:00:00\n'
+                    '  TRACK 02 AUDIO\n    TITLE "Second"\n    INDEX 01 00:05:00\n'
+                    '  TRACK 03 AUDIO\n    TITLE "Third"\n    INDEX 01 00:08:30\n')
+        plan = C.plan_split_cue(cue_root)
+        check(plan["ok"], "plan_split_cue succeeds against a real cue+wav pair")
+        eq(len(plan.get("points", [])), 3, "three cut points planned")
+        eq(plan.get("estimate"), False, "a cue-based plan is never marked as an estimate")
+
+        print("\n[apply_split — dry run plans without writing]")
+        preview = C.apply_split(cue_root, plan["source"], plan["points"], dry_run=True)
+        check(preview["ok"], "dry run reports ok")
+        eq(len(preview.get("planned", [])), 3, "reports what it would write")
+        check(not os.path.isdir(os.path.join(cue_root, "split_tracks")),
+             "dry run creates no split_tracks folder at all")
+
+        print("\n[apply_split — real run actually cuts the file, never touches the source]")
+        real = C.apply_split(cue_root, plan["source"], plan["points"], dry_run=False)
+        check(real["ok"], "real split succeeds")
+        eq(len(real.get("written", [])), 3, "three files written")
+        check(os.path.isfile(os.path.join(cue_root, "side_a.wav")),
+             "the original continuous file is untouched")
+        durations = [round(__import__("label_ref").audio_duration(p), 1) for p in real["written"]]
+        eq(durations, [5.0, 3.4, 3.6], "each cut file's real duration matches its planned span")
+
+        print("\n[plan_split_cue — refuses a folder with no .cue]")
+        no_cue_root = os.path.join(tmp, "no_cue_release")
+        split_wav_of(os.path.join(no_cue_root, "side_a.wav"), 5.0)
+        plan_nocue = C.plan_split_cue(no_cue_root)
+        check(not plan_nocue["ok"], "refuses cleanly when there is no .cue file")
+
+        print("\n[plan_split_discogs — estimates cut points from summed track durations]")
+        dg_root = os.path.join(tmp, "discogs_split_release")
+        split_wav_of(os.path.join(dg_root, "whole_side.wav"), 20.0)
+        fake_split = FakeDiscogs(tracklist_by_disc={
+            1: [{"title": "One", "duration": 8.0, "artist": "X"},
+                {"title": "Two", "duration": 12.0, "artist": "X"}],
+        })
+        plan_dg = C.plan_split_discogs(dg_root, "1", fake_split)
+        check(plan_dg["ok"], "plan_split_discogs succeeds with full Discogs durations")
+        eq(plan_dg.get("estimate"), True, "a Discogs-based plan IS marked as an estimate")
+        eq([p["start"] for p in plan_dg["points"]], [0.0, 8.0], "cumulative start times from summed durations")
+
+        print("\n[plan_split_discogs — refuses when more than one audio file is present]")
+        multi_root = os.path.join(tmp, "discogs_multi_release")
+        split_wav_of(os.path.join(multi_root, "a.wav"), 5.0)
+        split_wav_of(os.path.join(multi_root, "b.wav"), 5.0)
+        plan_multi = C.plan_split_discogs(multi_root, "1", fake_split)
+        check(not plan_multi["ok"], "refuses when it can't tell which file is the continuous rip")
+except ImportError as exc:
+    print("\n  SKIP  split_tracks section — %s not installed" % exc)
+
+
 shutil.rmtree(tmp, ignore_errors=True)
 
 print("\n%d checks, %d failed" % (ran, len(fails)))

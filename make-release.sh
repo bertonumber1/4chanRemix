@@ -62,7 +62,7 @@ cp "${PROJ_DIR}/make-release.sh"  "${STAGE}/"
 # smoke_test.py ships too, so an install can be checked on the box it landed on.
 for f in acoustid_helper.py detection.py telegram_panel.py \
          label_panel.py label_ref.py cd_tools.py multicd_dedupe.py \
-         fingerprint_kit.py smoke_test.py; do
+         fingerprint_kit.py track_splitter.py smoke_test.py; do
     [ -f "${PROJ_DIR}/${f}" ] && cp "${PROJ_DIR}/${f}" "${STAGE}/"
 done
 

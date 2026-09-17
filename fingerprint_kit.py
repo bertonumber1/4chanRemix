@@ -220,16 +220,44 @@ def same(fa, fb, bar: float = SAME) -> bool:
     return similarity(fa, fb) >= bar
 
 
+def compare_recordings(path_a: str, path_b: str, cache: dict, bar: float = SAME):
+    """True/False/None — whether the AUDIO ITSELF matches. Deliberately
+    does NOT check duration of these two files against each other: a
+    caller like multicd_dedupe.py's build_fix_plan() may already be
+    validating duration against a DIFFERENT, more authoritative reference
+    (Discogs' own stated duration for the occurrence being filled, not
+    necessarily either file's own length) — redoing a raw file-to-file
+    duration check here would silently override that with the wrong
+    comparison and reject a match the caller's own logic already vouched
+    for. Callers with no duration check of their own should use
+    same_recording() instead, which bundles one in.
+
+    None means this check has NOTHING TO SAY — fpcalc couldn't produce a
+    usable fingerprint for one or both files (silence, a corrupt/
+    unreadable file, a synthetic test fixture, or the tool missing
+    entirely), not "different recording". A caller with another signal
+    (duration) should treat None as "that other signal is all there is,"
+    never as a rejection — only an actual disagreement (False) should
+    veto an otherwise-good match."""
+    if not AVAILABLE:
+        return None
+    _, fp_a = fingerprint_cached(path_a, cache)
+    _, fp_b = fingerprint_cached(path_b, cache)
+    fa, fb = decode(fp_a), decode(fp_b)
+    if fa is None or fb is None:
+        return None
+    return same(fa, fb, bar)
+
+
 def same_recording(path_a: str, path_b: str, cache: dict,
                     bar: float = SAME, dur_delta: float = MAX_DUR_DELTA) -> bool:
-    """The full, corroborated check a caller should actually use: same
-    audio AND same length. Never true when fingerprinting isn't available
-    on this machine — callers fall back to their own duration-only logic
-    in that case, they don't skip the check silently."""
-    if not AVAILABLE:
-        return False
-    dur_a, fp_a = fingerprint_cached(path_a, cache)
-    dur_b, fp_b = fingerprint_cached(path_b, cache)
+    """The full, corroborated check for a caller with NO duration signal
+    of its own: same length (of these two files, to each other) AND same
+    audio. Uncertain (compare_recordings() returning None) collapses to
+    False here — with nothing else to go on, "couldn't tell" is treated
+    as "not confirmed," not as "yes."."""
+    dur_a, _ = fingerprint_cached(path_a, cache)
+    dur_b, _ = fingerprint_cached(path_b, cache)
     if dur_a and dur_b and abs(dur_a - dur_b) > dur_delta:
         return False
-    return same(decode(fp_a), decode(fp_b), bar)
+    return compare_recordings(path_a, path_b, cache, bar) is True

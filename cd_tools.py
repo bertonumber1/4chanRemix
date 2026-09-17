@@ -27,6 +27,7 @@ import shutil
 import label_ref as L
 import label_panel as P
 import multicd_dedupe as mcd
+import track_splitter as ts
 
 _RELEASE_RE = re.compile(r"(?:discogs\.com/)?release/(\d+)", re.I)
 _MASTER_RE = re.compile(r"(?:discogs\.com/)?master/(\d+)", re.I)
@@ -552,3 +553,112 @@ def delete_review_files(root: str, paths: list) -> dict:
             row["reason"] = str(exc)
         results.append(row)
     return {"ok": bool(results) and all(r["ok"] for r in results), "results": results}
+
+
+# ─── split — one continuous file into its individual tracks ───────────────
+# Deliberately NOT built on disc_numbers()/build_plan(): those assume a
+# release already has CD1/CD2/... subfolders full of per-track files. A
+# release that still needs splitting is the opposite case — one flat
+# folder holding a single continuous rip, disc structure or not. So this
+# looks directly in `root` (not recursively — audio_files() walks a whole
+# multi-disc tree, which is the wrong scope for "what's the one file to
+# cut here") rather than reusing anything disc-shaped.
+def _flat_audio_files(root: str) -> list:
+    out = []
+    try:
+        for name in os.listdir(root):
+            full = os.path.join(root, name)
+            if os.path.isfile(full) and os.path.splitext(name)[1].lower() in L.AUDIO_EXT:
+                out.append(full)
+    except OSError:
+        pass
+    return sorted(out)
+
+
+def _flat_cue_files(root: str) -> list:
+    try:
+        return sorted(os.path.join(root, f) for f in os.listdir(root) if f.lower().endswith(".cue"))
+    except OSError:
+        return []
+
+
+def plan_split_cue(root: str) -> dict:
+    """Where each track would be cut, from a cue sheet in `root` that
+    describes ONE continuous file (see track_splitter.parse_continuous_cue
+    for why a cue naming several files is refused instead). Read-only —
+    computes cut points, touches nothing."""
+    cues = _flat_cue_files(root)
+    if not cues:
+        return {"ok": False, "reason": "no .cue file directly in this folder"}
+    tried = []
+    for cue in cues:
+        parsed = ts.parse_continuous_cue(cue)
+        if not parsed["ok"]:
+            tried.append(f"{os.path.basename(cue)}: {parsed['reason']}")
+            continue
+        source = os.path.join(root, parsed["source_file"])
+        if not os.path.isfile(source):
+            tried.append(f"{os.path.basename(cue)}: names "
+                         f"\"{parsed['source_file']}\", not found here")
+            continue
+        dur = L.audio_duration(source)
+        if dur is None:
+            tried.append(f"{os.path.basename(cue)}: {parsed['source_file']} is unreadable")
+            continue
+        points = ts.split_points(parsed["tracks"], dur)
+        return {"ok": True, "reason": "", "cue": cue, "source": source,
+                "points": points, "estimate": False}
+    return {"ok": False, "reason": "; ".join(tried)}
+
+
+def plan_split_discogs(root: str, release_id: str, discogs) -> dict:
+    """Where each track would be cut, ESTIMATED from Discogs' own stated
+    per-track durations rather than measured from a cue sheet — see
+    track_splitter.durations_to_tracks for why this is never as precise.
+    Read-only."""
+    if not release_id:
+        return {"ok": False, "reason": "no Discogs release given"}
+    if discogs is None:
+        return {"ok": False, "reason": "no Discogs token configured"}
+    files = _flat_audio_files(root)
+    if len(files) != 1:
+        return {"ok": False,
+                "reason": f"expected exactly one audio file directly in this folder "
+                          f"to split (found {len(files)}) — Discogs durations can't "
+                          "say which one is the continuous rip the way a cue's own "
+                          "FILE line can"}
+    source = files[0]
+    dur = L.audio_duration(source)
+    if dur is None:
+        return {"ok": False, "reason": f"{os.path.basename(source)} is unreadable"}
+    try:
+        by_disc = discogs.tracklist_by_disc(int(release_id))
+    except L.DiscogsError as exc:
+        return {"ok": False, "reason": f"Discogs lookup failed: {exc}"}
+    tracks = by_disc.get(1) or next(iter(by_disc.values()), [])
+    if not tracks:
+        return {"ok": False, "reason": "Discogs release has no tracklist"}
+    result = ts.durations_to_tracks(tracks)
+    if not result["ok"]:
+        return {"ok": False, "reason": result["reason"]}
+    points = ts.split_points(result["tracks"], dur)
+    return {"ok": True, "reason": "", "source": source, "points": points, "estimate": True}
+
+
+SPLIT_OUT_DIRNAME = "split_tracks"
+
+
+def apply_split(root: str, source: str, points: list, dry_run: bool = True) -> dict:
+    """Cuts `source` per `points` into a `split_tracks/` subfolder next to
+    it — never overwrites or deletes the source, and never writes into
+    `root` directly, so a split that needs a second look doesn't get
+    mistaken for the release's real, final tracks by every other matcher
+    in this app that expects `root` to already hold only those."""
+    if not (os.path.isfile(source) and P._under(source, root)):
+        return {"ok": False, "reason": "source file is not inside this CD root", "written": []}
+    out_dir = os.path.join(root, SPLIT_OUT_DIRNAME)
+    result = ts.split_file(source, points, out_dir, dry_run=dry_run)
+    if not dry_run and result["ok"]:
+        P._log_move("cdtools-split", source, out_dir, True,
+                    f"{len(result.get('written', []))} track(s) split out")
+    return result
