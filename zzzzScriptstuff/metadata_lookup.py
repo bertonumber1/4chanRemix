@@ -478,6 +478,53 @@ def merge_releases(releases: list[tuple[Provider, Release]]) -> MergedRelease:
     return merged
 
 
+def track_search_as_releases(prov: Provider, artist: str, title: str) -> list[Release]:
+    """Search for the RELEASE a single TRACK belongs to, normalised to
+    the same `list[Release]` shape search_release() returns — so a
+    single-track group can flow through the exact same confidence-gate
+    / merge / write path as a normal album lookup, just fed by a
+    different query.
+
+    Two provider shapes exist for this:
+      - MusicBrainz's `search_by_recording(artist, title)` already
+        returns `list[Release]` directly (built for the per-recording
+        sampling fallback above).
+      - `Provider.search_track(artist, title)` (Discogs, Deezer, ...)
+        returns `list[TrackInfo]`. Its `.release` — the release that
+        track came from, with catno/label/year — is what we want; a
+        provider that doesn't populate `.release` (Deezer has no
+        catalogue-number concept) falls back to a bare Release built
+        from the TrackInfo's own fields, so it still counts as a vote
+        even with no catno to contribute.
+
+    A provider with neither method contributes nothing (empty list) —
+    same as it would for search_release on a provider that somehow
+    lacked that too.
+    """
+    if hasattr(prov, "search_by_recording"):
+        try:
+            return prov.search_by_recording(artist, title)
+        except Exception:
+            return []
+    if type(prov).search_track is Provider.search_track:
+        return []   # base no-op — provider doesn't implement track search
+    try:
+        hits = prov.search_track(artist, title)
+    except Exception:
+        return []
+    out: list[Release] = []
+    for h in hits:
+        rel = getattr(h, "release", None)
+        if rel is not None:
+            out.append(rel)
+        else:
+            out.append(Release(
+                platform=getattr(h, "platform", prov.id),
+                artist=h.artist, album=h.album, score=h.score,
+            ))
+    return out
+
+
 def merge_bpms(tracks: list[TrackInfo]) -> int:
     return consensus_int_value([t.bpm for t in tracks])
 
@@ -731,6 +778,12 @@ def fill_missing_metadata(
     emit("info", "grouping files by (artist, album)...")
 
     by_release: dict[tuple[str, str], list[dict[str, Any]]] = {}
+    # Orphan-single groups live in `by_release` too (same key shape,
+    # same per-album loop below handles them) but are flagged here so
+    # that loop knows to query providers by TRACK TITLE instead of
+    # ALBUM TITLE — see the single-track reroute in the grouping pass.
+    single_group_keys: set[tuple[str, str]] = set()
+    stats_routed_to_single_track = 0
     # Recovery helpers (is_unknown_tag, recover_from_path) are used in
     # the grouping pass. Counter/Path imported here at function scope.
     from detection import is_unknown_tag, recover_from_path
@@ -803,6 +856,7 @@ def fill_missing_metadata(
 
         artist_unknown = is_unknown_tag(artist)
         album_unknown = is_unknown_tag(album)
+        recovered: dict[str, str] = {}
 
         # ----- RECOVERY CHAIN -----
         # Strategy 1: path-based recovery (folder name + filename parsing).
@@ -821,17 +875,25 @@ def fill_missing_metadata(
             # all of them. That is exactly how two unrelated tracks in the
             # quarantine folder both ended up stamped with the same
             # MusicBrainz release, label "Sony Music", country Indonesia.
+            #
+            # Gated PER FIELD (not by tossing the whole dict on any weak
+            # signal) — a strong "Artist - Title" filename match and a
+            # weak bare-folder-as-album guess can both fire on the same
+            # orphan track, and the strong title is real evidence even
+            # though the album guess next to it isn't.
             if recovered.get("confidence") == "weak":
-                recovered = {}
                 stats_recovery_too_weak += 1
+            fc = recovered.get("field_confidence") or {}
             used_anything = False
             r_artist = recovered.get("artist", "").strip()
             r_album = recovered.get("album", "").strip()
-            if artist_unknown and r_artist and not is_unknown_tag(r_artist):
+            if (artist_unknown and fc.get("artist") == "strong"
+                    and r_artist and not is_unknown_tag(r_artist)):
                 artist = r_artist
                 artist_unknown = False
                 used_anything = True
-            if album_unknown and r_album and not is_unknown_tag(r_album):
+            if (album_unknown and fc.get("album") == "strong"
+                    and r_album and not is_unknown_tag(r_album)):
                 album = r_album
                 album_unknown = False
                 used_anything = True
@@ -859,6 +921,32 @@ def fill_missing_metadata(
                     used_anything = True
             if used_anything:
                 stats_recovered_from_siblings += 1
+
+        # ----- SINGLE-TRACK REROUTE -----
+        # Album is still unrecoverable, but if the artist IS known and
+        # there's a real track title (its own tag, or a strong filename
+        # parse — never the weak bare-folder guess), this is exactly the
+        # orphan-single case: a loose track with no reliable album to
+        # group it by. Route it to a per-track lookup instead of
+        # dropping it — the per-album loop below queries these groups by
+        # TRACK TITLE (Discogs' `track:` filter / MusicBrainz recording
+        # search) rather than by album, to find the release it's from.
+        if not artist_unknown and album_unknown:
+            try:
+                title = (row["title"] or "").strip()
+            except (KeyError, IndexError):
+                title = ""
+            if not title or is_unknown_tag(title):
+                title = (recovered.get("title", "") or "").strip()
+            if title and not is_unknown_tag(title):
+                d = dict(row)
+                d["_query_artist"] = artist
+                d["_query_album"] = title
+                key = (artist, title)
+                single_group_keys.add(key)
+                by_release.setdefault(key, []).append(d)
+                stats_routed_to_single_track += 1
+                continue
 
         # ----- FINAL GUARD -----
         # If EITHER field is still unknown/placeholder after all recovery,
@@ -899,6 +987,12 @@ def fill_missing_metadata(
              f"refused to query: {stats_skipped_unknown:,} files have no "
              f"recoverable artist/album — left untagged "
              f"(would have sent 'Unknown Artist' to providers)")
+    if stats_routed_to_single_track:
+        emit("info",
+             f"orphan singles: {stats_routed_to_single_track:,} file(s) had "
+             f"an artist and title but no recoverable album — routed to a "
+             f"per-track lookup (Discogs track search / MusicBrainz "
+             f"recording search) instead of being skipped")
 
     n_total_albums = len(by_release)
 
@@ -1011,94 +1105,113 @@ def fill_missing_metadata(
                 current_file=f"{artist} - {album}",
             )
 
-        # ----- pre-flight check ----------------------------------------
-        # Cheap regex check on the album name before burning rate-limit
-        # budget on a query that's guaranteed to miss.
-        qc = _quick_check_album(artist, album)
+        # This group came from the single-track reroute in the grouping
+        # pass above — `album` here actually holds the TRACK TITLE, not
+        # an album name. None of the album-shaped detection (bootleg
+        # skip, VA routing, compilation-series fallbacks) applies to a
+        # bare track title, so it's skipped entirely for these groups;
+        # the "query each provider" section below branches on this flag
+        # to search by track instead of by release.
+        is_single_group = (artist, album) in single_group_keys
 
-        # Bootleg/unofficial: don't query any provider. The release is
-        # not on MB/Deezer/etc by definition, so it'd be 100% no-match.
-        if qc.skip:
-            stats.files_no_match += len(rows)
-            stats_skipped_unofficial += 1
-            stats.albums_skipped_unofficial += 1
-            emit("info", f"skip: {artist} - {album}  ({qc.skip_reason})")
-            if ui is not None:
-                ui.advance()  # not a hard error, but no work to do
-            continue
+        if not is_single_group:
+            # ----- pre-flight check ----------------------------------------
+            # Cheap regex check on the album name before burning rate-limit
+            # budget on a query that's guaranteed to miss.
+            qc = _quick_check_album(artist, album)
 
-        # Compilation/VA: route the query to "Various Artists". MB indexes
-        # compilation albums under that name; querying with the per-track
-        # artist is what caused the user's 100% no-match Initial D run.
-        if qc.use_various_artists:
-            query_artist = "Various Artists"
-            stats_routed_to_va += 1
-            stats.albums_routed_to_va += 1
-            emit("info",
-                 f"compilation: {artist} - {album}  "
-                 f"-> querying as 'Various Artists' ({qc.note})")
-        else:
-            query_artist = artist
+            # Bootleg/unofficial: don't query any provider. The release is
+            # not on MB/Deezer/etc by definition, so it'd be 100% no-match.
+            if qc.skip:
+                stats.files_no_match += len(rows)
+                stats_skipped_unofficial += 1
+                stats.albums_skipped_unofficial += 1
+                emit("info", f"skip: {artist} - {album}  ({qc.skip_reason})")
+                if ui is not None:
+                    ui.advance()  # not a hard error, but no work to do
+                continue
 
-        # Use the normalised album string for the actual provider query
-        # (strips Japanese markers, deluxe-edition tags, disc numbers).
-        # The original (artist, album) is still used as the key into
-        # `rows` for writing back, so the DB row's original strings are
-        # preserved — we only normalise for the lookup itself.
-        query_album = qc.normalised_album or album
-
-        # Build a list of fallback (artist, album) query pairs to try if
-        # the primary query misses. Order matters: most-specific first.
-        # We stop at the first hit.
-        fallback_queries: list[tuple[str, str, str]] = []   # (artist, album, why)
-
-        # Fallback 1: catalogue-number stripped query.
-        # "[SHADOW 082] Helicopter '97" → "Helicopter '97"
-        if qc.catalogue_label or qc.catalogue_number:
-            stripped = _CAT_STRIP_RE.sub(" ", query_album).strip()
-            stripped = _WHITESPACE_RE.sub(" ", stripped)
-            if stripped and stripped != query_album:
-                fallback_queries.append((query_artist, stripped,
-                                          "cat-num stripped"))
-
-        # Fallback 2 & 3: compilation series.
-        # When we recognise the album as part of a recurring series
-        # (Beatport Drum & Bass: Sound Pack #348, etc.), the per-track
-        # artist won't match — the MB release is filed under Various
-        # Artists. Query the series name + issue first; if that misses,
-        # the series name alone.
-        if qc.is_compilation_series and qc.series_name:
-            if qc.series_issue:
-                # Only add the "VA + series + issue" fallback if it
-                # differs from the primary query (which it does when
-                # the primary query_album was the FULL noisy string
-                # rather than the cleaned series name).
-                fb1_album = f"{qc.series_name} #{qc.series_issue}"
-                if (query_artist, fb1_album) != ("Various Artists", query_album):
-                    fallback_queries.append((
-                        "Various Artists", fb1_album,
-                        "VA + series + issue",
-                    ))
-                # Also try without the issue number — sometimes MB has
-                # the parent series indexed but not every individual
-                # numbered release.
-                if (query_artist, qc.series_name) != ("Various Artists", query_album):
-                    fallback_queries.append((
-                        "Various Artists", qc.series_name,
-                        "VA + series (no issue)",
-                    ))
+            # Compilation/VA: route the query to "Various Artists". MB indexes
+            # compilation albums under that name; querying with the per-track
+            # artist is what caused the user's 100% no-match Initial D run.
+            if qc.use_various_artists:
+                query_artist = "Various Artists"
+                stats_routed_to_va += 1
+                stats.albums_routed_to_va += 1
+                emit("info",
+                     f"compilation: {artist} - {album}  "
+                     f"-> querying as 'Various Artists' ({qc.note})")
             else:
-                if (query_artist, qc.series_name) != ("Various Artists", query_album):
-                    fallback_queries.append((
-                        "Various Artists", qc.series_name,
-                        "VA + series",
-                    ))
+                query_artist = artist
 
-        # Log the strategy if any fallbacks will be tried
-        if fallback_queries:
-            strats = ", ".join(f"'{a}' '{b}'" for a, b, _why in fallback_queries[:3])
-            emit("info",
-                 f"will try {len(fallback_queries)} fallback queries if primary misses")
+            # Use the normalised album string for the actual provider query
+            # (strips Japanese markers, deluxe-edition tags, disc numbers).
+            # The original (artist, album) is still used as the key into
+            # `rows` for writing back, so the DB row's original strings are
+            # preserved — we only normalise for the lookup itself.
+            query_album = qc.normalised_album or album
+
+            # Build a list of fallback (artist, album) query pairs to try if
+            # the primary query misses. Order matters: most-specific first.
+            # We stop at the first hit.
+            fallback_queries: list[tuple[str, str, str]] = []   # (artist, album, why)
+
+            # Fallback 1: catalogue-number stripped query.
+            # "[SHADOW 082] Helicopter '97" → "Helicopter '97"
+            if qc.catalogue_label or qc.catalogue_number:
+                stripped = _CAT_STRIP_RE.sub(" ", query_album).strip()
+                stripped = _WHITESPACE_RE.sub(" ", stripped)
+                if stripped and stripped != query_album:
+                    fallback_queries.append((query_artist, stripped,
+                                              "cat-num stripped"))
+
+            # Fallback 2 & 3: compilation series.
+            # When we recognise the album as part of a recurring series
+            # (Beatport Drum & Bass: Sound Pack #348, etc.), the per-track
+            # artist won't match — the MB release is filed under Various
+            # Artists. Query the series name + issue first; if that misses,
+            # the series name alone.
+            if qc.is_compilation_series and qc.series_name:
+                if qc.series_issue:
+                    # Only add the "VA + series + issue" fallback if it
+                    # differs from the primary query (which it does when
+                    # the primary query_album was the FULL noisy string
+                    # rather than the cleaned series name).
+                    fb1_album = f"{qc.series_name} #{qc.series_issue}"
+                    if (query_artist, fb1_album) != ("Various Artists", query_album):
+                        fallback_queries.append((
+                            "Various Artists", fb1_album,
+                            "VA + series + issue",
+                        ))
+                    # Also try without the issue number — sometimes MB has
+                    # the parent series indexed but not every individual
+                    # numbered release.
+                    if (query_artist, qc.series_name) != ("Various Artists", query_album):
+                        fallback_queries.append((
+                            "Various Artists", qc.series_name,
+                            "VA + series (no issue)",
+                        ))
+                else:
+                    if (query_artist, qc.series_name) != ("Various Artists", query_album):
+                        fallback_queries.append((
+                            "Various Artists", qc.series_name,
+                            "VA + series",
+                        ))
+
+            # Log the strategy if any fallbacks will be tried
+            if fallback_queries:
+                strats = ", ".join(f"'{a}' '{b}'" for a, b, _why in fallback_queries[:3])
+                emit("info",
+                     f"will try {len(fallback_queries)} fallback queries if primary misses")
+        else:
+            # Single-track group: query by (artist, TRACK TITLE) directly,
+            # no album-shaped detection or fallbacks — those only make
+            # sense for real album names.
+            query_artist = artist
+            query_album = album   # holds the track title for this group
+            fallback_queries = []
+            emit("info", f"orphan single: '{query_artist}' - '{query_album}' "
+                         f"-> searching by track title")
 
         # ----- query each provider in turn -----
         # Call-site guard: refuse to invoke search_release with placeholder
@@ -1120,7 +1233,10 @@ def fill_missing_metadata(
             continue
         for prov in providers:
             try:
-                results = prov.search_release(query_artist, query_album)
+                if is_single_group:
+                    results = track_search_as_releases(prov, query_artist, query_album)
+                else:
+                    results = prov.search_release(query_artist, query_album)
             except Exception as e:
                 stats.errors.append(f"{prov.id}: {query_artist} - {query_album}: {e}")
                 emit("broken",
@@ -1178,6 +1294,11 @@ def fill_missing_metadata(
                          f"rejected ({why})")
 
         # ----- INTERNALS FALLBACK ------------------------------------
+        # Not for single-track groups — there's no "album" here to pull
+        # albumartist/originalalbum candidates from, and treating the
+        # track title as a bare album name (the "VA + bare album"
+        # last-resort below) would just burn a query on a guaranteed-odd
+        # match.
         # Everything above missed. Before logging "no match", peek at
         # the file's OTHER tag fields (albumartist, originalalbum,
         # originalartist) that were extracted during the index pass.
@@ -1199,7 +1320,7 @@ def fill_missing_metadata(
         # tried. And we run after all earlier fallbacks because the
         # quality signal is weaker — these tag fields are often less
         # reliable than artist/album.
-        if not provider_releases and rows:
+        if not is_single_group and not provider_releases and rows:
             sample = rows[0]
             internals_queries: list[tuple[str, str, str]] = []
 
@@ -1295,7 +1416,11 @@ def fill_missing_metadata(
         # Cost: up to 3 extra MB requests per missed album. We only
         # do this for the MusicBrainz provider (others don't have a
         # recording-search method yet) and only when nothing else worked.
-        if not provider_releases and rows:
+        # Not for single-track groups — the "query each provider" branch
+        # above already called search_by_recording directly for this
+        # exact (artist, title), so sampling it again here would just
+        # repeat the same miss.
+        if not is_single_group and not provider_releases and rows:
             mb_prov = None
             for p in providers:
                 if p.id == "musicbrainz" and hasattr(p, "search_by_recording"):

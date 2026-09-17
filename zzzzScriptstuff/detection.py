@@ -665,6 +665,17 @@ def recover_from_path(
     #             Fine as a display hint, useless as a query, and dangerous as
     #             a grouping key: every file in one folder collapses into a
     #             single fake release.
+    #
+    # Tracked PER FIELD in `field_confidence` — a strong filename match
+    # (artist/title) and a weak folder-as-album guess can both fire on
+    # the same file (an orphan track: real filename, junk-drawer folder),
+    # and a caller needs to trust the strong field without being forced
+    # to also trust the weak one riding along with it. The scalar
+    # `confidence` below is kept for existing callers that only want a
+    # single yes/no gate — it reports the WEAKEST tier among whatever
+    # was actually found, so it stays a safe (if coarser) signal: never
+    # "strong" when a weak-only field is mixed in.
+    field_confidence: dict[str, str] = {}
     confidence = ""
 
     # Filename FIRST. "A1. Baby's Gang - Challenger" says the artist and the
@@ -677,11 +688,12 @@ def recover_from_path(
             gd = m.groupdict()
             if not have_artist and gd.get("artist"):
                 out["artist"] = gd["artist"].strip()
+                field_confidence["artist"] = "strong"
             if not have_title and gd.get("title"):
                 out["title"] = gd["title"].strip()
+                field_confidence["title"] = "strong"
             if "artist" in out or "title" in out:
                 notes.append(f"filename='{stem}'")
-                confidence = "strong"
             break
 
     # Folder-name parsing for artist + album
@@ -693,11 +705,12 @@ def recover_from_path(
             gd = m.groupdict()
             if not have_artist and "artist" not in out and gd.get("artist"):
                 out["artist"] = gd["artist"].strip()
+                field_confidence["artist"] = "strong"
             if not have_album and gd.get("album"):
                 out["album"] = gd["album"].strip()
+                field_confidence["album"] = "strong"
             if "artist" in out or "album" in out:
                 notes.append(f"folder='{folder}'")
-                confidence = "strong"
             break
 
     # Folder-name didn't match a pattern but is a bare string —
@@ -706,16 +719,19 @@ def recover_from_path(
             and folder and " - " not in folder and " – " not in folder
             and _plausible_release_name(folder)):
         out["album"] = folder
+        field_confidence["album"] = "weak"
         notes.append(f"folder-as-album='{folder}'")
-        confidence = confidence or "weak"
         if (not have_artist and "artist" not in out
                 and _plausible_release_name(grandparent)):
             out["artist"] = grandparent
+            field_confidence["artist"] = "weak"
             notes.append(f"grandparent-as-artist='{grandparent}'")
-            confidence = "weak"
 
     if notes:
         out["note"] = "; ".join(notes)
+    if field_confidence:
+        out["field_confidence"] = field_confidence
+        confidence = "weak" if "weak" in field_confidence.values() else "strong"
     if confidence:
         out["confidence"] = confidence
     return out

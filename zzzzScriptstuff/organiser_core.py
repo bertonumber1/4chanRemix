@@ -216,6 +216,7 @@ def decide_album_type(
     diversity_threshold: float = 0.5,
     various_artists_tags: list[str] | None = None,
     mix_keywords: list[str] | None = None,
+    min_album_agreement: float = 0.5,
 ) -> str:
     """
     Classify a group of files (typically one source folder) as:
@@ -229,8 +230,26 @@ def decide_album_type(
       1. If albumartist looks like "Various Artists" -> mix.
       2. If album name contains mix-keywords ("DJ Foo presents...", "Essential Mix...") -> mix.
       3. If the share of tracks whose `artist` differs from the modal
-         artist exceeds `diversity_threshold` -> mix.
+         artist exceeds `diversity_threshold` -> mix, BUT only when the
+         group also agrees on ONE album name (see `min_album_agreement`
+         below) — artist diversity alone doesn't mean "one compilation",
+         it can just as easily mean "several unrelated singles that
+         happen to sit in the same holding-pen folder". A real VA
+         compilation is one release; tracks with different artists AND
+         different albums aren't a release at all, just a folder.
       4. Otherwise -> solo.
+
+    `min_album_agreement`: the share of tracks that must agree on the
+    SAME album name for artist-diversity (check 3) to mean "compilation"
+    rather than "unrelated singles". Concretely: a folder of orphan
+    tracks each individually matched to their OWN distinct single/EP
+    (different artist AND different album per track, e.g. after a
+    per-track Discogs lookup) must NOT be classified 'mix' — that would
+    make the organiser fold each track's own real artist into a generic
+    "Various Artists" folder label, throwing away exactly the identity
+    the per-track lookup just resolved. A genuine compilation, by
+    contrast, has one shared album name across (nearly) all tracks even
+    though the artist differs per track — that's what this checks for.
     """
     if not records:
         return "unknown"
@@ -264,7 +283,7 @@ def decide_album_type(
             if re.search(r"\b" + re.escape(kw) + r"\b", album):
                 return "mix"
 
-    # --- check 3: track-artist diversity ---------------------------------
+    # --- check 3: track-artist diversity, gated on album agreement -------
     track_artists = [
         (r.get("artist") or "").strip().lower()
         for r in records if r.get("artist")
@@ -274,7 +293,17 @@ def decide_album_type(
         most_common_count = counts.most_common(1)[0][1]
         diff_share = 1.0 - (most_common_count / len(track_artists))
         if diff_share >= diversity_threshold:
-            return "mix"
+            album_names = [
+                (r.get("album") or "").strip().lower()
+                for r in records if r.get("album")
+            ]
+            album_agreement = 0.0
+            if album_names:
+                album_counts = Counter(album_names)
+                album_agreement = (album_counts.most_common(1)[0][1]
+                                    / len(album_names))
+            if album_agreement > min_album_agreement:
+                return "mix"
 
     return "solo"
 
@@ -993,12 +1022,16 @@ def build_destination_path(
         parts.append(filename)
         return Path(*parts)
 
-    # Artist in the folder name too, not just the filename — for a solo
-    # release only (album_type == "mix" keeps the plain title-only folder,
-    # same reasoning as artist_led above: a VA/compilation has no single
-    # meaningful folder-level artist, since file_artist is the PER-TRACK
-    # artist there and genuinely differs track to track within one folder).
-    include_artist = album_type != "mix" and file_artist and file_artist != unknown_artist
+    # Artist in the folder name too, not just the filename. A solo release
+    # uses its own artist; a VA/compilation uses the literal label "Various
+    # Artists" instead of any one track's own artist — file_artist there is
+    # the PER-TRACK artist and genuinely differs track to track, so using it
+    # directly would give every track in the same release a DIFFERENT folder
+    # name, splitting one release across many folders instead of sharing one.
+    # Each track's own filename still carries its real artist regardless —
+    # this only changes what the shared folder itself is called.
+    folder_artist = "Various Artists" if album_type == "mix" else file_artist
+    include_artist = bool(folder_artist) and folder_artist != unknown_artist
 
     template = str(cfg.get("folder_name_template") or "").strip()
     if scheme.strip().lower() == "custom" and template:
@@ -1010,13 +1043,9 @@ def build_destination_path(
         # missing; the shipped default template only wraps those two in
         # their own parens for exactly this reason, but a user-edited
         # template is on its own past that.
-        # {artist} follows the SAME VA-comp guard as include_artist above —
-        # without it, a compilation's tracks (each with a different {artist})
-        # would each resolve to a DIFFERENT folder name, splitting one
-        # release across many folders instead of sharing the one.
         tokens = {
             "catno": catno,
-            "artist": file_artist if (album_type != "mix" and file_artist != unknown_artist) else "",
+            "artist": folder_artist if include_artist else "",
             "title": rel_title,
             "year": year,
         }
@@ -1027,7 +1056,7 @@ def build_destination_path(
     else:
         folder_name = s(
             (f"({catno}) " if catno else "")
-            + (f"{file_artist} - " if include_artist else "")
+            + (f"{folder_artist} - " if include_artist else "")
             + rel_title + (f" ({year})" if year else ""),
             unknown_album,
         )

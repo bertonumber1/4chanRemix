@@ -1289,6 +1289,123 @@ class DiscogsProvider(Provider):
         out.sort(key=lambda r: r.score, reverse=True)
         return out
 
+    def search_track(self, artist: str, title: str) -> list[TrackInfo]:
+        """Find the RELEASE a single TRACK belongs to, via Discogs'
+        `track:` search filter — matches against every release's own
+        tracklist. This is the path for a lone/orphan track with no
+        reliable album tag to search by at all: search_release() is
+        useless there since there's no album name to query with, but
+        the track title alone is often enough for Discogs to surface
+        the (usually single/EP) release it's from, complete with its
+        real catalogue number, artist and year.
+
+        Each result's `.release` carries the full Release (catno,
+        label, year, ...) exactly like search_release() would have
+        returned for it — callers that already know how to consume a
+        search_release() hit can reuse that unchanged.
+        """
+        a = (artist or "").strip()
+        t = (title or "").strip()
+        if not a or not t:
+            return []
+        if a.lower() in self._UNKNOWN_QUERY_VALUES or t.lower() in self._UNKNOWN_QUERY_VALUES:
+            return []
+        params = {
+            "track": t,
+            "artist": a,
+            "type": "release",
+            "per_page": "10",
+        }
+        try:
+            self.rate_limit()
+            url = f"{self.BASE}/database/search?{_urlencode(params)}"
+            req = Request(url, headers=self._auth_headers())
+            with urlopen(req, timeout=20) as r:
+                raw = r.read().decode("utf-8", errors="replace")
+            data = json.loads(raw)
+        except HTTPError as e:
+            if e.code == 401:
+                logger.warning("Discogs 401 — invalid token? Falling back to unauth")
+                self._token = ""
+                self.rate_limit_seconds = 2.5
+                return []
+            if e.code in (429, 503):
+                logger.warning("Discogs rate limit hit, sleeping 5s")
+                time.sleep(5)
+            return []
+        except Exception as e:
+            logger.warning("Discogs track search failed for %r / %r: %s", artist, title, e)
+            return []
+
+        out: list[TrackInfo] = []
+        results = data.get("results", []) or []
+        for r in results[:10]:
+            try:
+                # Same "Artist - Album" split as search_release — the
+                # search result is release-level, not the specific
+                # matched track (Discogs' search API doesn't return
+                # which tracklist entry matched).
+                rtitle = r.get("title", "") or ""
+                rel_artist = ""
+                rel_album = rtitle
+                if " - " in rtitle:
+                    rel_artist, _, rel_album = rtitle.partition(" - ")
+                    rel_artist = rel_artist.strip()
+                    rel_album = rel_album.strip()
+
+                labels = r.get("label", []) or []
+                catnos = r.get("catno", "") or ""
+                if isinstance(catnos, list):
+                    catnos = catnos[0] if catnos else ""
+                genres = r.get("genre", []) or []
+                styles = r.get("style", []) or []
+                if isinstance(genres, str):
+                    genres = [genres]
+                if isinstance(styles, str):
+                    styles = [styles]
+                combined_genre = "; ".join(s for s in (styles + genres) if s) or ""
+
+                # Discogs already filtered on the track title server-side
+                # (that's what `track:` does), so title-vs-title similarity
+                # would be a near-constant no-signal number. The real
+                # question is whether the RELEASE's artist actually
+                # matches the one we queried with — compilations reuse
+                # the same track title across many unrelated releases,
+                # and artist agreement is what tells those apart.
+                score = string_similarity(a, rel_artist) * 100 if rel_artist else 40.0
+
+                rel = Release(
+                    platform=self.id,
+                    artist=rel_artist or a,
+                    album=rel_album,
+                    year=str(r.get("year", "") or ""),
+                    label=(labels[0] if labels else ""),
+                    catalog_number=catnos,
+                    country=r.get("country", "") or "",
+                    genre=combined_genre,
+                    release_id=str(r.get("id", "") or ""),
+                    url=f"https://www.discogs.com{r.get('uri', '')}"
+                        if r.get("uri") else "",
+                    art_url=r.get("cover_image", "") or r.get("thumb", "") or "",
+                    media_format=(r.get("format", [""]) or [""])[0]
+                                  if isinstance(r.get("format"), list) else "",
+                    score=score,
+                )
+                out.append(TrackInfo(
+                    platform=self.id,
+                    artist=rel_artist or a,
+                    title=t,
+                    album=rel_album,
+                    release_id=rel.release_id,
+                    score=score,
+                    release=rel,
+                ))
+            except Exception as e:
+                logger.debug("Discogs track result parse failed: %s", e)
+                continue
+        out.sort(key=lambda ti: ti.score, reverse=True)
+        return out
+
 
 
 #
