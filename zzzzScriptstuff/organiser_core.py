@@ -993,10 +993,44 @@ def build_destination_path(
         parts.append(filename)
         return Path(*parts)
 
-    folder_name = s(
-        (f"({catno}) " if catno else "") + rel_title + (f" ({year})" if year else ""),
-        unknown_album,
-    )
+    # Artist in the folder name too, not just the filename — for a solo
+    # release only (album_type == "mix" keeps the plain title-only folder,
+    # same reasoning as artist_led above: a VA/compilation has no single
+    # meaningful folder-level artist, since file_artist is the PER-TRACK
+    # artist there and genuinely differs track to track within one folder).
+    include_artist = album_type != "mix" and file_artist and file_artist != unknown_artist
+
+    template = str(cfg.get("folder_name_template") or "").strip()
+    if scheme.strip().lower() == "custom" and template:
+        # Plain str.format substitution, deliberately not smart about
+        # dropping empty tokens' surrounding punctuation — e.g. a blank
+        # {catno} in "({catno}) {artist}..." leaves a bare "()" behind
+        # rather than trying to guess which literal characters around it
+        # were "part of" that token. catno/year are the fields usually
+        # missing; the shipped default template only wraps those two in
+        # their own parens for exactly this reason, but a user-edited
+        # template is on its own past that.
+        # {artist} follows the SAME VA-comp guard as include_artist above —
+        # without it, a compilation's tracks (each with a different {artist})
+        # would each resolve to a DIFFERENT folder name, splitting one
+        # release across many folders instead of sharing the one.
+        tokens = {
+            "catno": catno,
+            "artist": file_artist if (album_type != "mix" and file_artist != unknown_artist) else "",
+            "title": rel_title,
+            "year": year,
+        }
+        try:
+            folder_name = s(template.format(**tokens), unknown_album)
+        except (KeyError, IndexError):
+            folder_name = s(rel_title, unknown_album)
+    else:
+        folder_name = s(
+            (f"({catno}) " if catno else "")
+            + (f"{file_artist} - " if include_artist else "")
+            + rel_title + (f" ({year})" if year else ""),
+            unknown_album,
+        )
     if track:
         filename = f"{track} - {file_artist} - {title}{ext}"
     else:

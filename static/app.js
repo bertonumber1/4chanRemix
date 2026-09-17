@@ -1210,6 +1210,8 @@ async function loadNaming(){
   try{
     const d=await (await fetch('/api/naming')).json();
     const box=document.getElementById('naming-schemes');
+    const tokenHint='Available tokens: {catno} {artist} {title} {year} — '+
+      '{title} is the release/album name. {artist} is left blank for a compilation.';
     box.innerHTML=(d.schemes||[]).map(sc=>`
       <label class="naming-opt${sc.active?' on':''}">
         <input type="radio" name="fscheme" value="${esc(sc.key)}" ${sc.active?'checked':''}
@@ -1218,6 +1220,15 @@ async function loadNaming(){
           <b>${esc(sc.label)}</b>
           <p class="naming-why">${esc(sc.blurb)}</p>
           ${(sc.examples||[]).map(e=>`<code class="naming-ex" title="${esc(e.note)}">${esc(e.path)}</code>`).join('')}
+          ${sc.key==='custom'?`
+          <div style="display:flex;gap:5px;margin-top:6px;align-items:center">
+            <input type="text" id="naming-template-in" class="path-input" style="flex:1"
+                   value="${esc(d.template||'')}" title="${esc(tokenHint)}"
+                   placeholder="({catno}) {artist} - {title} ({year})">
+            <button class="btn-xs" title="${esc(tokenHint)}"
+                    onclick="setSetting('folder_name_template',document.getElementById('naming-template-in').value,loadNaming)">Save</button>
+          </div>
+          <p class="naming-why" style="margin-top:4px">${esc(tokenHint)}</p>`:''}
         </div>
       </label>`).join('');
     const cfg=await (await fetch('/api/config')).json();

@@ -124,6 +124,43 @@ eq(p5.parent.name, "CD1", "plain branch: CD1 subfolder present")
 eq(p6.parent.name, "CD2", "plain branch: CD2 subfolder present")
 
 
+print("\n[plain 'release' scheme: folder now includes artist for a solo release]")
+solo_plain = record("/src/SoloRel/01.flac", "Track One", "1")
+sp = build_destination_path(solo_plain, "solo", destination_root="/Out", organise_cfg=plain_cfg)
+eq(sp.parent.name, "(12-345) DJ Test - Test Album (2001)",
+  "folder is '(catno) Artist - Title (Year)', in that order")
+
+print("\n[plain 'release' scheme: a VA/mix release keeps NO per-track artist in the shared folder]")
+va1 = record("/src/VARel/01.flac", "Song A", "1", primary_artist="Artist One",
+            albumartist="Artist One", artist="Artist One")
+va2 = record("/src/VARel/02.flac", "Song B", "2", primary_artist="Artist Two",
+            albumartist="Artist Two", artist="Artist Two")
+vp1 = build_destination_path(va1, "mix", destination_root="/Out", organise_cfg=plain_cfg)
+vp2 = build_destination_path(va2, "mix", destination_root="/Out", organise_cfg=plain_cfg)
+eq(vp1.parent, vp2.parent, "both VA tracks still land in the SAME shared release folder")
+eq(vp1.parent.name, "(12-345) Test Album (2001)",
+  "folder has no artist at all — neither track's own name, since a VA comp has no single one")
+
+print("\n[folder_scheme='custom': user template reorders/reformats the folder freely]")
+custom_cfg = {"folder_scheme": "custom", "folder_name_template": "{artist} - {title} [{catno}] ({year})"}
+cp = build_destination_path(solo_plain, "solo", destination_root="/Out", organise_cfg=custom_cfg)
+eq(cp.parent.name, "DJ Test - Test Album [12-345] (2001)", "folder matches the custom template exactly")
+
+print("\n[folder_scheme='custom': VA/mix still gets no per-track artist, same guard as the plain scheme]")
+cva1 = build_destination_path(va1, "mix", destination_root="/Out", organise_cfg=custom_cfg)
+cva2 = build_destination_path(va2, "mix", destination_root="/Out", organise_cfg=custom_cfg)
+eq(cva1.parent, cva2.parent, "both VA tracks still share one folder under a custom template too")
+check("Artist One" not in cva1.parent.name and "Artist Two" not in cva1.parent.name,
+     "{artist} resolved to blank, not either track's own name")
+
+print("\n[folder_scheme='custom': a missing token value is NOT smart-cleaned, by design]")
+no_catno = dict(solo_plain); no_catno["catalog_number"] = ""
+ncp = build_destination_path(no_catno, "solo", destination_root="/Out",
+                             organise_cfg={"folder_scheme": "custom",
+                                          "folder_name_template": "({catno}) {artist} - {title} ({year})"})
+eq(ncp.parent.name, "() DJ Test - Test Album (2001)",
+  "empty {catno} leaves a bare '()' rather than guessing what to drop")
+
 print("\n%d checks, %d failed" % (ran, len(fails)))
 print("PASS" if not fails else "FAILED:\n  - " + "\n  - ".join(fails))
 sys.exit(1 if fails else 0)

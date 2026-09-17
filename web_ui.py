@@ -2681,7 +2681,8 @@ def naming_preview(scheme: str = ""):
         "folder_scheme") or "artist_release_track_mix_year")
     dest = ((cfg or {}).get("paths") or {}).get("destination_root") or "/Output"
 
-    out = {"current": current, "destination": dest, "schemes": []}
+    template = str(((cfg or {}).get("organise") or {}).get("folder_name_template") or "")
+    out = {"current": current, "destination": dest, "template": template, "schemes": []}
     try:
         from organiser_core import build_destination_path
     except Exception as exc:
@@ -2694,8 +2695,12 @@ def naming_preview(scheme: str = ""):
          "Empty slots are dropped, never padded. Best when you file singles and "
          "want each mix to stand on its own."),
         ("release", "One folder per RELEASE",
-         "The classic album layout: (catalogue number) Title (Year), with the "
+         "The classic album layout: (catalogue number) Artist - Title (Year), with the "
          "tracks inside it. Best when you keep albums and compilations whole."),
+        ("custom", "Custom template",
+         "Type your own pattern below using {catno} {artist} {title} {year} — "
+         "{title} means the release/album name. {artist} is left blank automatically "
+         "for a compilation (no single artist to use)."),
     ):
         override = dict(cfg or {})
         org = dict(override.get("organise") or {})
@@ -2723,6 +2728,7 @@ def naming_preview(scheme: str = ""):
 # Deliberately small: everything here has a consequence you would notice.
 _SETTABLE = {
     "folder_scheme":  ("organise", "str"),
+    "folder_name_template": ("organise", "str"),
     "import_mode":    ("import",   "str"),
     "delete_orphaned_extras": ("organise", "bool"),
 }

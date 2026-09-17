@@ -104,8 +104,19 @@ orphan_bonus_max_audio = 2
 # "Artist - Release - Track - Year". The mix comes from a trailing
 # "(Original Mix)"-style fragment in the title, falling back to the
 # remixer tag. Set this to "release" for the older one-folder-per-release
-# "(catno) Title (Year)" layout.
+# "(catno) Title (Year)" layout, or "custom" to use folder_name_template
+# below instead.
 folder_scheme = "artist_release_track_mix_year"
+
+# Only used when folder_scheme = "custom" above. Available tokens:
+# {catno} {artist} {title} {year} — {title} here means the RELEASE/album
+# name, not a per-track title. Plain substitution, not smart about empty
+# tokens: a blank {catno} leaves a bare "()" behind rather than guessing
+# which surrounding characters to drop with it. {artist} is automatically
+# left blank for a VA/compilation release (every track would otherwise
+# resolve to a different folder, one per track's own artist, splitting a
+# single release across many folders instead of sharing one).
+folder_name_template = "({catno}) {artist} - {title} ({year})"
 
 mix_artist_diversity_threshold = 0.5
 
