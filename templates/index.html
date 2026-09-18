@@ -111,74 +111,6 @@
   </div>
 </div>
 
-<div class="card cdt-panel">
-  <h3>CD Tools — check, arrange, tag one release folder</h3>
-  <p style="font-size:10px;color:var(--dim);margin:-4px 0 8px;line-height:1.4">
-    Works on any folder you point it at — a single CD, or a multi-disc release with
-    CD1/CD2/... subfolders. Verifies against a .cue sheet already in the folder first,
-    and the Discogs release below for whatever a cue doesn't cover. Never deletes a file
-    on its own: duplicates are set aside in a review folder next to the release, and stay
-    there until you explicitly delete them below. Still one continuous file instead of
-    separate tracks (a whole vinyl side or CD image)? Split tracks below cuts it up first,
-    from the .cue sheet's own timestamps or an estimate from Discogs' track lengths — needs
-    ffmpeg on PATH.
-  </p>
-  <div class="path-row">
-    <span class="path-label">CD root</span>
-    <input class="path-input" id="cdt-root-in" readonly tabindex="-1" onfocus="setTimeout(()=>this.blur())" placeholder="not set" onclick="openBrowser('cdt-root')" title="Click to choose the release folder to work on">
-    <button class="btn-xs" onclick="openBrowser('cdt-root')" title="Pick the release folder to work on — a single CD, or a multi-disc release with CD1/CD2/... subfolders">📁 Browse</button>
-    <button class="btn-xs ghost" onclick="openInFileManager('cdt-root-in',this)" title="Open this folder in the file manager">↗ Open</button>
-  </div>
-  <div class="path-row">
-    <span class="path-label">Discogs</span>
-    <input class="path-input" id="cdt-release-in" placeholder="release/master URL or id — optional if a .cue sheet already covers every disc" title="Paste a discogs.com release or master URL, or a bare release id. Used to check/tag whatever a .cue sheet in the folder doesn't already cover.">
-    <button class="btn-xs" onclick="cdtSearch()" title="Search Discogs using the CD root folder's own name — runs automatically the moment you pick a folder above, or press this to redo it">🔍 Search</button>
-  </div>
-  <div id="cdt-search-results" class="hidden" style="margin:-4px 0 8px 0"></div>
-  <div style="display:flex;gap:5px;flex-wrap:wrap;margin-top:8px;align-items:center">
-    <button class="btn-xs" onclick="cdtCheck()" title="Read every disc's tracks and compare against .cue sheets and the Discogs release above. Read-only — moves nothing.">Check tracks</button>
-    <button class="btn-xs" onclick="cdtDupes()" title="List any track that appears more than once anywhere in this release, across every disc. Read-only.">Dupe check</button>
-    <button class="btn-xs warn" onclick="cdtArrange(true)" title="Preview exactly what Auto-arrange would move, without touching a file.">Preview arrange</button>
-    <button class="btn-xs warn" onclick="cdtArrange(false)" title="Move each track's winning file into its correct CD folder, and every duplicate into a review folder next to this release. Nothing is ever deleted. Only runs once Check tracks reports the release is safe to auto-fix.">Auto-arrange</button>
-    <button class="btn-xs" onclick="cdtSearchSlsk()" title="Search Soulseek (via Nicotine+'s local API on 127.0.0.1:12339) for each track the last Check tracks run found genuinely missing — no file for it anywhere in this release, not just an ambiguous duplicate. Run Check tracks first. Nicotine+ must be running.">Search SLSK (missing)</button>
-    <span class="lb-sep"></span>
-    <button class="btn-xs" onclick="cdtTag(true)" title="Preview what tagging would write, without touching a file.">Preview tag</button>
-    <button class="btn-xs" onclick="cdtTag(false)" title="Write catalogue number / artist / album / year from the Discogs release above onto every file, plus per-track title and track number wherever a track can be matched. Never overwrites a tag that already has a value.">Tag from Discogs</button>
-    <button class="btn-xs" onclick="cdtArtwork(false)" title="Save a loose folder.jpg — from an embedded picture already somewhere in the folder if there is one, otherwise fetched from the Discogs release above. Never touches an audio file.">Get artwork</button>
-    <span class="lb-sep"></span>
-    <button class="btn-xs" onclick="cdtVerify()" title="Re-check this release after arranging/tagging, to confirm it is actually clean now rather than trusting the last action's own report.">Verify</button>
-    <label class="dry-label" title="Preview only, for the buttons above that support it"><input type="checkbox" id="cdt-dry-run" checked> dry run</label>
-  </div>
-
-  <div style="display:flex;gap:5px;flex-wrap:wrap;margin-top:8px;align-items:center;padding-top:8px;border-top:1px solid var(--border)">
-    <span class="path-label" style="min-width:auto">Split tracks</span>
-    <button class="btn-xs" onclick="cdtSplitPlan('cue')" title="For a release that is still ONE continuous file (a whole vinyl side or CD image) with a .cue sheet marking where each track starts. Sample-accurate — the cue's own timestamps are used as-is. Read-only, previews the cut points first.">From .cue</button>
-    <button class="btn-xs" onclick="cdtSplitPlan('discogs')" title="Same, but with no .cue sheet: estimates each track's start time by adding up Discogs' own stated track lengths above. This is an ESTIMATE, not a measurement — Discogs' lengths are rounded to the second and don't know about the real silence/crossfade at each boundary, so cuts land close but rarely frame-exact.">From Discogs lengths (estimate)</button>
-  </div>
-  <div id="cdt-split-results" class="hidden" style="margin-top:6px"></div>
-  <div id="cdt-result" class="log" style="margin-top:8px;max-height:260px"></div>
-
-  <div style="margin-top:10px;padding-top:8px;border-top:1px solid var(--border)">
-    <div class="path-row">
-      <span class="path-label">Move/copy to</span>
-      <input class="path-input" id="cdt-dest-in" readonly tabindex="-1" onfocus="setTimeout(()=>this.blur())" placeholder="not set" onclick="openBrowser('cdt-dest')" title="Pick where Move/Copy below sends this release folder — e.g. your real archive">
-      <button class="btn-xs" onclick="openBrowser('cdt-dest')" title="Choose the destination folder">📁 Browse</button>
-    </div>
-    <div style="display:flex;gap:5px;margin-top:6px">
-      <button class="btn-xs warn" onclick="cdtMove()" title="Move this whole release folder into the destination above. Logged and undoable from the Labels tab's Move log, the same as any other move in this app.">Move release</button>
-      <button class="btn-xs" onclick="cdtCopy()" title="Copy (not move) this whole release folder into the destination above. The original release folder stays exactly where it is.">Copy release</button>
-    </div>
-  </div>
-
-  <div style="margin-top:10px;padding-top:8px;border-top:1px solid var(--border)">
-    <div style="display:flex;align-items:center;gap:8px">
-      <b style="font-size:11px">Review folder</b>
-      <span style="font-size:10px;color:var(--dim)">— duplicates set aside by Auto-arrange. Nothing here is deleted until you say so.</span>
-      <button class="btn-xs ghost" onclick="cdtRefreshReview()" title="Refresh this list">↻</button>
-    </div>
-    <div id="cdt-review-list" style="font-size:11px;margin-top:6px"></div>
-  </div>
-</div>
 </div><!-- /direct -->
 
 <!-- ═══════════════ SESSION TAB ═══════════════ -->
@@ -208,6 +140,8 @@
     <div id="prov-list"></div>
   </div>
 
+  <hr class="cdt-hr">
+  <div class="cdt-subhead">Pipeline</div>
   <div class="job-phases">
     <div class="phase" id="ph-import"><span class="dot"></span>Import</div>
     <span class="phase-arrow">→</span>
@@ -234,6 +168,8 @@
     <span id="s-el">elapsed: —</span>
   </div>
 
+  <hr class="cdt-hr">
+  <div class="cdt-subhead">Session rows</div>
   <p class="tab-blurb">
     <b>Session</b> — the batch you are working on now, held in <code>web_session.db</code>.
     Import above fills it, you check it here, and <b>Tools → Commit session</b> merges it into
@@ -436,6 +372,102 @@
   </div>
 </div><!-- /tools-right -->
 
+<div class="card cdt-panel">
+  <h3>CD Tools — check, arrange, tag one release folder</h3>
+  <p style="font-size:10px;color:var(--dim);margin:-4px 0 8px;line-height:1.4">
+    Works on any folder you point it at — a single CD, or a multi-disc release with
+    CD1/CD2/... subfolders. Verifies against a .cue sheet already in the folder first,
+    and the Discogs release below for whatever a cue doesn't cover. Never deletes a file
+    on its own: duplicates are set aside in a review folder next to the release, and stay
+    there until you explicitly delete them below. Still one continuous file instead of
+    separate tracks (a whole vinyl side or CD image)? Split tracks below cuts it up first,
+    from the .cue sheet's own timestamps or an estimate from Discogs' track lengths — needs
+    ffmpeg on PATH.
+  </p>
+  <div class="path-row">
+    <span class="path-label">CD root</span>
+    <input class="path-input" id="cdt-root-in" readonly tabindex="-1" onfocus="setTimeout(()=>this.blur())" placeholder="not set" onclick="openBrowser('cdt-root')" title="Click to choose the release folder to work on">
+    <button class="btn-xs" onclick="openBrowser('cdt-root')" title="Pick the release folder to work on — a single CD, or a multi-disc release with CD1/CD2/... subfolders">📁 Browse</button>
+    <button class="btn-xs ghost" onclick="openInFileManager('cdt-root-in',this)" title="Open this folder in the file manager">↗ Open</button>
+  </div>
+  <div class="path-row">
+    <span class="path-label">Discogs</span>
+    <input class="path-input" id="cdt-release-in" placeholder="release/master URL or id — optional if a .cue sheet already covers every disc" title="Paste a discogs.com release or master URL, or a bare release id. Used to check/tag whatever a .cue sheet in the folder doesn't already cover.">
+    <button class="btn-xs" onclick="cdtSearch()" title="Search Discogs using the CD root folder's own name — runs automatically the moment you pick a folder above, or press this to redo it">🔍 Search</button>
+  </div>
+  <div id="cdt-search-results" class="hidden" style="margin:-4px 0 8px 0"></div>
+  <div style="display:flex;gap:5px;margin-top:4px">
+    <button class="btn-xs ghost" onclick="cdtClearSelected()" title="Clear the CD root and Discogs release above, so you can start on a different release. Leaves the log below alone.">Clear selected</button>
+    <button class="btn-xs ghost" onclick="cdtClearAll()" title="Clear selected, plus wipe the log below.">Clear all</button>
+  </div>
+
+  <hr class="cdt-hr">
+  <div class="cdt-subhead">CD track splitter</div>
+  <p style="font-size:10px;color:var(--dim);margin:0 0 6px;line-height:1.4">
+    For a release that's still one continuous file per disc/side — cuts it into separate
+    tracks before anything below can check, arrange or tag them individually.
+  </p>
+  <div style="display:flex;gap:5px;flex-wrap:wrap;align-items:center">
+    <button class="btn-xs" onclick="cdtSplitPlan('cue')" title="For a release that is still ONE continuous file (a whole vinyl side or CD image) with a .cue sheet marking where each track starts. Sample-accurate — the cue's own timestamps are used as-is. Read-only, previews the cut points first.">From .cue</button>
+    <button class="btn-xs" onclick="cdtSplitPlan('discogs')" title="Same, but with no .cue sheet: estimates each track's start time by adding up Discogs' own stated track lengths above. This is an ESTIMATE, not a measurement — Discogs' lengths are rounded to the second and don't know about the real silence/crossfade at each boundary, so cuts land close but rarely frame-exact.">From Discogs lengths (estimate)</button>
+  </div>
+  <div id="cdt-split-results" class="hidden" style="margin-top:6px"></div>
+
+  <hr class="cdt-hr">
+  <div class="cdt-subhead">Sorter / organizer</div>
+  <p style="font-size:10px;color:var(--dim);margin:0 0 6px;line-height:1.4">
+    Works on tracks that already exist as separate files (post-split, or ripped that way
+    to begin with): checks them against Discogs, files each one where it belongs, writes
+    tags, and fetches artwork.
+  </p>
+  <div style="display:flex;gap:5px;flex-wrap:wrap;align-items:center">
+    <span class="path-label" style="min-width:auto">Inspect</span>
+    <button class="btn-xs" onclick="cdtCheck()" title="Read every disc's tracks and compare against .cue sheets and the Discogs release above. Read-only — moves nothing.">Check tracks</button>
+    <button class="btn-xs" onclick="cdtDupes()" title="List any track that appears more than once anywhere in this release, across every disc. Read-only.">Dupe check</button>
+  </div>
+  <div style="display:flex;gap:5px;flex-wrap:wrap;margin-top:6px;align-items:center;padding-top:8px;border-top:1px solid var(--border)">
+    <span class="path-label" style="min-width:auto">Arrange</span>
+    <button class="btn-xs warn" onclick="cdtArrange(true)" title="Preview exactly what Auto-arrange would move, without touching a file.">Preview arrange</button>
+    <button class="btn-xs warn" onclick="cdtArrange(false)" title="Move each track's winning file into its correct CD folder, and every duplicate into a review folder next to this release. Nothing is ever deleted. Only runs once Check tracks reports the release is safe to auto-fix.">Auto-arrange</button>
+    <button class="btn-xs" onclick="cdtSearchSlsk()" title="Search Soulseek (via Nicotine+'s local API on 127.0.0.1:12339) for each track the last Check tracks run found genuinely missing — no file for it anywhere in this release, not just an ambiguous duplicate. Run Check tracks first. Nicotine+ must be running.">Search SLSK (missing)</button>
+    <button class="btn-xs danger hidden" id="cdt-slsk-stop" onclick="cdtStopSlsk()" title="Stop after the search in progress finishes — searches already sent to Nicotine+ are not undone, and results already found stay found.">■ Stop</button>
+  </div>
+  <div style="display:flex;gap:5px;flex-wrap:wrap;margin-top:6px;align-items:center;padding-top:8px;border-top:1px solid var(--border)">
+    <span class="path-label" style="min-width:auto">Tag &amp; artwork</span>
+    <button class="btn-xs" onclick="cdtTag(true)" title="Preview what tagging would write, without touching a file.">Preview tag</button>
+    <button class="btn-xs" onclick="cdtTag(false)" title="Write catalogue number / artist / album / year from the Discogs release above onto every file, plus per-track title and track number wherever a track can be matched. With Force overwrite off, never overwrites a tag that already has a value.">Tag from Discogs</button>
+    <label class="dry-label" title="Overwrite a field even if the file already has a value there — needed for e.g. cue-split tracks whose titles are still placeholders like &quot;Pista 1&quot;. You'll get an extra are-you-sure prompt when this is on."><input type="checkbox" id="cdt-force-tag"> force overwrite</label>
+    <button class="btn-xs" onclick="cdtArtwork(false)" title="Save a loose folder.jpg — from an embedded picture already somewhere in the folder if there is one, otherwise fetched from the Discogs release above. Never touches an audio file.">Get artwork</button>
+  </div>
+  <div style="display:flex;gap:5px;flex-wrap:wrap;margin-top:6px;align-items:center;padding-top:8px;border-top:1px solid var(--border)">
+    <span class="path-label" style="min-width:auto">Verify</span>
+    <button class="btn-xs" onclick="cdtVerify()" title="Re-check this release after arranging/tagging, to confirm it is actually clean now rather than trusting the last action's own report.">Verify</button>
+    <label class="dry-label" title="Preview only, for the buttons above that support it"><input type="checkbox" id="cdt-dry-run" checked> dry run</label>
+  </div>
+  <div id="cdt-result" class="log" style="margin-top:8px;max-height:260px"></div>
+
+  <div style="margin-top:10px;padding-top:8px;border-top:1px solid var(--border)">
+    <div class="path-row">
+      <span class="path-label">Move/copy to</span>
+      <input class="path-input" id="cdt-dest-in" readonly tabindex="-1" onfocus="setTimeout(()=>this.blur())" placeholder="not set" onclick="openBrowser('cdt-dest')" title="Pick where Move/Copy below sends this release folder — e.g. your real archive">
+      <button class="btn-xs" onclick="openBrowser('cdt-dest')" title="Choose the destination folder">📁 Browse</button>
+    </div>
+    <div style="display:flex;gap:5px;margin-top:6px">
+      <button class="btn-xs warn" onclick="cdtMove()" title="Move this whole release folder into the destination above. Logged and undoable from the Labels tab's Move log, the same as any other move in this app.">Move release</button>
+      <button class="btn-xs" onclick="cdtCopy()" title="Copy (not move) this whole release folder into the destination above. The original release folder stays exactly where it is.">Copy release</button>
+    </div>
+  </div>
+
+  <div style="margin-top:10px;padding-top:8px;border-top:1px solid var(--border)">
+    <div style="display:flex;align-items:center;gap:8px">
+      <b style="font-size:11px">Review folder</b>
+      <span style="font-size:10px;color:var(--dim)">— duplicates set aside by Auto-arrange. Nothing here is deleted until you say so.</span>
+      <button class="btn-xs ghost" onclick="cdtRefreshReview()" title="Refresh this list">↻</button>
+    </div>
+    <div id="cdt-review-list" style="font-size:11px;margin-top:6px"></div>
+  </div>
+</div>
+
 </div><!-- /tools -->
 
 <!-- ═══════════════ SPEK-TRO TAB ═══════════════ -->
@@ -447,6 +479,7 @@
     <section class="tg-card">
       <div class="tg-head">
         <h3>Channel uploader</h3>
+        <span class="tg-flow" title="Outbound — posts your own library into the Telegram group">outbound</span>
         <span class="tg-dot" id="tg-up-dot"></span>
         <span class="tg-state" id="tg-up-state">checking…</span>
       </div>
@@ -482,6 +515,7 @@
     <!-- ── UPLOADER SETTINGS ──────────────────────────────────────── -->
     <section class="tg-card">
       <div class="tg-head"><h3>Uploader settings</h3>
+        <span class="tg-flow" title="Outbound — tunes how the Channel uploader posts">outbound</span>
         <span class="tg-state" id="tg-set-msg"></span></div>
       <p class="tg-note">Saved to <code>uploader_config.json</code>; the next
         release picks them up. Nothing here interrupts a release in flight.</p>
@@ -541,6 +575,7 @@
     <!-- ── ACCOUNT, PERMISSIONS, ACTIONS ──────────────────────────── -->
     <section class="tg-card">
       <div class="tg-head"><h3>Telegram tools</h3>
+        <span class="tg-flow" title="Shared — account/permission checks and posted-message jobs used by the uploader above">shared</span>
         <span class="tg-state" id="tg-tool-state"></span></div>
 
       <p class="tg-note">Checks that otherwise only announce themselves by an
@@ -573,6 +608,7 @@
     <section class="tg-card">
       <div class="tg-head">
         <h3>Channel scraper</h3>
+        <span class="tg-flow" title="Inbound — pulls lossless files out of a channel you point it at">inbound</span>
         <span class="tg-dot" id="tg-job-dot"></span>
         <span class="tg-state" id="tg-job-state">idle</span>
       </div>

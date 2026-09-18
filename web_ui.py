@@ -1998,6 +1998,7 @@ async def cdtools_tag(req: Request):
     body = await req.json()
     root, release = body.get("root", ""), body.get("release", "")
     dry_run = bool(body.get("dry_run"))
+    force = bool(body.get("force"))
     if not root or not os.path.isdir(root):
         return JSONResponse({"ok": False, "reason": "not a folder: " + root})
     discogs = _cdt_discogs()
@@ -2007,7 +2008,7 @@ async def cdtools_tag(req: Request):
         _cdt_log("tag", root, result)
         return JSONResponse(result)
     try:
-        result = cdt.tag_release(root, release_id, discogs, dry_run=dry_run)
+        result = cdt.tag_release(root, release_id, discogs, dry_run=dry_run, force=force)
     except Exception as exc:
         result = {"ok": False, "reason": str(exc)}
     _cdt_log("tag", root, result)

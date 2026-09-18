@@ -294,11 +294,14 @@ def list_review(root: str) -> list:
 
 
 # ─── tag ─────────────────────────────────────────────────────────────────────
-def tag_release(root: str, release_id: str, discogs, dry_run: bool = True) -> dict:
+def tag_release(root: str, release_id: str, discogs, dry_run: bool = True,
+                 force: bool = False) -> dict:
     """Write catalog_number/artist/album/year onto every file under root,
     plus per-track title/track_number wherever a track can be matched to a
-    file — reuses tag_writer.write_tags_to_file's only_missing=True, so an
-    existing tag, right or wrong, is never touched. Same
+    file. By default reuses tag_writer.write_tags_to_file's only_missing=True,
+    so an existing tag, right or wrong, is never touched; pass force=True to
+    overwrite existing values with the Discogs match instead (e.g. cue-split
+    tracks that already carry placeholder titles like "Pista 1"). Same
     label_ref.match_tracks() one-file-answers-one-track matcher the Labels
     tab's own tag_incoming() already relies on."""
     from tag_writer import write_tags_to_file
@@ -358,7 +361,7 @@ def tag_release(root: str, release_id: str, discogs, dry_run: bool = True) -> di
             tags.update(track_tags_by_file.get(fi, {}))
             if not tags:
                 continue
-            res = write_tags_to_file(fpath, tags, only_missing=True, dry_run=dry_run)
+            res = write_tags_to_file(fpath, tags, only_missing=not force, dry_run=dry_run)
             if res.error:
                 errors += 1
             elif res.written_fields:

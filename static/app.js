@@ -714,6 +714,32 @@ function cdtLog(level,text){
 }
 function cdtBasename(p){ return String(p).split(/[\\/]/).pop(); }
 
+// Disables every button in the CD Tools panel while one request is in
+// flight, so a slow request can't be double-fired by an impatient click.
+// This only guards against overlapping requests client-side — it does not
+// (and cannot, without server-side cancellation support) stop a write
+// that's already been dispatched to the server mid-flight.
+let cdtBusy=false;
+function cdtSetBusy(on){
+  cdtBusy=on;
+  document.querySelectorAll('.cdt-panel button').forEach(b=>{
+    if(b.id!=='cdt-slsk-stop') b.disabled=on;
+  });
+}
+
+function cdtClearSelected(){
+  document.getElementById('cdt-root-in').value='';
+  document.getElementById('cdt-release-in').value='';
+  const sr=document.getElementById('cdt-search-results'); sr.classList.add('hidden'); sr.innerHTML='';
+  const spr=document.getElementById('cdt-split-results'); spr.classList.add('hidden'); spr.innerHTML='';
+  cdtLastPlan_=null; cdtLastSplit_=null;
+  cdtLog('info','cleared — pick a CD root to start on a different release');
+}
+function cdtClearAll(){
+  cdtClearSelected();
+  document.getElementById('cdt-result').innerHTML='';
+}
+
 function cdtRenderPlan(plan){
   const lines=['status: '+plan.status];
   for(const d of Object.keys(plan.disc_plan||{})){
@@ -741,17 +767,20 @@ async function cdtSearch(){
   const box=document.getElementById('cdt-search-results');
   box.classList.remove('hidden');
   box.innerHTML='<span style="color:var(--dim)">searching Discogs…</span>';
-  const d=await (await fetch('/api/cdtools/search?root='+encodeURIComponent(root))).json();
-  if(!d.ok){ box.innerHTML='<span style="color:var(--warn)">'+esc(d.reason||'search failed')+'</span>'; return; }
-  if(!(d.results||[]).length){
-    box.innerHTML='<span style="color:var(--dim)">no Discogs matches for "'+esc(d.query)+'"</span>';
-    return;
-  }
-  box.innerHTML='<div style="color:var(--dim);margin-bottom:3px">Discogs results for "'+esc(d.query)+
-    '" — click one to use it:</div>'+d.results.map(r=>
-    `<button class="btn-xs ghost" style="display:block;width:100%;text-align:left;margin-bottom:2px" `+
-    `data-cdt-pick="${r.id}">${esc(r.artist?r.artist+' - ':'')}${esc(r.title)}`+
-    ` (${esc(r.year||'?')}${r.catno?', '+esc(r.catno):''})</button>`).join('');
+  cdtSetBusy(true);
+  try{
+    const d=await (await fetch('/api/cdtools/search?root='+encodeURIComponent(root))).json();
+    if(!d.ok){ box.innerHTML='<span style="color:var(--warn)">'+esc(d.reason||'search failed')+'</span>'; return; }
+    if(!(d.results||[]).length){
+      box.innerHTML='<span style="color:var(--dim)">no Discogs matches for "'+esc(d.query)+'"</span>';
+      return;
+    }
+    box.innerHTML='<div style="color:var(--dim);margin-bottom:3px">Discogs results for "'+esc(d.query)+
+      '" — click one to use it:</div>'+d.results.map(r=>
+      `<button class="btn-xs ghost" style="display:block;width:100%;text-align:left;margin-bottom:2px" `+
+      `data-cdt-pick="${r.id}">${esc(r.artist?r.artist+' - ':'')}${esc(r.title)}`+
+      ` (${esc(r.year||'?')}${r.catno?', '+esc(r.catno):''})</button>`).join('');
+  } finally { cdtSetBusy(false); }
 }
 document.addEventListener('click',ev=>{
   const b=ev.target.closest('[data-cdt-pick]');
@@ -766,11 +795,14 @@ let cdtLastPlan_=null;
 async function cdtCheck(){
   const root=cdtNeedRoot(); if(!root) return;
   cdtLog('info','checking tracks…');
-  const qs=new URLSearchParams({root, release: cdtRelease()});
-  const d=await (await fetch('/api/cdtools/plan?'+qs)).json();
-  if(!d.ok){ cdtLog('broken', d.reason||'check failed'); return; }
-  cdtLastPlan_=d.plan;
-  cdtLog(d.plan.status==='auto_fixable'?'info':'warning', cdtRenderPlan(d.plan));
+  cdtSetBusy(true);
+  try{
+    const qs=new URLSearchParams({root, release: cdtRelease()});
+    const d=await (await fetch('/api/cdtools/plan?'+qs)).json();
+    if(!d.ok){ cdtLog('broken', d.reason||'check failed'); return; }
+    cdtLastPlan_=d.plan;
+    cdtLog(d.plan.status==='auto_fixable'?'info':'warning', cdtRenderPlan(d.plan));
+  } finally { cdtSetBusy(false); }
 }
 
 // Reuses the exact same Nicotine+ /search wiring the Labels tab's
@@ -779,6 +811,9 @@ async function cdtCheck(){
 // for tracks Check tracks itself already decided are genuinely missing
 // (plan.missing) — never an ambiguous tie, never a duplicate — so this
 // always follows a Check tracks run, not a replacement for it.
+let cdtSlskStopFlag=false;
+function cdtStopSlsk(){ cdtSlskStopFlag=true; cdtLog('info','stopping after the current SLSK search…'); }
+
 async function cdtSearchSlsk(){
   const missing=(cdtLastPlan_ && cdtLastPlan_.missing) || [];
   if(!missing.length){
@@ -786,34 +821,44 @@ async function cdtSearchSlsk(){
       '(either nothing is missing, or Check tracks has not run yet on this folder).');
     return;
   }
-  for(const m of missing){
-    const a=(m.artist||'').trim();
-    const query=(_SLSK_VARIOUS.has(a.toLowerCase().replace(/\.$/,'')) ? m.title : `${a} ${m.title}`).trim();
-    if(!query) continue;
-    try{
-      const resp=await fetch(SLSK_API+'/search',{method:'POST',
-        headers:{'Content-Type':'application/json'},
-        body:JSON.stringify({query, mode:'global', switch_page:true})});
-      const dd=await resp.json().catch(()=>({}));
-      if(resp.ok && dd.ok!==false) cdtLog('info','SLSK search: '+query);
-      else cdtLog('warning','SLSK search failed: '+query+' — '+(dd.error||resp.status));
-    }catch(e){
-      cdtLog('broken','Could not reach Nicotine+ on '+SLSK_API+
-        ' — is it running, with the api-nicotine-plus plugin enabled?');
-      return;
+  cdtSlskStopFlag=false;
+  const stopBtn=document.getElementById('cdt-slsk-stop');
+  stopBtn.classList.remove('hidden');
+  cdtSetBusy(true);
+  try{
+    for(const m of missing){
+      if(cdtSlskStopFlag){ cdtLog('info','stopped — remaining tracks not searched'); break; }
+      const a=(m.artist||'').trim();
+      const query=(_SLSK_VARIOUS.has(a.toLowerCase().replace(/\.$/,'')) ? m.title : `${a} ${m.title}`).trim();
+      if(!query) continue;
+      try{
+        const resp=await fetch(SLSK_API+'/search',{method:'POST',
+          headers:{'Content-Type':'application/json'},
+          body:JSON.stringify({query, mode:'global', switch_page:true})});
+        const dd=await resp.json().catch(()=>({}));
+        if(resp.ok && dd.ok!==false) cdtLog('info','SLSK search: '+query);
+        else cdtLog('warning','SLSK search failed: '+query+' — '+(dd.error||resp.status));
+      }catch(e){
+        cdtLog('broken','Could not reach Nicotine+ on '+SLSK_API+
+          ' — is it running, with the api-nicotine-plus plugin enabled?');
+        break;
+      }
     }
-  }
+  } finally { cdtSetBusy(false); stopBtn.classList.add('hidden'); }
 }
 
 async function cdtDupes(){
   const root=cdtNeedRoot(); if(!root) return;
   cdtLog('info','checking for duplicate tracks…');
-  const d=await (await fetch('/api/cdtools/scan?root='+encodeURIComponent(root))).json();
-  if(!d.ok){ cdtLog('broken', d.reason||'scan failed'); return; }
-  const keys=Object.keys(d.duplicates||{});
-  if(!keys.length){ cdtLog('info','no duplicate tracks found'); return; }
-  const lines=keys.map(k=>k+':  '+d.duplicates[k].map(cdtBasename).join('   |   '));
-  cdtLog('warning', keys.length+' duplicate track(s):\n'+lines.join('\n'));
+  cdtSetBusy(true);
+  try{
+    const d=await (await fetch('/api/cdtools/scan?root='+encodeURIComponent(root))).json();
+    if(!d.ok){ cdtLog('broken', d.reason||'scan failed'); return; }
+    const keys=Object.keys(d.duplicates||{});
+    if(!keys.length){ cdtLog('info','no duplicate tracks found'); return; }
+    const lines=keys.map(k=>k+':  '+d.duplicates[k].map(cdtBasename).join('   |   '));
+    cdtLog('warning', keys.length+' duplicate track(s):\n'+lines.join('\n'));
+  } finally { cdtSetBusy(false); }
 }
 
 async function cdtArrange(preview){
@@ -823,55 +868,75 @@ async function cdtArrange(preview){
       '\n\nMatched tracks move into their correct CD folder; duplicates move to a review '+
       'folder next to the release. Nothing is ever deleted.')) return;
   cdtLog('info',(dry?'previewing':'running')+' auto-arrange…');
-  const r=await fetch('/api/cdtools/apply',{method:'POST',
-    headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({root, release:cdtRelease(), dry_run:dry})});
-  const d=await r.json();
-  if(!d.ok && !(d.results&&d.results.length)){ cdtLog('broken', d.reason||'auto-arrange failed'); return; }
-  const moved=(d.results||[]).filter(x=>x.ok);
-  cdtLog(d.ok?'info':'broken', (dry?'[preview] ':'')+moved.length+' file move(s):\n'+
-    moved.map(m=>cdtBasename(m.src)+'  ->  '+m.dest).join('\n'));
-  if(d.verify && Object.keys(d.verify).length) cdtLog('broken','VERIFY MISMATCH: '+JSON.stringify(d.verify));
-  if(!dry) cdtRefreshReview();
+  cdtSetBusy(true);
+  try{
+    const r=await fetch('/api/cdtools/apply',{method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({root, release:cdtRelease(), dry_run:dry})});
+    const d=await r.json();
+    if(!d.ok && !(d.results&&d.results.length)){ cdtLog('broken', d.reason||'auto-arrange failed'); return; }
+    const moved=(d.results||[]).filter(x=>x.ok);
+    cdtLog(d.ok?'info':'broken', (dry?'[preview] ':'')+moved.length+' file move(s):\n'+
+      moved.map(m=>cdtBasename(m.src)+'  ->  '+m.dest).join('\n'));
+    if(d.verify && Object.keys(d.verify).length) cdtLog('broken','VERIFY MISMATCH: '+JSON.stringify(d.verify));
+    if(!dry) cdtRefreshReview();
+  } finally { cdtSetBusy(false); }
 }
 
 async function cdtTag(preview){
   const root=cdtNeedRoot(); if(!root) return;
   const dry = preview || cdtDry();
-  if(!preview && !dry && !confirm('Write tags for real onto files in:\n\n'+root+
-      '\n\nOnly fills in fields that are currently MISSING — never overwrites a tag that '+
-      'already has a value, right or wrong.')) return;
-  cdtLog('info',(dry?'previewing':'running')+' tag from Discogs…');
-  const r=await fetch('/api/cdtools/tag',{method:'POST',
-    headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({root, release:cdtRelease(), dry_run:dry})});
-  const d=await r.json();
-  cdtLog(d.ok?'info':'broken', (dry?'[preview] ':'')+(d.reason||(d.ok?'done':'failed')));
+  const force = document.getElementById('cdt-force-tag').checked;
+  if(!preview && !dry){
+    const msg = force
+      ? 'OVERWRITE tags for real onto files in:\n\n'+root+
+        '\n\nForce is ON — this replaces every matched field (including title/track number) '+
+        'with the Discogs match, even if the file already has a value. Are you sure?'
+      : 'Write tags for real onto files in:\n\n'+root+
+        '\n\nOnly fills in fields that are currently MISSING — never overwrites a tag that '+
+        'already has a value, right or wrong.';
+    if(!confirm(msg)) return;
+  }
+  cdtLog('info',(dry?'previewing':'running')+(force?' forced tag':' tag')+' from Discogs…');
+  cdtSetBusy(true);
+  try{
+    const r=await fetch('/api/cdtools/tag',{method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({root, release:cdtRelease(), dry_run:dry, force})});
+    const d=await r.json();
+    cdtLog(d.ok?'info':'broken', (dry?'[preview] ':'')+(d.reason||(d.ok?'done':'failed')));
+  } finally { cdtSetBusy(false); }
 }
 
 async function cdtArtwork(preview){
   const root=cdtNeedRoot(); if(!root) return;
   const dry = preview || cdtDry();
   cdtLog('info',(dry?'previewing':'fetching')+' artwork…');
-  const r=await fetch('/api/cdtools/artwork',{method:'POST',
-    headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({root, release:cdtRelease(), dry_run:dry})});
-  const d=await r.json();
-  cdtLog(d.ok?'info':'broken', (dry?'[preview] ':'')+(d.reason||(d.ok?'done':'failed')));
+  cdtSetBusy(true);
+  try{
+    const r=await fetch('/api/cdtools/artwork',{method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({root, release:cdtRelease(), dry_run:dry})});
+    const d=await r.json();
+    cdtLog(d.ok?'info':'broken', (dry?'[preview] ':'')+(d.reason||(d.ok?'done':'failed')));
+  } finally { cdtSetBusy(false); }
 }
 
 async function cdtVerify(){
   const root=cdtNeedRoot(); if(!root) return;
   cdtLog('info','verifying…');
-  const qs=new URLSearchParams({root, release: cdtRelease()});
-  const d=await (await fetch('/api/cdtools/verify?'+qs)).json();
-  if(!d.ok){ cdtLog('broken', d.reason||'verify failed'); return; }
-  const dkeys=Object.keys(d.duplicates||{});
-  let msg=(d.clean?'CLEAN — no duplicates, plan status: ':'NOT CLEAN — plan status: ')+d.plan.status+
-    (dkeys.length?(', '+dkeys.length+' duplicate track(s) remain'):'');
-  if(d.purged) msg+=` — review folder cleaned up (${d.purged} file(s) permanently removed, all confirmed surplus)`;
-  cdtLog(d.clean?'info':'warning', msg);
-  if(d.purged) cdtRefreshReview();
+  cdtSetBusy(true);
+  try{
+    const qs=new URLSearchParams({root, release: cdtRelease()});
+    const d=await (await fetch('/api/cdtools/verify?'+qs)).json();
+    if(!d.ok){ cdtLog('broken', d.reason||'verify failed'); return; }
+    const dkeys=Object.keys(d.duplicates||{});
+    let msg=(d.clean?'CLEAN — no duplicates, plan status: ':'NOT CLEAN — plan status: ')+d.plan.status+
+      (dkeys.length?(', '+dkeys.length+' duplicate track(s) remain'):'');
+    if(d.purged) msg+=` — review folder cleaned up (${d.purged} file(s) permanently removed, all confirmed surplus)`;
+    cdtLog(d.clean?'info':'warning', msg);
+    if(d.purged) cdtRefreshReview();
+  } finally { cdtSetBusy(false); }
 }
 
 async function cdtMove(){

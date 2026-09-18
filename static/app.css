@@ -9,7 +9,7 @@
 
 :root{
   --bg:#070a0e;--panel:#0e141bee;--card:#141c2688;--border:#25384a;
-  --acc:#2f9fe0;--acc2:#8fe0f0;--text:#dce8f0;--dim:#5f7688;
+  --acc:#2f9fe0;--acc2:#8fe0f0;--btn-bg:#175a86;--text:#dce8f0;--dim:#5f7688;
   --ok:#4ecb71;--warn:#f0c040;--err:#ff5566;--info:#60b8ff;--dup:#c060f0;
 }
 *{box-sizing:border-box;margin:0;padding:0}
@@ -60,14 +60,23 @@ header{background:var(--panel);border-bottom:1px solid var(--border);
 aside{width:310px;min-width:240px;border-right:1px solid var(--border);
       background:rgba(7,11,16,.72);
       display:flex;flex-direction:column;overflow:hidden;flex-shrink:0}
+/* Direct tab used to have a third flex item here (CD Tools) splitting the
+   remaining space with .log-area; now it's just these two, so give each
+   half the row instead of leaving aside pinned to a narrow fixed width
+   next to one giant log pane. */
+#tab-direct aside{width:auto;flex:1;flex-shrink:1;min-width:280px}
 .card{border-bottom:1px solid var(--border);padding:10px 12px;flex-shrink:0}
-/* .cdt-panel is a .card used as the SECOND row-flex item next to aside
-   (310px, fixed), not stacked inside it — .card's own flex-shrink:0 and the
-   lack of any width/flex here meant it sized to its longest unwrapped line
-   (the description paragraph, ~2000px on one line) instead of filling the
-   remaining row and wrapping, pushing every button in it off-screen. */
+/* .cdt-panel is a .card used as a row-flex item next to .tools-left in the
+   Tools tab (330px, fixed), not stacked inside it — .card's own
+   flex-shrink:0 and the lack of any width/flex here meant it sized to its
+   longest unwrapped line (the description paragraph, ~2000px on one line)
+   instead of filling the remaining row and wrapping, pushing every button
+   in it off-screen. */
 .cdt-panel{flex:1;flex-shrink:1;min-width:0;overflow-y:auto}
 .cdt-panel .path-label{background:#1e1e30;color:var(--dim)}
+.cdt-subhead{font-size:12px;font-weight:700;letter-spacing:.4px;text-transform:uppercase;
+             color:var(--acc2);margin:14px 0 6px}
+.cdt-hr{border:none;border-top:1px solid var(--border);margin:12px 0 0}
 .card h3{font-size:9px;text-transform:uppercase;letter-spacing:.12em;
          color:var(--dim);margin-bottom:8px}
 .path-row{display:flex;gap:8px;margin-bottom:10px;align-items:center}
@@ -85,8 +94,9 @@ aside{width:310px;min-width:240px;border-right:1px solid var(--border);
 .path-input::placeholder{color:var(--dim)}
 .path-input:focus{outline:none;border-color:var(--acc2);box-shadow:0 0 0 2px rgba(224,165,58,.18);background:#1c1710}
 .path-input.active-target{border-color:var(--acc2)!important;box-shadow:0 0 0 2px rgba(224,165,58,.22);background:#1c1710}
-.btn-xs{background:var(--acc);border:none;color:#fff;padding:8px 14px;
-        border-radius:4px;cursor:pointer;font:inherit;font-size:11px;font-weight:700;white-space:nowrap}
+.btn-xs{background:var(--btn-bg);border:none;color:#fff;padding:8px 14px;
+        border-radius:4px;cursor:pointer;font:inherit;font-size:11px;font-weight:700;
+        letter-spacing:.2px;white-space:nowrap}
 .btn-xs:hover{opacity:.82}
 .btn-xs.ghost{background:#1e1e30;color:var(--dim)}
 .btn-xs.ghost:hover{color:var(--text)}
@@ -197,8 +207,8 @@ aside{width:310px;min-width:240px;border-right:1px solid var(--border);
 @keyframes pulse{0%,100%{opacity:1}50%{opacity:.3}}
 .action-bar{padding:10px 14px;border-bottom:1px solid var(--border);
             display:flex;align-items:center;gap:9px;flex-wrap:wrap;flex-shrink:0;margin-top:8px}
-.btn{background:var(--acc);border:none;color:#fff;padding:9px 18px;border-radius:4px;
-     cursor:pointer;font:inherit;font-size:13px;font-weight:600}
+.btn{background:var(--btn-bg);border:none;color:#fff;padding:9px 18px;border-radius:4px;
+     cursor:pointer;font:inherit;font-size:13px;font-weight:700;letter-spacing:.2px}
 .btn:hover:not(:disabled){opacity:.82}
 .btn:disabled{opacity:.35;cursor:not-allowed}
 .btn.run-all{background:linear-gradient(90deg,var(--acc),var(--acc2))}
@@ -348,6 +358,8 @@ textarea.sql-input:focus{outline:none;border-color:var(--acc)}
 .tg-head{display:flex;align-items:center;gap:9px;border-bottom:1px solid var(--border);
          padding-bottom:9px;margin-bottom:2px}
 .tg-head h3{margin:0;font-size:14px;font-weight:600;letter-spacing:.02em;flex:1}
+.tg-flow{font-size:9px;text-transform:uppercase;letter-spacing:.1em;color:var(--dim);
+         border:1px solid var(--border);border-radius:3px;padding:2px 6px;flex:none}
 .tg-dot{width:8px;height:8px;border-radius:50%;background:var(--dim);flex:none}
 .tg-dot.on{background:#3fd07a;box-shadow:0 0 7px #3fd07a99}
 .tg-dot.off{background:#e0703f}
@@ -556,7 +568,7 @@ th.ff-tick,td.ff-tick{width:30px;text-align:center;padding-left:8px}
       border-radius:3px;cursor:pointer;font:inherit;font-size:10px}
 .lb-f:hover{color:var(--text)}
 .lb-f.active{border-color:var(--acc2);color:var(--acc2)}
-.direct-content-type{display:flex;gap:5px}
+.direct-content-type{display:flex;gap:5px;flex-wrap:wrap}
 .direct-content-type .btn-xs.active{background:#1d2b3a;border-color:var(--acc);color:var(--acc)}
 .lb-search{flex:1;min-width:150px;background:#0d141c;border:1px solid var(--border);
            color:var(--text);padding:5px 9px;border-radius:4px;font:inherit;font-size:11px}
