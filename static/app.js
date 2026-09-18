@@ -908,6 +908,28 @@ async function cdtTag(preview){
   } finally { cdtSetBusy(false); }
 }
 
+async function cdtRename(preview){
+  const root=cdtNeedRoot(); if(!root) return;
+  const dry = preview || cdtDry();
+  if(!preview && !dry && !confirm('Rename files for real in:\n\n'+root+
+      '\n\nOnly renames a file that is confidently matched to a track (to "NN - Title.ext") — '+
+      'a file with no match is left exactly where it is.')) return;
+  cdtLog('info',(dry?'previewing':'renaming')+' from Discogs…');
+  cdtSetBusy(true);
+  try{
+    const r=await fetch('/api/cdtools/rename',{method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({root, release:cdtRelease(), dry_run:dry})});
+    const d=await r.json();
+    const lines=(d.results||[]).filter(x=>x.ok).map(x=>cdtBasename(x.src)+'  ->  '+cdtBasename(x.dest));
+    const failed=(d.results||[]).filter(x=>!x.ok);
+    let msg=(dry?'[preview] ':'')+(d.reason||(d.ok?'done':'failed'));
+    if(lines.length) msg+=':\n'+lines.join('\n');
+    if(failed.length) msg+='\n'+failed.map(x=>'FAILED  '+cdtBasename(x.src)+' — '+x.reason).join('\n');
+    cdtLog(d.ok?'info':'broken', msg);
+  } finally { cdtSetBusy(false); }
+}
+
 async function cdtArtwork(preview){
   const root=cdtNeedRoot(); if(!root) return;
   const dry = preview || cdtDry();

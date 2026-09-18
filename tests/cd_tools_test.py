@@ -526,6 +526,26 @@ try:
     eq(str(w2.tags.get("TIT2", "")).strip(), "Real Track Beta",
       "track 2's placeholder file got track 2's real title, by position")
 
+    ren_dry = C.rename_tracks(pista_root, "1", fake_pista, dry_run=True)
+    eq(ren_dry["ok"], True, "rename_tracks dry run reports ok")
+    eq(ren_dry["renamed"], 2, "dry run reports both files it WOULD rename")
+    check(os.path.exists(os.path.join(pista_root, "01 - Pista01.wav")),
+         "dry run renamed nothing for real")
+
+    ren_real = C.rename_tracks(pista_root, "1", fake_pista, dry_run=False)
+    eq(ren_real["ok"], True, "rename_tracks real run reports ok")
+    eq(ren_real["renamed"], 2, "both files actually got renamed")
+    check(os.path.exists(os.path.join(pista_root, "01 - Real Track Alpha.wav")),
+         "file 1 renamed to its real matched title")
+    check(os.path.exists(os.path.join(pista_root, "02 - Real Track Beta.wav")),
+         "file 2 renamed to its real matched title")
+    check(not os.path.exists(os.path.join(pista_root, "01 - Pista01.wav")),
+         "the old placeholder filename is gone")
+
+    ren_again = C.rename_tracks(pista_root, "1", fake_pista, dry_run=False)
+    eq(ren_again["renamed"], 0,
+      "renaming again is a no-op once files already carry their matched name")
+
     art_root = os.path.join(tmp, "artwork_release")
     wav(os.path.join(art_root, "01 - track.wav"))
     fake3 = FakeDiscogs(images=[{"type": "primary", "uri": "http://example.invalid/cover.jpg"}])

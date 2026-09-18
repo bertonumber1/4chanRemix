@@ -303,6 +303,86 @@ def _leading_track_no(path: str):
 
 
 # ─── tag ─────────────────────────────────────────────────────────────────────
+def _resolve_release_targets(root: str, release_id: str, discogs, rel: dict) -> list:
+    """(folder, expected_titles) per disc-folder actually present under root —
+    shared by tag_release and rename_tracks so they can never disagree about
+    which file answers for which track."""
+    discs = mcd.disc_numbers(root)
+    targets = []
+    if discs:
+        try:
+            by_disc = discogs.tracklist_by_disc(int(release_id))
+        except Exception:
+            by_disc = {}
+        for d in discs:
+            dd = mcd.disc_dir_path(root, d)
+            if dd:
+                # tracklist_by_disc() entries are {"title","duration"} —
+                # match_tracks() below only wants the titles.
+                titles = [t["title"] for t in by_disc.get(d, []) if t.get("title")]
+                targets.append((dd, titles))
+    else:
+        expected = None
+        # root has no CDn SUBFOLDERS, but might still BE one disc of a
+        # multi-disc release that Discogs lists as a single entry (a
+        # compilation whose "CD1"/"CD2" are headings inside one combined
+        # tracklist, not separate releases) — e.g. "...Actividad Constante
+        # (CD1)" as its own top-level folder, siblings named (CD2)/(CD3)
+        # elsewhere entirely. Matching root's 18 files against the release's
+        # full 52-track list can never line up; ask for just this disc.
+        # Check root's own name first, then its parent's — the CD Track
+        # Splitter's own output lands in a generically-named "split_tracks"
+        # child folder, so root itself often carries no disc hint at all
+        # even though it very much represents one specific disc.
+        _clean = root.rstrip("\\/")
+        m = (re.search(r"\b(?:cd|disc|disco|disk|dvd)\D{0,3}(\d+)\b",
+                       os.path.basename(_clean), re.I)
+             or re.search(r"\b(?:cd|disc|disco|disk|dvd)\D{0,3}(\d+)\b",
+                          os.path.basename(os.path.dirname(_clean)), re.I))
+        if m:
+            try:
+                by_disc = discogs.tracklist_by_disc(int(release_id))
+            except Exception:
+                by_disc = {}
+            titles = [t["title"] for t in by_disc.get(int(m.group(1)), []) if t.get("title")]
+            if titles:
+                expected = titles
+        if expected is None:
+            expected = [t.get("title", "").strip() for t in rel.get("tracklist", [])
+                       if (t.get("type_") or "track") == "track" and t.get("title")]
+        targets.append((root, expected))
+    return targets
+
+
+def _match_folder_tracks(folder: str, expected: list) -> tuple:
+    """(matched, file_paths) for one folder — match_tracks() plus the
+    positional backstop for cue-splitter placeholder filenames."""
+    info = L.folder_tracks(folder)
+    file_paths = info.get("paths") or []
+    matched = L.match_tracks(expected, info.get("ids") or []) if expected else {}
+    if expected and len(file_paths) == len(expected):
+        # match_tracks() is pure text similarity, so a file named purely
+        # after its track NUMBER (a cue-splitter placeholder like
+        # "Pista 07") scores zero against every real title and is left
+        # unmatched forever, no matter how many files carry the same
+        # placeholder scheme. When the file count exactly equals the
+        # expected track count, whatever's left over after real text
+        # matches is exactly one gap-filling permutation — pair the
+        # remainder by each file's own leading track number against its
+        # tracklist position, but only when EVERY remaining file actually
+        # has one; otherwise this would silently mis-tag on directory
+        # order, which is not guaranteed to mean anything.
+        unmatched_t = [ti for ti in range(len(expected)) if ti not in matched]
+        unmatched_f = [fi for fi in range(len(file_paths)) if fi not in matched.values()]
+        if unmatched_t and len(unmatched_t) == len(unmatched_f):
+            nums = [_leading_track_no(file_paths[fi]) for fi in unmatched_f]
+            if all(n is not None for n in nums):
+                ordered_f = [fi for _, fi in sorted(zip(nums, unmatched_f))]
+                for ti, fi in zip(sorted(unmatched_t), ordered_f):
+                    matched[ti] = fi
+    return matched, file_paths
+
+
 def tag_release(root: str, release_id: str, discogs, dry_run: bool = True,
                  force: bool = False) -> dict:
     """Write catalog_number/artist/album/year onto every file under root,
@@ -336,69 +416,11 @@ def tag_release(root: str, release_id: str, discogs, dry_run: bool = True,
         **({} if various else {"artist": artist_name}),
     }.items() if v}
 
-    discs = mcd.disc_numbers(root)
-    targets = []
-    if discs:
-        try:
-            by_disc = discogs.tracklist_by_disc(int(release_id))
-        except Exception:
-            by_disc = {}
-        for d in discs:
-            dd = mcd.disc_dir_path(root, d)
-            if dd:
-                # tracklist_by_disc() entries are {"title","duration"} —
-                # match_tracks() below only wants the titles.
-                titles = [t["title"] for t in by_disc.get(d, []) if t.get("title")]
-                targets.append((dd, titles))
-    else:
-        expected = None
-        # root has no CDn SUBFOLDERS, but might still BE one disc of a
-        # multi-disc release that Discogs lists as a single entry (a
-        # compilation whose "CD1"/"CD2" are headings inside one combined
-        # tracklist, not separate releases) — e.g. "...Actividad Constante
-        # (CD1)" as its own top-level folder, siblings named (CD2)/(CD3)
-        # elsewhere entirely. Matching root's 18 files against the release's
-        # full 52-track list can never line up; ask for just this disc.
-        m = re.search(r"\b(?:cd|disc|disco|disk|dvd)\D{0,3}(\d+)\b",
-                      os.path.basename(root.rstrip("\\/")), re.I)
-        if m:
-            try:
-                by_disc = discogs.tracklist_by_disc(int(release_id))
-            except Exception:
-                by_disc = {}
-            titles = [t["title"] for t in by_disc.get(int(m.group(1)), []) if t.get("title")]
-            if titles:
-                expected = titles
-        if expected is None:
-            expected = [t.get("title", "").strip() for t in rel.get("tracklist", [])
-                       if (t.get("type_") or "track") == "track" and t.get("title")]
-        targets.append((root, expected))
+    targets = _resolve_release_targets(root, release_id, discogs, rel)
 
     tagged = errors = 0
     for folder, expected in targets:
-        info = L.folder_tracks(folder)
-        file_paths = info.get("paths") or []
-        matched = L.match_tracks(expected, info.get("ids") or []) if expected else {}
-        if expected and len(file_paths) == len(expected):
-            # match_tracks() is pure text similarity, so a file named purely
-            # after its track NUMBER (a cue-splitter placeholder like
-            # "Pista 07") scores zero against every real title and is left
-            # unmatched forever, no matter how many files carry the same
-            # placeholder scheme. When the file count exactly equals the
-            # expected track count, whatever's left over after real text
-            # matches is exactly one gap-filling permutation — pair the
-            # remainder by each file's own leading track number against its
-            # tracklist position, but only when EVERY remaining file actually
-            # has one; otherwise this would silently mis-tag on directory
-            # order, which is not guaranteed to mean anything.
-            unmatched_t = [ti for ti in range(len(expected)) if ti not in matched]
-            unmatched_f = [fi for fi in range(len(file_paths)) if fi not in matched.values()]
-            if unmatched_t and len(unmatched_t) == len(unmatched_f):
-                nums = [_leading_track_no(file_paths[fi]) for fi in unmatched_f]
-                if all(n is not None for n in nums):
-                    ordered_f = [fi for _, fi in sorted(zip(nums, unmatched_f))]
-                    for ti, fi in zip(sorted(unmatched_t), ordered_f):
-                        matched[ti] = fi
+        matched, file_paths = _match_folder_tracks(folder, expected)
         track_tags_by_file = {}
         for ti, track_title in enumerate(expected):
             fi = matched.get(ti)
@@ -418,6 +440,63 @@ def tag_release(root: str, release_id: str, discogs, dry_run: bool = True,
         "%d error(s) writing tags" % errors if errors else
         ("tagged %d file(s)" % tagged if tagged else "nothing to tag — every file already had these fields"))
     return {"ok": errors == 0, "tagged_files": tagged, "errors": errors, "dry_run": dry_run, "reason": reason}
+
+
+# ─── rename ──────────────────────────────────────────────────────────────────
+_BAD_FS_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
+
+
+def rename_tracks(root: str, release_id: str, discogs, dry_run: bool = True) -> dict:
+    """Rename each file CONFIDENTLY matched to a track (same disc-aware,
+    positionally-backstopped matching tag_release uses) to "NN - Title.ext",
+    in place — same folder, extension untouched. A file with no match is
+    left exactly where it is rather than guessed at; renaming the wrong file
+    to the wrong title is worse than leaving a placeholder name alone."""
+    if not release_id:
+        return {"ok": False, "reason": "no Discogs release given"}
+    if discogs is None:
+        return {"ok": False, "reason": "no Discogs token configured"}
+    try:
+        rel = discogs.release(int(release_id))
+    except Exception as exc:
+        return {"ok": False, "reason": f"could not fetch release: {exc}"}
+
+    targets = _resolve_release_targets(root, release_id, discogs, rel)
+
+    renamed = errors = 0
+    results = []
+    for folder, expected in targets:
+        matched, file_paths = _match_folder_tracks(folder, expected)
+        for ti, track_title in enumerate(expected):
+            fi = matched.get(ti)
+            if fi is None or not (0 <= fi < len(file_paths)):
+                continue
+            src = file_paths[fi]
+            ext = os.path.splitext(src)[1]
+            safe_title = _BAD_FS_CHARS.sub("_", track_title).strip().rstrip(".")
+            dest = os.path.join(folder, "%02d - %s%s" % (ti + 1, safe_title, ext))
+            if os.path.abspath(src) == os.path.abspath(dest):
+                continue
+            if os.path.exists(dest):
+                errors += 1
+                results.append({"ok": False, "src": src, "dest": dest,
+                               "reason": "a file already exists at the destination name"})
+                continue
+            if not dry_run:
+                try:
+                    os.replace(src, dest)
+                except OSError as exc:
+                    errors += 1
+                    results.append({"ok": False, "src": src, "dest": dest, "reason": str(exc)})
+                    continue
+            renamed += 1
+            results.append({"ok": True, "src": src, "dest": dest})
+    reason = ("would rename %d file(s)" % renamed) if dry_run else (
+        "%d error(s) renaming" % errors if errors else
+        ("renamed %d file(s)" % renamed if renamed else
+         "nothing to rename — no file is both matched to a track and not already named for it"))
+    return {"ok": errors == 0, "renamed": renamed, "errors": errors, "dry_run": dry_run,
+            "results": results, "reason": reason}
 
 
 # ─── artwork ─────────────────────────────────────────────────────────────────

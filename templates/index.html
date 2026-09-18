@@ -440,6 +440,11 @@
     <button class="btn-xs" onclick="cdtArtwork(false)" title="Save a loose folder.jpg — from an embedded picture already somewhere in the folder if there is one, otherwise fetched from the Discogs release above. Never touches an audio file.">Get artwork</button>
   </div>
   <div style="display:flex;gap:5px;flex-wrap:wrap;margin-top:6px;align-items:center;padding-top:8px;border-top:1px solid var(--border)">
+    <span class="path-label" style="min-width:auto">Rename</span>
+    <button class="btn-xs" onclick="cdtRename(true)" title="Preview which files would be renamed, without touching one.">Preview rename</button>
+    <button class="btn-xs warn" onclick="cdtRename(false)" title="Rename each file confidently matched to a Discogs track to &quot;NN - Title.ext&quot;, same folder, extension kept. A file with no confident match (e.g. an unresolved track-count mismatch) is left exactly where it is — never guessed at.">Rename tracks per Discogs</button>
+  </div>
+  <div style="display:flex;gap:5px;flex-wrap:wrap;margin-top:6px;align-items:center;padding-top:8px;border-top:1px solid var(--border)">
     <span class="path-label" style="min-width:auto">Verify</span>
     <button class="btn-xs" onclick="cdtVerify()" title="Re-check this release after arranging/tagging, to confirm it is actually clean now rather than trusting the last action's own report.">Verify</button>
     <label class="dry-label" title="Preview only, for the buttons above that support it"><input type="checkbox" id="cdt-dry-run" checked> dry run</label>

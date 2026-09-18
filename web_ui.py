@@ -2015,6 +2015,30 @@ async def cdtools_tag(req: Request):
     return JSONResponse(result)
 
 
+@app.post("/api/cdtools/rename")
+async def cdtools_rename(req: Request):
+    g = _cdt_guard()
+    if g:
+        return g
+    body = await req.json()
+    root, release = body.get("root", ""), body.get("release", "")
+    dry_run = bool(body.get("dry_run"))
+    if not root or not os.path.isdir(root):
+        return JSONResponse({"ok": False, "reason": "not a folder: " + root})
+    discogs = _cdt_discogs()
+    release_id, err = cdt.resolve_release_id(release, discogs)
+    if not release_id:
+        result = {"ok": False, "reason": err or "no Discogs release given"}
+        _cdt_log("rename", root, result)
+        return JSONResponse(result)
+    try:
+        result = cdt.rename_tracks(root, release_id, discogs, dry_run=dry_run)
+    except Exception as exc:
+        result = {"ok": False, "reason": str(exc)}
+    _cdt_log("rename", root, result)
+    return JSONResponse(result)
+
+
 @app.post("/api/cdtools/artwork")
 async def cdtools_artwork(req: Request):
     g = _cdt_guard()
