@@ -929,12 +929,19 @@ class Discogs:
         d = self._get(f"/releases/{int(release_id)}")
         out: dict = {}
         disc = 1
+        headings_seen = 0
         for t in d.get("tracklist", []):
             if (t.get("type_") or "track") == "heading":
+                # The heading ITSELF is the reliable disc-boundary signal —
+                # a submitter naming their sides "DJ Pepo. Attica Abajo" /
+                # "DJ Napo Y DJ Valen. Attica Arriba" instead of "CD 1"/"CD 2"
+                # still means a new disc started here, just without a digit
+                # to parse. Fall back to counting headings in order; an
+                # explicit digit in the text still wins when present.
+                headings_seen += 1
                 heading = (t.get("title") or "")
                 m = re.search(r"\b(?:cd|disc|disco|disk|dvd)\D{0,3}(\d+)\b", heading, re.I)
-                if m:
-                    disc = int(m.group(1))
+                disc = int(m.group(1)) if m else headings_seen
                 continue
             title = (t.get("title") or "").strip()
             if not title:

@@ -351,8 +351,27 @@ def tag_release(root: str, release_id: str, discogs, dry_run: bool = True,
                 titles = [t["title"] for t in by_disc.get(d, []) if t.get("title")]
                 targets.append((dd, titles))
     else:
-        expected = [t.get("title", "").strip() for t in rel.get("tracklist", [])
-                   if (t.get("type_") or "track") == "track" and t.get("title")]
+        expected = None
+        # root has no CDn SUBFOLDERS, but might still BE one disc of a
+        # multi-disc release that Discogs lists as a single entry (a
+        # compilation whose "CD1"/"CD2" are headings inside one combined
+        # tracklist, not separate releases) — e.g. "...Actividad Constante
+        # (CD1)" as its own top-level folder, siblings named (CD2)/(CD3)
+        # elsewhere entirely. Matching root's 18 files against the release's
+        # full 52-track list can never line up; ask for just this disc.
+        m = re.search(r"\b(?:cd|disc|disco|disk|dvd)\D{0,3}(\d+)\b",
+                      os.path.basename(root.rstrip("\\/")), re.I)
+        if m:
+            try:
+                by_disc = discogs.tracklist_by_disc(int(release_id))
+            except Exception:
+                by_disc = {}
+            titles = [t["title"] for t in by_disc.get(int(m.group(1)), []) if t.get("title")]
+            if titles:
+                expected = titles
+        if expected is None:
+            expected = [t.get("title", "").strip() for t in rel.get("tracklist", [])
+                       if (t.get("type_") or "track") == "track" and t.get("title")]
         targets.append((root, expected))
 
     tagged = errors = 0
