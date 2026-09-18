@@ -293,6 +293,15 @@ def list_review(root: str) -> list:
     return sorted(L.audio_files(review_root))
 
 
+_LEADING_NUM_RE = re.compile(r"^\s*0*(\d+)")
+
+
+def _leading_track_no(path: str):
+    """The number a filename opens with (`"02 - Pista02.wav"` -> 2), or None."""
+    m = _LEADING_NUM_RE.match(os.path.basename(path))
+    return int(m.group(1)) if m else None
+
+
 # ─── tag ─────────────────────────────────────────────────────────────────────
 def tag_release(root: str, release_id: str, discogs, dry_run: bool = True,
                  force: bool = False) -> dict:
@@ -351,6 +360,26 @@ def tag_release(root: str, release_id: str, discogs, dry_run: bool = True,
         info = L.folder_tracks(folder)
         file_paths = info.get("paths") or []
         matched = L.match_tracks(expected, info.get("ids") or []) if expected else {}
+        if expected and len(file_paths) == len(expected):
+            # match_tracks() is pure text similarity, so a file named purely
+            # after its track NUMBER (a cue-splitter placeholder like
+            # "Pista 07") scores zero against every real title and is left
+            # unmatched forever, no matter how many files carry the same
+            # placeholder scheme. When the file count exactly equals the
+            # expected track count, whatever's left over after real text
+            # matches is exactly one gap-filling permutation — pair the
+            # remainder by each file's own leading track number against its
+            # tracklist position, but only when EVERY remaining file actually
+            # has one; otherwise this would silently mis-tag on directory
+            # order, which is not guaranteed to mean anything.
+            unmatched_t = [ti for ti in range(len(expected)) if ti not in matched]
+            unmatched_f = [fi for fi in range(len(file_paths)) if fi not in matched.values()]
+            if unmatched_t and len(unmatched_t) == len(unmatched_f):
+                nums = [_leading_track_no(file_paths[fi]) for fi in unmatched_f]
+                if all(n is not None for n in nums):
+                    ordered_f = [fi for _, fi in sorted(zip(nums, unmatched_f))]
+                    for ti, fi in zip(sorted(unmatched_t), ordered_f):
+                        matched[ti] = fi
         track_tags_by_file = {}
         for ti, track_title in enumerate(expected):
             fi = matched.get(ti)

@@ -499,6 +499,33 @@ try:
     no_release = C.tag_release(tag_root, "", fake2, dry_run=True)
     eq(no_release["ok"], False, "tag_release refuses when no release id is given")
 
+    # A cue-splitter's placeholder titles ("Pista 07") share no text with any
+    # real Discogs title, so match_tracks() alone leaves every file unmatched
+    # forever — tag_release must fall back to pairing by each file's own
+    # leading track number once the file count exactly equals the expected
+    # track count, or force=True has nothing to overwrite in the first place.
+    pista_root = os.path.join(tmp, "tag_release_pista")
+    wav(os.path.join(pista_root, "01 - Pista01.wav"))
+    wav(os.path.join(pista_root, "02 - Pista02.wav"))
+    rel_pista = {
+        "artists": [{"name": "Various"}],
+        "title": "Pista Test Album",
+        "year": 2002,
+        "tracklist": [{"type_": "track", "title": "Real Track Alpha"},
+                     {"type_": "track", "title": "Real Track Beta"}],
+    }
+    fake_pista = FakeDiscogs(release=rel_pista)
+    tr_pista = C.tag_release(pista_root, "1", fake_pista, dry_run=False, force=True)
+    eq(tr_pista["ok"], True, "forced tag_release on placeholder-named files reports ok")
+    eq(tr_pista["tagged_files"], 2, "both placeholder-named files got tagged")
+
+    w1 = WAVE(os.path.join(pista_root, "01 - Pista01.wav"))
+    w2 = WAVE(os.path.join(pista_root, "02 - Pista02.wav"))
+    eq(str(w1.tags.get("TIT2", "")).strip(), "Real Track Alpha",
+      "track 1's placeholder file got track 1's real title, by position")
+    eq(str(w2.tags.get("TIT2", "")).strip(), "Real Track Beta",
+      "track 2's placeholder file got track 2's real title, by position")
+
     art_root = os.path.join(tmp, "artwork_release")
     wav(os.path.join(art_root, "01 - track.wav"))
     fake3 = FakeDiscogs(images=[{"type": "primary", "uri": "http://example.invalid/cover.jpg"}])
