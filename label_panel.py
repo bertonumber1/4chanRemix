@@ -1328,6 +1328,17 @@ def export(kind: str) -> tuple[str, str]:
                             r["folder"]])
         return f"{label} - re-hunt (fake) - {stamp}.csv", buf.getvalue()
 
+    if kind == "series":
+        groups = [g for g in L.group_series(rows) if g["missing"]]
+        out = []
+        for g in sorted(groups, key=lambda g: g["series"].lower()):
+            out.append(f"{g['series']}  ({len(g['have'])} of {g['total']})")
+            out.append("    missing: " + ", ".join(str(n) for n in sorted(g["missing"])))
+            out.append("")
+        header = [f"{scan_.get('label_name')} — series still missing volumes — {stamp}",
+                  "=" * 60, ""]
+        return f"{label} - series missing - {stamp}.txt", "\n".join(header + out)
+
     raise RuntimeError("unknown export: " + kind)
 
 
