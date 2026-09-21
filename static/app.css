@@ -34,6 +34,10 @@ header{background:var(--panel);border-bottom:1px solid var(--border);
             font-size:18px;font-weight:800;letter-spacing:.01em;
             color:var(--text);white-space:nowrap}
 .brand:hover .brand-name{color:var(--acc2)}
+.brand-edition{font-family:'Segoe UI','Helvetica Neue',Arial,sans-serif;
+               font-size:11px;font-weight:600;letter-spacing:.03em;
+               color:var(--dim);white-space:nowrap;align-self:flex-end;
+               margin-bottom:2px}
 .tabs{display:flex;gap:8px;margin-left:18px;align-items:stretch}
 .tab-btn{background:#181420;border:1px solid var(--border);border-bottom:2px solid transparent;
          color:var(--dim);padding:9px 20px;border-radius:6px 6px 0 0;cursor:pointer;font:inherit;
@@ -352,7 +356,7 @@ textarea.sql-input:focus{outline:none;border-color:var(--acc)}
    ROW and the grid would be squeezed to its minimum. Make it a column. */
 #tab-telegram.active{flex-direction:column;overflow:auto;padding:14px 16px 22px;gap:12px}
 .tg-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(400px,1fr));
-         gap:14px;align-items:start;width:100%}
+         gap:14px;align-items:stretch;width:100%}
 .tg-card{background:var(--card);border:1px solid var(--border);border-radius:8px;
          padding:16px 16px 14px;display:flex;flex-direction:column;gap:10px}
 .tg-head{display:flex;align-items:center;gap:9px;border-bottom:1px solid var(--border);
