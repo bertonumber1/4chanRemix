@@ -29,16 +29,18 @@ from typing import Any
 
 MP3_EXTENSIONS = (".mp3",)
 
-# quick_info()'s declared bitrate, kbps -> the estimate_source() string a
-# genuine encode at that setting should roughly produce. Used only to decide
-# whether a mismatch is worth flagging — never to overrule spectral_check().
-_DECLARED_TO_ESTIMATE_FLOOR = [
-    (96, "128 kbps or lower"),
-    (144, "160 kbps"),
-    (176, "192 kbps"),
-    (224, "256 kbps / MP3 V2"),
-    (288, "320 kbps"),
-]
+# estimate_source()'s label -> the highest declared kbps that bucket can
+# plausibly mean. "128 kbps or lower" is open-ended at the BOTTOM (a 96 or a
+# 140 kbps file both land there), so the only meaningful question is whether
+# the declared rate overshoots the bucket's own TOP. "320 kbps" has no
+# ceiling worth naming — None means "never flag".
+_ESTIMATE_CEILING_KBPS = {
+    "128 kbps or lower": 144,
+    "160 kbps": 176,
+    "192 kbps": 224,
+    "256 kbps / MP3 V2": 288,
+    "320 kbps": None,
+}
 
 
 def dependencies_available() -> bool:
@@ -152,15 +154,12 @@ def spectral_check(path: str | Path) -> dict[str, Any]:
 def declared_vs_spectral_mismatch(declared_bitrate_bps: int, estimate: str) -> bool:
     """Does the header's own bitrate claim outrun what the spectrum backs up?
 
-    Only fires when the declared rate is comfortably ABOVE the estimate's own
-    floor — a 190kbps file "estimated 192 kbps" is agreement, not a mismatch.
+    Only fires when the declared rate is comfortably above the MATCHED
+    bucket's own ceiling — a 134kbps file estimated "128 kbps or lower" is
+    agreement (that bucket has no real bottom), not a mismatch.
     """
-    declared_kbps = declared_bitrate_bps / 1000.0
-    est_floor = None
-    for floor, label in _DECLARED_TO_ESTIMATE_FLOOR:
-        if label == estimate:
-            est_floor = floor
-            break
-    if est_floor is None:
+    ceiling = _ESTIMATE_CEILING_KBPS.get(estimate)
+    if not ceiling:
         return False
-    return declared_kbps > est_floor * 1.35
+    declared_kbps = declared_bitrate_bps / 1000.0
+    return declared_kbps > ceiling * 1.1
