@@ -353,9 +353,18 @@ def _smooth(a: np.ndarray, width: int) -> np.ndarray:
     return np.convolve(padded, kernel, mode="valid")[:len(a)]
 
 
-def analyse(path: str, max_seconds: float = MAX_ANALYSIS_SECONDS) -> Analysis:
+def analyse(path: str, max_seconds: float = MAX_ANALYSIS_SECONDS,
+            force_measure: bool = False) -> Analysis:
     """Measure one file. Never raises for a bad file — a folder scan must not stop
-    on the one track with a broken header."""
+    on the one track with a broken header.
+
+    `force_measure`: a lossy-format file (mp3/aac/...) normally short-circuits
+    before decoding — a wall in something meant to be lossy is not a finding.
+    Passing true instead runs the full decode + measurement anyway, purely as
+    a looking glass: the verdict still comes back "lossy_format", never
+    "lossy"/"suspect", but cutoff_hz/wall_db/above_db get filled in for real
+    instead of staying at their zero defaults. See mp3_check.py, which is the
+    only caller that ever sets this."""
     res = Analysis(path=str(path), name=Path(path).name)
     try:
         info = probe(str(path))
@@ -369,7 +378,7 @@ def analyse(path: str, max_seconds: float = MAX_ANALYSIS_SECONDS) -> Analysis:
         res.nyquist_hz = info.sample_rate / 2.0
         for field, value in read_tags(str(path)).items():
             setattr(res, field, value)
-        if info.lossy_format:
+        if info.lossy_format and not force_measure:
             res.verdict = "lossy_format"
             res.confidence = 100
             res.reasons = [f"{info.codec} — a lossy format by design, so there is nothing to fake here"]
@@ -422,6 +431,13 @@ def analyse(path: str, max_seconds: float = MAX_ANALYSIS_SECONDS) -> Analysis:
             res.side_ratio_db = _side_ratio(freqs, mid_sum, side_sum, res.cutoff_hz)
         res.bands = _band_table(freqs, smooth)
         _verdict(res)
+        # _verdict() just judged this the way it would a FLAC. Put it back to
+        # lossy_format — the real cutoff/wall/above measurements it made along
+        # the way stay, only the verdict label reverts.
+        if info.lossy_format and force_measure:
+            res.verdict = "lossy_format"
+            res.confidence = 100
+            res.reasons = [f"{info.codec} — a lossy format by design"]
     except FFmpegMissing:
         raise
     except Exception as e:  # a corrupt file is a result, not a crash

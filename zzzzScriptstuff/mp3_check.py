@@ -138,7 +138,7 @@ def spectral_check(path: str | Path) -> dict[str, Any]:
 
     if not spectral.ffmpeg_available():
         return {"ok": False, "error": "ffmpeg not available"}
-    r = spectral.analyse(str(path))
+    r = spectral.analyse(str(path), force_measure=True)
     if not r.ok:
         return {"ok": False, "error": r.error or "analysis failed"}
     return {
