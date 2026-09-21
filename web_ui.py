@@ -2594,6 +2594,50 @@ def spectrogram_api(path: str = "", force: bool = False):
     return FileResponse(str(png_path), media_type="image/png")
 
 
+@app.get("/api/mp3check/list")
+def mp3check_list(folder: str = "", page: int = 0, per_page: int = 100):
+    """Every .mp3 under `folder`, header/tags only — no audio decoded, so
+    this stays fast even over a few thousand files. Spectral checking is a
+    separate, slower, on-demand endpoint per file."""
+    import mp3_check as M
+    if not M.dependencies_available():
+        return JSONResponse(
+            {"error": "mp3 check needs: " + ", ".join(M.missing_dependencies())},
+            status_code=503)
+    root = Path(folder)
+    if not root.is_dir():
+        return JSONResponse({"error": "not a folder: " + folder}, status_code=400)
+    files = M.find_mp3_files(root)
+    total = len(files)
+    offset = page * per_page
+    rows = [M.quick_info(p).as_dict() for p in files[offset:offset + per_page]]
+    for r in rows:
+        r["mb"] = round((r.get("size_bytes") or 0) / 1048576, 2)
+        r["kbps"] = round((r.get("declared_bitrate") or 0) / 1000)
+    return JSONResponse({
+        "files": rows, "total": total, "page": page,
+        "pages": max(1, (total + per_page - 1) // per_page),
+    })
+
+
+@app.get("/api/mp3check/analyse")
+def mp3check_analyse(path: str = ""):
+    """Decode + FFT one file: what the spectrum is actually consistent with,
+    next to whether that agrees with the header's own declared bitrate.
+    Deliberately per-file, not a bulk scan — this is the slow half."""
+    import mp3_check as M
+    p = Path(path)
+    if not p.is_file():
+        return JSONResponse({"error": "file not found"}, status_code=404)
+    result = M.spectral_check(p)
+    if result.get("ok"):
+        info = M.quick_info(p)
+        result["mismatch"] = M.declared_vs_spectral_mismatch(
+            info.declared_bitrate, result["estimate"])
+        result["declared_kbps"] = round(info.declared_bitrate / 1000)
+    return JSONResponse(result)
+
+
 @app.post("/api/commit")
 async def commit_api():
     """Merge web_session.db into library.db (INSERT OR REPLACE)."""

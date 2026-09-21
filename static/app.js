@@ -407,6 +407,7 @@ const FB_TARGETS={
   'direct-src': {input:'direct-src-in', label:'SOURCE folder (direct mode)'},
   'direct-dest':{input:'direct-dest-in',label:'OUTPUT folder (direct mode)'},
   'ff-folder':  {input:'ff-folder-in',  label:'folder to check for fake FLACs'},
+  'mck-folder': {input:'mck-folder-in', label:'folder of mp3s to check'},
   'cdt-root':   {input:'cdt-root-in',   label:'CD / release folder for CD Tools'},
   'cdt-dest':   {input:'cdt-dest-in',   label:'destination for Move/Copy release'},
 };
@@ -1411,6 +1412,7 @@ function startToolStream(onDone){
 
 // ── fake-flac tab ────────────────────────────────────────────────────────────
 let ffPage_=0, ffRows_=[], ffCurrent_=null;
+let mckPage_=0, mckRows_=[], mckCurrent_=null;
 
 async function checkVampAvailable(){
   const btn=document.getElementById('ff-vamp-btn');
@@ -1658,6 +1660,84 @@ async function ffShareOne(){
     }
   }catch(e){ if(e&&e.name!=='AbortError') alert('Share failed: '+e.message); }
 }
+// ── MP3 CHECK ────────────────────────────────────────────────────────────────
+function mckFmtTime(s){ s=Math.round(s||0); return Math.floor(s/60)+':'+String(s%60).padStart(2,'0'); }
+
+async function mckLoad(page){
+  const folder=document.getElementById('mck-folder-in').value.trim();
+  if(!folder){ alert('Pick a folder first.'); return; }
+  mckPage_=page;
+  const params=new URLSearchParams({folder,page,per_page:100});
+  const r=await fetch('/api/mp3check/list?'+params);
+  const d=await r.json();
+  if(d.error){ alert(d.error); return; }
+  mckRows_=d.files||[];
+  document.getElementById('mck-page-info').textContent=`page ${(d.page||0)+1} of ${d.pages||1}`;
+  document.getElementById('mck-count').textContent=`${(d.total||0).toLocaleString()} mp3 file(s)`;
+  document.getElementById('mck-tbody').innerHTML=mckRows_.map((row,i)=>{
+    const who=[row.artist,row.title].filter(Boolean).join(' — ');
+    const declared=row.ok
+      ? `${row.kbps} kbps <span class="ff-verdict" style="opacity:.7">${esc(row.bitrate_mode||'')}</span>`
+      : `<span title="${esc(row.error||'')}">unreadable</span>`;
+    return `<tr>
+      <td>${esc(row.name||'')}</td>
+      <td>${esc(who)}</td>
+      <td>${mckFmtTime(row.duration)}</td>
+      <td>${row.mb} MB</td>
+      <td>${declared}</td>
+      <td><button class="btn-xs" onclick="mckOpenRow(${i})" ${row.ok?'':'disabled'}>🔬 View</button></td>
+    </tr>`;
+  }).join('') || '<tr><td colspan="6" style="padding:20px;color:var(--dim)">no mp3 files found under that folder</td></tr>';
+}
+function mckPageBy(delta){ mckLoad(Math.max(0,mckPage_+delta)); }
+
+async function mckOpenRow(i){
+  const row=mckRows_[i];
+  if(!row) return;
+  mckCurrent_=row;
+  document.getElementById('mck-spec-name').textContent=row.name||row.path;
+  document.getElementById('mck-spec-sub').textContent=[row.artist,row.title].filter(Boolean).join(' — ')||row.path;
+  document.getElementById('mck-spec-nums').innerHTML=
+    `declared <b>${row.kbps} kbps ${esc(row.bitrate_mode||'')}</b> · ${row.sample_rate||'?'} Hz · `+
+    `checking the actual audio…`;
+
+  const url='/api/spectrogram?path='+encodeURIComponent(row.path);
+  const img=document.getElementById('mck-spec-img'),
+        st=document.getElementById('mck-spec-status');
+  img.hidden=true; st.hidden=false; st.textContent='Rendering spectrogram…';
+  img.onload=()=>{ img.hidden=false; st.hidden=true; };
+  img.onerror=()=>{ st.textContent='Could not render this one — is ffmpeg installed?'; };
+  img.src=url;
+  const saveLink=document.getElementById('mck-spec-save');
+  saveLink.href=url;
+  saveLink.download=(row.name||'spectrogram')+'.png';
+  const panel=document.getElementById('mck-spec');
+  panel.hidden=false;
+  panel.scrollIntoView({behavior:'smooth',block:'nearest'});
+
+  try{
+    const r=await fetch('/api/mp3check/analyse?path='+encodeURIComponent(row.path));
+    const d=await r.json();
+    if(mckCurrent_!==row) return;               // moved on to another row already
+    if(!d.ok){
+      document.getElementById('mck-spec-nums').innerHTML=
+        `declared <b>${row.kbps} kbps ${esc(row.bitrate_mode||'')}</b> — spectral check failed: ${esc(d.error||'')}`;
+      return;
+    }
+    const flag=d.mismatch
+      ? `<span class="ff-conf hi">mismatch</span> declared ${d.declared_kbps} kbps but the audio is consistent with ${esc(d.estimate)}`
+      : `<span class="ff-conf lo">agrees</span> with declared ${d.declared_kbps} kbps`;
+    document.getElementById('mck-spec-nums').innerHTML=
+      `declared <b>${row.kbps} kbps ${esc(row.bitrate_mode||'')}</b> · spectral wall at `+
+      `${(d.cutoff_hz/1000).toFixed(1)} kHz of ${(d.nyquist_hz/1000).toFixed(1)} kHz Nyquist `+
+      `(consistent with <b>${esc(d.estimate)}</b>) · ${flag}`;
+  }catch(e){
+    if(mckCurrent_===row)
+      document.getElementById('mck-spec-nums').innerHTML+=' — spectral check failed';
+  }
+}
+function mckSpecClose(){ document.getElementById('mck-spec').hidden=true; }
+
 function closeSpec(e){ if(e.target.id==='spec-overlay') closeSpecBtn(); }
 function closeSpecBtn(){ document.getElementById('spec-overlay').classList.add('hidden'); }
 

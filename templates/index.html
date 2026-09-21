@@ -22,6 +22,7 @@
     <button data-tab="telegram" class="tab-btn" onclick="switchTab('telegram')" title="Control the Telegram scraper and the channel uploader">Telegram</button>
     <button data-tab="labels" class="tab-btn" onclick="switchTab('labels')" title="Label sorter — compare a record label's Discogs catalogue against the folders you hold, and list what is still missing">Labels</button>
     <button data-tab="fakeflac" class="tab-btn" onclick="switchTab('fakeflac')" title="SPEK-TRO — spectrogram analysis. Finds FLACs that were made from a lossy source (an MP3 re-wrapped as FLAC), and shows you the picture that proves it.">SPEK-TRO</button>
+    <button data-tab="mp3check" class="tab-btn" onclick="switchTab('mp3check')" title="MP3 CHECK — SPEK-TRO for mp3s: view the spectrogram and see what the file's own header claims for bitrate/CBR-VBR next to what the actual audio content is consistent with.">MP3 CHECK</button>
   </nav>
   <span id="hdr-status">idle</span>
   <!-- Language. The page is written in English and a language is a dictionary
@@ -735,6 +736,66 @@
   </div>
 </div>
 </div><!-- /spektro -->
+
+<!-- ═══════════════ MP3 CHECK TAB ═══════════════ -->
+<!-- SPEK-TRO's picture and spectral analyser, pointed at mp3s. Never a
+     fake/genuine verdict — an mp3 having a spectral wall is expected — only
+     ever a comparison between what the header claims and what the audio
+     actually looks like, so a relabelled low-bitrate file stops being
+     invisible to both a bitrate reader and a spectrogram viewer alone. -->
+<div id="tab-mp3check" class="tab-content">
+<div class="page-panel">
+  <div class="path-row" style="padding:10px 14px 0">
+    <span class="path-label src">Folder</span>
+    <input class="path-input" id="mck-folder-in" readonly tabindex="-1" onfocus="setTimeout(()=>this.blur())" placeholder="not set — pick a folder of mp3s to check" title="Click Browse">
+    <button class="btn-xs" onclick="openBrowser('mck-folder')" title="Choose a folder to list mp3s from">📁 Browse</button>
+    <button class="btn-xs ghost" onclick="openInFileManager('mck-folder-in',this)" title="Opens this folder in the file manager">↗ Open</button>
+  </div>
+  <div class="toolbar">
+    <button class="btn" onclick="mckLoad(0)" title="List every .mp3 under the folder above, with its own declared bitrate/mode — instant, nothing is decoded yet">▶ List mp3s</button>
+    <button class="btn ghost" onclick="mckLoad(mckPage_)" style="margin-left:auto" title="Reload this page">↺ Refresh</button>
+  </div>
+  <div class="tbl-wrap">
+    <table id="mck-table">
+      <thead><tr>
+        <th title="The file on disk">File</th>
+        <th title="Tags read from the file">Artist / Title</th>
+        <th title="Length">Length</th>
+        <th title="File size">Size</th>
+        <th title="What the file's OWN header claims — read straight off the MP3 frame headers / Xing tag, not from any tag editor">Declared</th>
+        <th title="View the spectrogram, and decode+FFT the audio to see what it is actually consistent with">Spectral</th>
+      </tr></thead>
+      <tbody id="mck-tbody"></tbody>
+    </table>
+  </div>
+  <div class="pagination">
+    <button class="btn-xs ghost" onclick="mckPageBy(-1)" title="Previous page">← Prev</button>
+    <span id="mck-page-info">page 1 of 1</span>
+    <button class="btn-xs ghost" onclick="mckPageBy(1)" title="Next page">Next →</button>
+    <span id="mck-count" style="margin-left:auto;color:var(--dim)"></span>
+  </div>
+
+  <div id="mck-spec" class="ff-spec" hidden>
+    <div class="ff-spec-head">
+      <div class="ff-spec-id">
+        <b id="mck-spec-name"></b>
+        <p class="ff-spec-sub" id="mck-spec-sub"></p>
+        <p class="ff-spec-sub" id="mck-spec-nums"></p>
+      </div>
+      <div class="ff-spec-actions">
+        <a class="btn-xs" id="mck-spec-save" download title="Save this picture as a PNG">⭳ Save picture</a>
+        <button class="btn-xs ghost" onclick="mckSpecClose()" title="Close the picture">✕</button>
+      </div>
+    </div>
+    <p class="ff-spec-status" id="mck-spec-status">Rendering spectrogram…</p>
+    <img id="mck-spec-img" alt="" hidden>
+    <p class="ff-spec-hint">Time runs left to right, frequency bottom to top, brightness is energy.
+      Every mp3 shows a wall somewhere — that is normal, not a fault. What matters is whether
+      <b>where it stops agrees with what "Declared" says</b>. A file claiming 320 kbps whose wall
+      sits down at 128-kbps height was re-saved at a higher bitrate than it was ever encoded at.</p>
+  </div>
+</div>
+</div><!-- /mp3check -->
 
 <!-- ═══════════════ LABELS TAB ═══════════════ -->
 <!-- What we have of a record label, what we do not, and what is still missing
